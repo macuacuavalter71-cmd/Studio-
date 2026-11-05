@@ -1,9 +1,29 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 """
 VERISCOPE V19.5.0 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
 """
 import os
+import sys
+
+# ==============================================================================
+# VALIDACAO OBRIGATORIA DO TOKEN (SECRET)
+# ==============================================================================
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+if not HF_TOKEN or not HF_TOKEN.startswith("hf_"):
+    print("=" * 70, flush=True)
+    print("ERRO CRITICO: A variavel de ambiente HF_TOKEN nao esta definida.", flush=True)
+    print("O Hugging Face revogou o seu token anterior por seguranca.", flush=True)
+    print("", flush=True)
+    print("PASSOS PARA RESOLVER:", flush=True)
+    print("1. No GitHub, va em Settings > Secrets and variables > Actions.", flush=True)
+    print("2. Crie um 'New repository secret' chamado: HF_TOKEN", flush=True)
+    print("3. Cole o seu novo token do HuggingFace.", flush=True)
+    print("4. No ficheiro .github/workflows/colab_run.yml, adicione em 'env':", flush=True)
+    print("      HF_TOKEN: ${{ secrets.HF_TOKEN }}", flush=True)
+    print("=" * 70, flush=True)
+    sys.exit(1)
+
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
@@ -15,7 +35,6 @@ os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 import subprocess
-import sys
 
 def install_packages():
     packages = [
@@ -64,11 +83,8 @@ except Exception:
 
 CLEAR_SCREEN = "\033[2J\033[H"
 STOP_FILE = "/tmp/veriscope_stop"
-MAX_EXECUTION_SECONDS = 5 * 3600 + 40 * 60  # 5h 40m = 20400 segundos
+MAX_EXECUTION_SECONDS = 5 * 3600 + 40 * 60
 
-# ==============================================================================
-# SEMÁFOROS GLOBAIS
-# ==============================================================================
 GLOBAL_CONNECTION_SEMAPHORE = threading.Semaphore(300)
 GLOBAL_HF_SEMAPHORE = threading.Semaphore(16)
 GLOBAL_DESEC_SEMAPHORE = threading.Semaphore(4)
@@ -76,10 +92,6 @@ GLOBAL_FILEWRITE_SEMAPHORE = threading.Semaphore(32)
 UNKNOWN_FILE_LOCK = threading.Lock()
 ACEITES_FILE_LOCK = threading.Lock()
 
-# ==============================================================================
-# CONFIG
-# ==============================================================================
-HF_TOKEN = "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"
 HF_LOGS_REPO = "Valter3B/Campaign_Logs"
 HF_TRADER_REPO = "Valter3B/Trader_Emails"
 META_ACEITES_POR_PROVEDOR = 50000
@@ -124,7 +136,7 @@ RATE_REDUCAO_POR_ERRO = 0.15
 RATE_RECUPERACAO_POR_SUCESSO = 0.05
 RATE_MINIMO = 5
 CHECKPOINT_SAVE_INTERVAL = 1000
-CHECKPOINT_TIME_INTERVAL = 300  # 5 minutos
+CHECKPOINT_TIME_INTERVAL = 300
 DESEC_MIN_DELAY = 0.5
 DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
@@ -402,9 +414,6 @@ FALLBACK_PROXY_URLS = [
     "https://raw.githubusercontent.com/mohammedcha/ProxRipper/main/full_proxies/socks4.txt"
 ]
 
-# ==============================================================================
-# CAMINHOS
-# ==============================================================================
 BASE_LOCAL = "/content/campaign_v19_0"
 DIR_EMAILS = "/content/emails_db"
 DIR_AUDIT = os.path.join(BASE_LOCAL, "audit")
@@ -445,9 +454,6 @@ FASES_OBRIGATORIAS_ANTES_ENVIO = [
     "FASE4_PROPAGACAO",
 ]
 
-# ==============================================================================
-# CHECKPOINT MANAGER
-# ==============================================================================
 class CheckpointManager:
     def __init__(self):
         self.locks = {
@@ -669,9 +675,6 @@ class CheckpointManager:
 
 CHECKPOINT = CheckpointManager()
 
-# ==============================================================================
-# GLOBAL STATE
-# ==============================================================================
 GLOBAL = {}
 LOG_FILE = None
 SMTP_LOG = None
@@ -750,9 +753,6 @@ def reset_global_state():
     })
     return execution_id
 
-# ==============================================================================
-# RATE CONTROLLER
-# ==============================================================================
 class RateController:
     def __init__(self):
         self.lock = threading.Lock()
@@ -836,9 +836,6 @@ class RateController:
 
 RATE_CTRL = RateController()
 
-# ==============================================================================
-# GESTÃO DE LOGS
-# ==============================================================================
 def limpar_logs_antigos(preservar_checkpoints=True):
     if os.path.exists(LOG_DIR):
         shutil.rmtree(LOG_DIR, ignore_errors=True)
@@ -975,9 +972,6 @@ def log_desec_request(domain, url, method, status_code, response_body, headers, 
     except Exception as e:
         debug_log("log_desec_request: " + str(e))
 
-# ==============================================================================
-# HUGGINGFACE SYNC
-# ==============================================================================
 def upload_all_checkpoints_to_hf():
     dizer("[HF SYNC] A enviar checkpoints e resultados para HuggingFace...")
     try:
@@ -1047,9 +1041,6 @@ def download_all_checkpoints_from_hf():
     except Exception as e:
         dizer("[HF SYNC] ERRO geral no download: " + str(e)[:100])
 
-# ==============================================================================
-# AUTO-RESTART
-# ==============================================================================
 def trigger_next_run():
     pat = os.environ.get("GITHUB_PAT")
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -1072,9 +1063,6 @@ def trigger_next_run():
     except Exception as e:
         dizer(f"[AUTO-RESTART] Exceção: {str(e)[:100]}")
 
-# ==============================================================================
-# CONTROLO DE FASES
-# ==============================================================================
 def definir_fase(nome):
     GLOBAL["fase_atual"] = nome
     GLOBAL["fase_inicio"] = time.time()
@@ -1109,9 +1097,6 @@ def espaco_disco_livre_gb(path="/content"):
     except Exception:
         return -1.0
 
-# ==============================================================================
-# MUTAÇÃO ABRACADABRA
-# ==============================================================================
 def mutar_url(url, email_recipient, identity_id):
     try:
         if not url or not url.startswith("http"):
@@ -1166,9 +1151,6 @@ def mutar_html_abracadabra(html_base, conta, recipient_email):
         debug_log("mutar_html_abracadabra: " + str(e))
         return html_base
 
-# ==============================================================================
-# MAIL FROM
-# ==============================================================================
 def carregar_mail_from_variations():
     dizer("A carregar variacoes de Mail From...")
     variations = []
@@ -1209,9 +1191,6 @@ def obter_display_name(conta, idx_conta):
     idx_var = (idx_conta - 1) % len(variations)
     return variations[idx_var]
 
-# ==============================================================================
-# DASHBOARD VISUAL
-# ==============================================================================
 def render_dashboard_text():
     if not GLOBAL:
         return
@@ -1280,9 +1259,6 @@ def monitor_live():
             pass
         time.sleep(10)
 
-# ==============================================================================
-# THREADS DE SUPORTE
-# ==============================================================================
 def keep_alive_thread():
     while GLOBAL.get("monitor_running"):
         try:
@@ -1335,9 +1311,6 @@ def check_stop_file():
         return True
     return False
 
-# ==============================================================================
-# FASE 0: IP COLAB + BLACKLISTS
-# ==============================================================================
 def obter_ip_colab():
     definir_fase("FASE 0 - IP do Colab + verificacao de blacklists")
     config = CHECKPOINT.obter_config()
@@ -1401,9 +1374,6 @@ def verificar_blacklists(ip):
         dizer("IP Colab limpo em " + str(len(limpo)) + " listas")
     return listado
 
-# ==============================================================================
-# FASE 1: TOKENS DESEC
-# ==============================================================================
 DESEC_TOKENS_VALIDOS = []
 DOM_TOKEN = {}
 DOM_TOKEN_LOCK = threading.Lock()
@@ -1446,9 +1416,6 @@ def testar_tokens_desec():
     marcar_fase("FASE1_TOKENS", True, str(len(validos)) + " tokens")
     return validos
 
-# ==============================================================================
-# FASE 2A: CONTAS + TEMPLATE
-# ==============================================================================
 def download_hf_com_retry(repo_id, filename, repo_type, max_retries=4):
     ultima = None
     for tentativa in range(max_retries):
@@ -1511,9 +1478,6 @@ def carregar_template():
     dizer("Template carregado: " + CAMPAIGN['template'] + " (" + str(len(html)) + " bytes)")
     return html
 
-# ==============================================================================
-# FASE 2B: PROVEDORES + MX
-# ==============================================================================
 def listar_ficheiros_repo():
     if GLOBAL.get("repo_files_cache"):
         return GLOBAL["repo_files_cache"]
@@ -1581,9 +1545,6 @@ def resolver_mxs_paralelo(provedores):
                 str(len(out)) + "/" + str(len(provedores)) + " com MX")
     return out
 
-# ==============================================================================
-# FASE 2C: DOWNLOAD COMPLETO DO REPOSITORIO
-# ==============================================================================
 def _heartbeat_snapshot(evento_parar):
     ultimo = -1
     while not evento_parar.is_set():
@@ -1841,9 +1802,6 @@ def processar_provedor_emails(args):
         GLOBAL["emails_read"] += total
     return prov, total
 
-# ==============================================================================
-# FASE 2D: BLACKLIST USER_UNKNOWN
-# ==============================================================================
 def baixar_unknowns_acumulado():
     definir_fase("FASE 2D - Blacklist persistente de USER_UNKNOWN")
     dizer("A carregar blacklist de USER_UNKNOWN...")
@@ -2033,9 +1991,6 @@ def gerar_ficheiros_finais():
         dizer("  ERRO geral no upload: " + str(e))
         debug_log("upload_finais: " + traceback.format_exc())
 
-# ==============================================================================
-# FASE 2.5: SISTEMA DE PROXIES
-# ==============================================================================
 REGEX_PROXY = re.compile(
     r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})["\'\s\)\]:|\t,;/]+["\'\s\(\[](\d{2,5})'
 )
@@ -2527,9 +2482,6 @@ def validar_proxies_ate_target(target_count):
         GLOBAL["spf_sujo"] = True
     return validos_novos
 
-# ==============================================================================
-# PROXY STATE - 3 STRIKES
-# ==============================================================================
 def carregar_proxy_state():
     if os.path.exists(PROXY_STATE_FILE):
         try:
@@ -2601,9 +2553,6 @@ def registrar_sucesso(proxy_key, provedor):
                 estado[proxy_key][provedor]["timeouts_consecutivos"] = 0
         salvar_proxy_state(estado)
 
-# ==============================================================================
-# FASE 3: DNS COMPLETO COM SPF BULK
-# ==============================================================================
 def token_para_dominio(domain):
     with DOM_TOKEN_LOCK:
         if domain in DOM_TOKEN:
@@ -2921,9 +2870,6 @@ def refresh_spf_bulk(motivo=""):
     GLOBAL["spf_sujo"] = False
     dizer("  SPF actualizado em " + str(ok_dom) + " blocos")
 
-# ==============================================================================
-# FASE 4: PROPAGAÇÃO
-# ==============================================================================
 def fase4_esperar_propagacao():
     definir_fase("FASE 4 - Propagacao DNS (" + str(DNS_PROPAGACAO_SEGUNDOS) + "s)")
     if fase_ja_completa("FASE4_PROPAGACAO"):
@@ -2970,9 +2916,6 @@ def verificar_propagacao_amostra(contas, ip_colab):
     marcar_fase("FASE4_PROPAGACAO", True, str(ok) + "/" + str(len(amostra)) + " propagados")
     return ok >= max(1, len(amostra) // 2)
 
-# ==============================================================================
-# APLICAR MUTACAO ABRACADABRA + DKIM
-# ==============================================================================
 def aplicar_mutacao_abracadabra(html_base, conta, target_emails, subject=None):
     if subject is None:
         subject = CAMPAIGN["subject"]
@@ -3012,9 +2955,6 @@ def aplicar_mutacao_abracadabra(html_base, conta, target_emails, subject=None):
         debug_log("DKIM: " + traceback.format_exc())
     return b
 
-# ==============================================================================
-# SMTP RECV + TLS
-# ==============================================================================
 def recv_smtp(sock, timeout=SMTP_RECV_TIMEOUT):
     sock.settimeout(timeout)
     buf, resp, atual = b"", [], []
@@ -3069,9 +3009,6 @@ def get_timeout(provedor):
         return SMTP_TIMEOUT_ASIATICO
     return SMTP_TIMEOUT
 
-# ==============================================================================
-# CLASSIFICACAO DE RESPOSTAS SMTP
-# ==============================================================================
 def classificar_resposta_smtp(smtp_code, smtp_message, provedor):
     code = int(smtp_code) if smtp_code else 0
     msg_low = str(smtp_message or "").lower()
@@ -3102,9 +3039,6 @@ def classificar_resposta_smtp(smtp_code, smtp_message, provedor):
         return "PERMANENTE", "Rejeicao permanente generica"
     return "DESCONHECIDA", "Codigo " + str(code)
 
-# ==============================================================================
-# FILA DE RETRY COM BACKOFF
-# ==============================================================================
 class RetryQueue:
     def __init__(self):
         self.items = deque()
@@ -3144,9 +3078,6 @@ class RetryQueue:
 
 RETRY_QUEUE = RetryQueue()
 
-# ==============================================================================
-# CHECKPOINT HELPER
-# ==============================================================================
 def salvar_checkpoint_smtp():
     try:
         stats = {
@@ -3174,9 +3105,6 @@ def talvez_salvar_checkpoint():
     if diff >= CHECKPOINT_SAVE_INTERVAL:
         salvar_checkpoint_smtp()
 
-# ==============================================================================
-# FASE 6: ENVIO HIBRIDO - PROXY-FIRST
-# ==============================================================================
 def tentar_conexao_com_proxy(proxy_info, mx_host, timeout, provedor):
     proxy_key = str(proxy_info['ip']) + ":" + str(proxy_info['port'])
     if not proxy_pode_usar(proxy_key, provedor):
@@ -3815,9 +3743,6 @@ def fase6_envio_massivo(mxs, contas, html_base):
     marcar_fase("FASE6_ENVIO", True,
                 str(GLOBAL['smtp_aceites']) + " aceites / " + str(GLOBAL['smtp_tentativas']) + " tentativas")
 
-# ==============================================================================
-# THREAD DE MONITORAMENTO DE PROXIES
-# ==============================================================================
 def monitor_proxies_continuo():
     dizer("[MONITOR] Thread de monitoramento de proxies iniciada (aguarda scraping inicial)")
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
@@ -3892,9 +3817,6 @@ def monitor_proxies_continuo():
             except Exception:
                 pass
 
-# ==============================================================================
-# FASE 7: EMAIL FINAL + RELATORIO
-# ==============================================================================
 def enviar_email_unico(dest, assunto, html, conta):
     sock = None
     try:
@@ -4115,9 +4037,6 @@ def salvar_logs_hf():
     except Exception as e:
         dizer("  AVISO: upload de logs falhou (" + str(e)[:100] + ")")
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
 def main():
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG
     execution_id = reset_global_state()
