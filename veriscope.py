@@ -79,7 +79,7 @@ ACEITES_FILE_LOCK = threading.Lock()
 # ==============================================================================
 # CONFIG
 # ==============================================================================
-HF_TOKEN = "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"
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_LOGS_REPO = "Valter3B/Campaign_Logs"
 HF_TRADER_REPO = "Valter3B/Trader_Emails"
 META_ACEITES_POR_PROVEDOR = 50000
