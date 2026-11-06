@@ -7,39 +7,9 @@ import os
 import sys
 
 # ==============================================================================
-# CARREGAMENTO ROBUSTO DO TOKEN HUGGINGFACE (3 NIVEIS DE FALLBACK)
+# LEITURA DO TOKEN (INJETADO PELO WRAPPER DO GITHUB ACTIONS)
 # ==============================================================================
-# Nivel 1: Variavel de ambiente (GitHub Actions via env, ou export local)
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-
-# Nivel 2: Ficheiro local /content/.hf_token (para Colab CLI manual)
-if not HF_TOKEN:
-    _paths_token = [
-        "/content/.hf_token",
-        "/content/hf_token.txt",
-        os.path.expanduser("~/.hf_token"),
-    ]
-    for _p in _paths_token:
-        if os.path.exists(_p):
-            try:
-                with open(_p, "r", encoding="utf-8") as _f:
-                    HF_TOKEN = _f.read().strip()
-                if HF_TOKEN:
-                    print("[HF] Token carregado do ficheiro: " + _p, flush=True)
-                    break
-            except Exception:
-                pass
-
-# Nivel 3: Fallback hardcoded (ultimo recurso - atualizar se revogado)
-if not HF_TOKEN:
-    HF_TOKEN = "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"
-    print("[HF] AVISO: A usar token hardcoded. Recomenda-se criar /content/.hf_token", flush=True)
-
-# Validacao final (nao para a execucao, apenas avisa)
-if not HF_TOKEN or not HF_TOKEN.startswith("hf_"):
-    print("[HF] AVISO: Token HuggingFace invalido ou vazio. Operacoes HF vao falhar.", flush=True)
-else:
-    print("[HF] Token carregado com sucesso (tamanho: " + str(len(HF_TOKEN)) + ")", flush=True)
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -470,6 +440,52 @@ FASES_OBRIGATORIAS_ANTES_ENVIO = [
     "FASE3_DNS",
     "FASE4_PROPAGACAO",
 ]
+
+# ==============================================================================
+# DIAGNÓSTICO CRU DE AMBIENTE (LOGGING DETALHADO)
+# ==============================================================================
+def diagnostico_ambiente_hf():
+    print("\n" + "="*80, flush=True)
+    print("🔍 DIAGNÓSTICO CRU DE AMBIENTE E AUTENTICAÇÃO HUGGING FACE", flush=True)
+    print("="*80, flush=True)
+    
+    hf_token = os.environ.get("HF_TOKEN", "")
+    print(f"[ENV] HF_TOKEN existe: {'SIM' if hf_token else 'NÃO'}", flush=True)
+    print(f"[ENV] HF_TOKEN length: {len(hf_token)}", flush=True)
+    print(f"[ENV] HF_TOKEN starts with 'hf_': {hf_token.startswith('hf_') if hf_token else False}", flush=True)
+    
+    print("\n[ENV] Variáveis de ambiente críticas:", flush=True)
+    critical_keys = ["HF_TOKEN", "COLAB_TOKEN_JSON", "GITHUB_PAT", "GITHUB_REPOSITORY", "PYTHONUNBUFFERED"]
+    for k in critical_keys:
+        v = os.environ.get(k, "")
+        if k == "HF_TOKEN" and v:
+            print(f"  - {k}: [REDACTED - {len(v)} chars]", flush=True)
+        elif k == "COLAB_TOKEN_JSON" and v:
+            print(f"  - {k}: [REDACTED JSON]", flush=True)
+        else:
+            print(f"  - {k}: {v}", flush=True)
+            
+    print("\n[HF HUB] A testar api.whoami()...", flush=True)
+    try:
+        from huggingface_hub import HfApi
+        import huggingface_hub
+        print(f"[HF HUB] huggingface_hub version: {huggingface_hub.__version__}", flush=True)
+        api = HfApi(token=hf_token if hf_token else None)
+        info = api.whoami()
+        print(f"[HF HUB] ✅ whoami() SUCCESS. User: {info.get('name')}", flush=True)
+    except Exception as e:
+        print(f"[HF HUB] ❌ whoami() FAILED.", flush=True)
+        print(f"[HF HUB] Exception Type: {type(e).__name__}", flush=True)
+        print(f"[HF HUB] Exception Message: {str(e)}", flush=True)
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"[HF HUB] HTTP Status: {e.response.status_code}", flush=True)
+            print(f"[HF HUB] Response Headers: {dict(e.response.headers)}", flush=True)
+            print(f"[HF HUB] Response Text: {e.response.text[:500]}", flush=True)
+        import traceback
+        print(f"[HF HUB] Traceback cru:", flush=True)
+        traceback.print_exc()
+        
+    print("="*80 + "\n", flush=True)
 
 class CheckpointManager:
     def __init__(self):
@@ -4056,6 +4072,10 @@ def salvar_logs_hf():
 
 def main():
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG
+    
+    # ⬇️ DIAGNÓSTICO CRU DE AMBIENTE (LOGS DO GITHUB ACTIONS)
+    diagnostico_ambiente_hf()
+    
     execution_id = reset_global_state()
     
     download_all_checkpoints_from_hf()
