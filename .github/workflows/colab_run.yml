@@ -16,9 +16,11 @@ jobs:
       GITHUB_REPOSITORY: ${{ github.repository }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -35,41 +37,48 @@ jobs:
       - name: Criar Sessão no Colab
         run: colab --auth oauth2 new -s veriscope-job
 
-      # ⬇️ SOLUÇÃO DEFINITIVA: Criar combined.py = wrapper + veriscope.py
       - name: Build combined.py with injected secrets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
         run: |
-          cat > combined.py << 'WRAPPER_EOF'
-import os
-import sys
+          python - <<'PY'
+          import os
+          import json
 
-print("=" * 70, flush=True)
-print("[WRAPPER] A injetar secrets no ambiente do Colab...", flush=True)
-os.environ['HF_TOKEN'] = 'HF_TOKEN_PLACEHOLDER'
-os.environ['GITHUB_PAT'] = 'GITHUB_PAT_PLACEHOLDER'
-os.environ['GITHUB_REPOSITORY'] = 'GITHUB_REPO_PLACEHOLDER'
+          with open("veriscope.py", "r", encoding="utf-8") as f:
+              original = f.read()
 
-print(f"[WRAPPER] HF_TOKEN definido: {bool(os.environ.get('HF_TOKEN'))}", flush=True)
-print(f"[WRAPPER] HF_TOKEN length: {len(os.environ.get('HF_TOKEN', ''))}", flush=True)
-print(f"[WRAPPER] HF_TOKEN starts with hf_: {os.environ.get('HF_TOKEN', '').startswith('hf_')}", flush=True)
-print(f"[WRAPPER] GITHUB_REPOSITORY: {os.environ.get('GITHUB_REPOSITORY')}", flush=True)
-print("=" * 70, flush=True)
+          wrapper = """
+          import os
 
-# Agora o veriscope.py é appendado abaixo pelo shell
-WRAPPER_EOF
+          print("=" * 70, flush=True)
+          print("[WRAPPER] A inicializar ambiente...", flush=True)
 
-          # Append veriscope.py ao combined.py
-          cat veriscope.py >> combined.py
+          os.environ['HF_TOKEN'] = {hf}
+          os.environ['GITHUB_PAT'] = {github}
+          os.environ['GITHUB_REPOSITORY'] = {repo}
 
-          # Injetar os secrets nos placeholders
-          sed -i "s|HF_TOKEN_PLACEHOLDER|${{ secrets.HF_TOKEN }}|g" combined.py
-          sed -i "s|GITHUB_PAT_PLACEHOLDER|${{ secrets.GITHUB_TOKEN }}|g" combined.py
-          sed -i "s|GITHUB_REPO_PLACEHOLDER|${{ github.repository }}|g" combined.py
+          print("[WRAPPER] HF_TOKEN definido:", bool(os.environ.get('HF_TOKEN')), flush=True)
+          print("[WRAPPER] HF_TOKEN length:", len(os.environ.get('HF_TOKEN', '')), flush=True)
+          print("[WRAPPER] GITHUB_REPOSITORY:", os.environ.get('GITHUB_REPOSITORY'), flush=True)
+          print("=" * 70, flush=True)
 
-          # Verificar que foi injetado
-          echo "--- Verificação (primeiras 20 linhas do combined.py) ---"
-          head -20 combined.py
+          """.format(
+              hf=json.dumps(os.environ["HF_TOKEN"]),
+              github=json.dumps(os.environ["GITHUB_PAT"]),
+              repo=json.dumps(os.environ["GITHUB_REPO"])
+          )
 
-      # ⬇️ Executar APENAS o combined.py (que já contém tudo)
+          with open("combined.py", "w", encoding="utf-8") as f:
+              f.write(wrapper)
+              f.write(original)
+
+          print("[OK] combined.py criado com sucesso.")
+          print("[OK] Tamanho do combined.py:", os.path.getsize("combined.py"), "bytes")
+          PY
+
       - name: Executar Veriscope via combined.py
         run: colab --auth oauth2 exec -s veriscope-job -f combined.py --timeout 21000
 
