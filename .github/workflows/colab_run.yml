@@ -12,7 +12,7 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       COLAB_TOKEN_JSON: '{"token": "ya29.a0AehfTOnT-bpLFPb1hwfdDrUlFXgzRKzgy2JWPhLr7pCHuDEKx0pigceIIcfBqe2qhIYCa6WGLoSftIlWCtVVnMKmK0GKKCMLLjwlbhOQIatq8iHm9_RmEZBV2J6AYSx1r0M-W6dF3WGa4JfHkn0u_RDou96Vv__vvZxEzRbW7fzB9p7EZgq_J7wf9fHqR_SvqqSRDb8aCgYKAQASARQSFQHGX2MiyuuzZy8i7XV0v1nQqyVHsQ0206", "refresh_token": "1//04LtHWplmfl6VCgYIARAAGAQSNwF-L9Irg5ffVeGPbmbVBKv7H22rSbGNHmb_5OZRDihoSvsitKIlgu_mnvrR8rK157V2c9V6Lyc", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-11-05T10:32:53Z"}'
-      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }} 
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_REPOSITORY: ${{ github.repository }}
 
     steps:
@@ -32,22 +32,46 @@ jobs:
           mkdir -p ~/.config/colab-cli
           printf '%s' "$COLAB_TOKEN_JSON" > ~/.config/colab-cli/token.json
 
-      - name: Criar Sessão no Colab (Background)
+      - name: Criar Sessão no Colab
         run: colab --auth oauth2 new -s veriscope-job
 
-      # ⬇️ PASSO CRÍTICO: Injetar o secret num wrapper que será executado DENTRO do Colab
-      - name: Criar Wrapper para Injetar Secret HF
+      # ⬇️ SOLUÇÃO DEFINITIVA: Criar combined.py = wrapper + veriscope.py
+      - name: Build combined.py with injected secrets
         run: |
-          echo "import os, sys" > wrapper.py
-          echo "os.environ['HF_TOKEN'] = '${{ secrets.HF_TOKEN }}'" >> wrapper.py
-          echo "os.environ['GITHUB_PAT'] = '${{ secrets.GITHUB_TOKEN }}'" >> wrapper.py
-          echo "os.environ['GITHUB_REPOSITORY'] = '${{ github.repository }}'" >> wrapper.py
-          echo "with open('veriscope.py', 'r', encoding='utf-8') as f: code = f.read()" >> wrapper.py
-          echo "exec(code)" >> wrapper.py
+          cat > combined.py << 'WRAPPER_EOF'
+import os
+import sys
 
-      # ⬇️ Executar o wrapper (que carrega o veriscope.py) e enviar ambos os ficheiros
-      - name: Executar Veriscope (Headless via Wrapper)
-        run: colab --auth oauth2 exec -s veriscope-job -f wrapper.py -f veriscope.py --timeout 21000
+print("=" * 70, flush=True)
+print("[WRAPPER] A injetar secrets no ambiente do Colab...", flush=True)
+os.environ['HF_TOKEN'] = 'HF_TOKEN_PLACEHOLDER'
+os.environ['GITHUB_PAT'] = 'GITHUB_PAT_PLACEHOLDER'
+os.environ['GITHUB_REPOSITORY'] = 'GITHUB_REPO_PLACEHOLDER'
+
+print(f"[WRAPPER] HF_TOKEN definido: {bool(os.environ.get('HF_TOKEN'))}", flush=True)
+print(f"[WRAPPER] HF_TOKEN length: {len(os.environ.get('HF_TOKEN', ''))}", flush=True)
+print(f"[WRAPPER] HF_TOKEN starts with hf_: {os.environ.get('HF_TOKEN', '').startswith('hf_')}", flush=True)
+print(f"[WRAPPER] GITHUB_REPOSITORY: {os.environ.get('GITHUB_REPOSITORY')}", flush=True)
+print("=" * 70, flush=True)
+
+# Agora o veriscope.py é appendado abaixo pelo shell
+WRAPPER_EOF
+
+          # Append veriscope.py ao combined.py
+          cat veriscope.py >> combined.py
+
+          # Injetar os secrets nos placeholders
+          sed -i "s|HF_TOKEN_PLACEHOLDER|${{ secrets.HF_TOKEN }}|g" combined.py
+          sed -i "s|GITHUB_PAT_PLACEHOLDER|${{ secrets.GITHUB_TOKEN }}|g" combined.py
+          sed -i "s|GITHUB_REPO_PLACEHOLDER|${{ github.repository }}|g" combined.py
+
+          # Verificar que foi injetado
+          echo "--- Verificação (primeiras 20 linhas do combined.py) ---"
+          head -20 combined.py
+
+      # ⬇️ Executar APENAS o combined.py (que já contém tudo)
+      - name: Executar Veriscope via combined.py
+        run: colab --auth oauth2 exec -s veriscope-job -f combined.py --timeout 21000
 
       - name: Obter Logs Finais
         if: always()
