@@ -2,6 +2,7 @@
 """
 VERISCOPE V19.5.0 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
+CORREÇÕES: REGEX_PROXY flexível + Drive paths + RLock para DOM_TOKEN
 """
 import os
 import sys
@@ -199,6 +200,7 @@ CP_SMTP = os.path.join(BASE_LOCAL, "cp_smtp.json")
 CP_CONTAS = os.path.join(BASE_LOCAL, "cp_contas.json")
 CP_CONFIG = os.path.join(BASE_LOCAL, "cp_config.json")
 
+# CORREÇÃO #2: Adicionar caminhos do Google Drive (como na V19.4.1)
 PROXY_SEARCH_DIRS = [
     DIR_PROXIES,
     "/content/proxies",
@@ -206,6 +208,9 @@ PROXY_SEARCH_DIRS = [
     "/content/data",
     "/content/uploads",
     "./",
+    "/content/drive/MyDrive",
+    "/content/drive/MyDrive/proxies",
+    "/content/drive/MyDrive/Proxies",
 ]
 
 FASES_OBRIGATORIAS_ANTES_ENVIO = [
@@ -1195,7 +1200,8 @@ def verificar_blacklists(ip):
 
 DESEC_TOKENS_VALIDOS = []
 DOM_TOKEN = {}
-DOM_TOKEN_LOCK = threading.Lock()
+# CORREÇÃO #3: Usar RLock (reentrante) em vez de Lock para evitar deadlock
+DOM_TOKEN_LOCK = threading.RLock()
 
 def testar_tokens_desec():
     definir_fase("FASE 1 - Validacao dos tokens deSEC")
@@ -1844,7 +1850,10 @@ def gerar_ficheiros_finais():
         dizer("  ERRO geral no upload: " + str(e))
         debug_log("upload_finais: " + traceback.format_exc())
 
-REGEX_PROXY = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})["\'\s)\]:|\t,;/]+["\'\s\[](\d{2,5})')
+# CORREÇÃO #1: Usar o REGEX_PROXY flexível da V19.4.1 (em vez do restritivo da V19.5.0)
+REGEX_PROXY = re.compile(
+    r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})["\'\s\)\]]*[:|\t,;/]+["\'\s\(\[]*(\d{2,5})'
+)
 REGEX_PROXY_JSON_IP = re.compile(
     r'"(?:ip|host|address|ip_address)"\s*:\s*"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"\s*,\s*'
     r'"(?:port|p)"\s*:\s*"?(\d{2,5})"?',
