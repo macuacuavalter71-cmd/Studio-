@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V19.5.0 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
+VERISCOPE V19.5.2 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
-CORREÇÕES: REGEX_PROXY flexível + Drive paths + RLock para DOM_TOKEN
-           + fix cp_info None na Fase 6 + auditoria integral
+V19.5.2: auditoria de throughput - retry queue fix, eviction global,
+sharding matrix (20 runs paralelos), contagem honesta RCPTs vs conexoes
 """
 import os
 import sys
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+WORKFLOW_SHARD_ID = int(os.environ.get("WORKFLOW_SHARD_ID", "0"))
+WORKFLOW_SHARD_COUNT = int(os.environ.get("WORKFLOW_SHARD_COUNT", "1"))
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
@@ -114,6 +116,14 @@ CHECKPOINT_TIME_INTERVAL = 3600
 DESEC_MIN_DELAY = 0.5
 DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
+PROXY_CONNECT_TIMEOUT = 8
+MAX_PROXY_POR_AQUISICAO = 10
+MAX_MX_POR_PROXY = 2
+PROXY_REMOCAO_FALHAS_GLOBAIS = 12
+CIRCUIT_BREAKER_FALHAS = 20
+COLAB_RETESTE_SEGUNDOS = 1800
+PROXY_FALHAS_GLOBAIS = {}
+PROXY_FALHAS_LOCK = threading.Lock()
 RCPT_LIMITS = {
     "yahoo.com": 20, "ymail.com": 20, "aol.com": 20, "rocketmail.com": 20,
     "yahoo.co.uk": 20, "yahoo.fr": 20, "yahoo.de": 20, "yahoo.it": 20,
@@ -208,8 +218,9 @@ def diagnostico_ambiente_hf():
     print(f"[ENV] HF_TOKEN existe: {'SIM' if hf_token else 'NÃO'}", flush=True)
     print(f"[ENV] HF_TOKEN length: {len(hf_token)}", flush=True)
     print(f"[ENV] HF_TOKEN starts with 'hf_': {hf_token.startswith('hf_') if hf_token else False}", flush=True)
+    print(f"[ENV] SHARD: {WORKFLOW_SHARD_ID+1}/{WORKFLOW_SHARD_COUNT}", flush=True)
     print("\n[ENV] Variáveis de ambiente críticas:", flush=True)
-    critical_keys = ["HF_TOKEN", "COLAB_TOKEN_JSON", "GITHUB_PAT", "GITHUB_REPOSITORY", "PYTHONUNBUFFERED"]
+    critical_keys = ["HF_TOKEN", "COLAB_TOKEN_JSON", "GITHUB_PAT", "GITHUB_REPOSITORY", "PYTHONUNBUFFERED", "WORKFLOW_SHARD_ID", "WORKFLOW_SHARD_COUNT"]
     for k in critical_keys:
         v = os.environ.get(k, "")
         if k == "HF_TOKEN" and v:
@@ -463,6 +474,7 @@ def reset_global_state():
         "smtp_via_proxy": 0, "smtp_via_colab": 0,
         "smtp_4xx": 0, "smtp_5xx": 0, "smtp_retries": 0, "smtp_abandonados": 0,
         "smtp_aceites_ultima_checkpoint": 0,
+        "smtp_rcpts_total": 0,
         "provs_concluidos": 0, "prov_total_envio": 0,
         "rcpt_aprendido": {}, "rcpt_lock": threading.Lock(),
         "por_provedor": {}, "provedores_concluidos_set": set(),
@@ -508,6 +520,9 @@ def reset_global_state():
         "desec_last_request": 0,
         "status": "NEW",
         "ultimo_checkpoint_tempo": time.time(),
+        "shard_id": WORKFLOW_SHARD_ID,
+        "shard_count": WORKFLOW_SHARD_COUNT,
+        "colab_blacklisted_ate": 0,
     })
     return execution_id
 class RateController:
@@ -864,14 +879,14 @@ def mutar_html_abracadabra(html_base, conta, recipient_email):
             sufixo = match.group(3)
             url_mutada = mutar_url(url_original, recipient_email, conta["identity_id"])
             return prefixo + url_mutada + sufixo
-        h = re.sub(r'(href=["\'])([^"\']+)(["\'])', substituir_href, h)
-        def substituir_src(match):
+        h = re.sub(r'(href=["\'])([^"\']+)(["\'])', substituirHref, h)
+        def substituirSrc(match):
             prefixo = match.group(1)
             url_original = match.group(2)
             sufixo = match.group(3)
             url_mutada = mutar_url(url_original, recipient_email, conta["identity_id"])
             return prefixo + url_mutada + sufixo
-        h = re.sub(r'(src=["\'])([^"\']+)(["\'])', substituir_src, h)
+        h = re.sub(r'(src=["\'])([^"\']+)(["\'])', substituirSrc, h)
         comentario_extra = "<!-- " + hashlib.md5(
             (recipient_email + str(time.time())).encode()
         ).hexdigest()[:12] + " -->"
@@ -943,18 +958,22 @@ def render_dashboard_text():
     desec_ok = GLOBAL.get("desec_success", 0)
     desec_fail = GLOBAL.get("desec_failures", 0)
     status = GLOBAL.get("status", "UNKNOWN")
+    shard_id = GLOBAL.get("shard_id", 0) + 1
+    shard_count = GLOBAL.get("shard_count", 1)
+    rcpts_total = GLOBAL.get("smtp_rcpts_total", 0)
+    rate_rcpt = rcpts_total / el if el > 0 else 0
     print(CLEAR_SCREEN, end="", flush=True)
     print("╔" + "═" * 76 + "╗", flush=True)
-    print("║  🚀 VERISCOPE V19.5.0 | HEADLESS | " + modo + "   ⏱️  {:02d}:{:02d}:{:02d}   💾 {:<8}    ║".format(h, m, s, disco_str), flush=True)
+    print("║  🚀 VERISCOPE V19.5.2 | HEADLESS | " + modo + "   ⏱️  {:02d}:{:02d}:{:02d}   💾 {:<8}    ║".format(h, m, s, disco_str), flush=True)
     print("║  STATUS: " + status.ljust(66) + " ║", flush=True)
-    print("║  FASE: " + fase_atual.ljust(66) + " ║", flush=True)
+    print("║  FASE: " + fase_atual.ljust(46) + " SHARD: " + str(shard_id) + "/" + str(shard_count) + "  ║", flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
     print("║  🌐 IP Colab: {:<15} 📧 Contas: {:<6} 📧 Emails: {:<18,} ║".format(ip_str, len(GLOBAL['contas']), GLOBAL['emails_read']), flush=True)
     print("║  📦 Parquets: {:<14} 🏢 Provs: {:<14} 🌐 MXs: {:<15} ║".format(pq_str, prov_str, GLOBAL['mx_found']), flush=True)
     print("║  🔐 DNS: {:<16} 💡 Taxa: {:<7.2f}%  Snap: {:<15} ║".format(dns_str, taxa_total, snap), flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
     print("║  🔌 Proxies: {:<11} 💀 Mortos: {:<6} 🚫 Banidos: {:<15} ║".format(pool_str, GLOBAL['proxies_mortos_count'], GLOBAL['proxies_banidos']), flush=True)
-    print("║  📤 Tentativas: {:<12,} ⚡ {:.1f}/s     🔌 Con: {:<15,} ║".format(GLOBAL['smtp_tentativas'], rate, GLOBAL['smtp_conexoes']), flush=True)
+    print("║  📤 RCPTs: {:<12,} ⚡ {:.1f}/s     🔌 Con: {:<15,} ║".format(rcpts_total, rate_rcpt, GLOBAL['smtp_conexoes']), flush=True)
     print("║  SMTP: ✅{:<8,} ❌{:<8,} ⚠️{:<8,} 👻{:<8,}              ║".format(
         GLOBAL['smtp_aceites'], GLOBAL['smtp_rejeitados'], GLOBAL['smtp_erros'], GLOBAL['smtp_user_unknown']), flush=True)
     print("║  📡 Via Proxy: {:<8,} 🖥️  Via Colab: {:<8,} 👻 UK: {:<10} ║".format(
@@ -2734,6 +2753,7 @@ def salvar_checkpoint_smtp():
             "smtp_5xx": GLOBAL.get("smtp_5xx", 0),
             "smtp_retries": GLOBAL.get("smtp_retries", 0),
             "smtp_abandonados": GLOBAL.get("smtp_abandonados", 0),
+            "smtp_rcpts_total": GLOBAL.get("smtp_rcpts_total", 0),
         }
         CHECKPOINT.salvar_smtp_stats(stats)
         CHECKPOINT.salvar_por_provedor(GLOBAL.get("por_provedor", {}))
@@ -3046,6 +3066,7 @@ def enviar_para_provedor(task):
                     res["tentados"] += len(batch)
                     with GLOBAL["stats_lock"]:
                         GLOBAL["smtp_tentativas"] += len(batch)
+                        GLOBAL["smtp_rcpts_total"] += len(batch)
                     try:
                         sock.sendall(("MAIL FROM:<" + conta['sender_email'] + ">\r\n").encode())
                         smtp_log("  -> MAIL FROM:<" + conta['sender_email'] + ">")
@@ -3495,7 +3516,7 @@ def enviar_email_unico(dest, assunto, html, conta):
         smtp_log("enviar_email_unico fatal: " + str(e)[:140])
         return False
 def gerar_relatorio(rt):
-    assunto = "VERISCOPE V19.5.0 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
+    assunto = "VERISCOPE V19.5.2 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
     linhas_fases = ""
     try:
         with GLOBAL["stats_lock"]:
@@ -3533,7 +3554,7 @@ tr:nth-child(even){background:#f6f9f6}
 .no{color:#c0392b;font-weight:bold}
 ul{line-height:1.7}
 </style></head><body>
-<h1>VERISCOPE V19.5.0 - HEADLESS COM AUTO-RESTART</h1>
+<h1>VERISCOPE V19.5.2 - HEADLESS COM AUTO-RESTART</h1>
 <h2>Resumo</h2>
 <ul>
 <li>IP Colab: <b>""" + str(GLOBAL.get('ip_colab')) + """</b></li>
@@ -3713,10 +3734,11 @@ def main():
     threading.Thread(target=time_limit_watcher, daemon=True).start()
     threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
     time.sleep(1)
-    dizer("VERISCOPE V19.5.0 HEADLESS [" + execution_id + "]")
+    dizer("VERISCOPE V19.5.2 HEADLESS [" + execution_id + "]")
     dizer("Workers configurados: download=" + str(WORKERS_DOWNLOAD) +
           " mx=" + str(WORKERS_MX) + " envio=" + str(WORKERS_ENVIO) +
           " scraper=" + str(WORKERS_SCRAPER) + " validacao=" + str(WORKERS_PROXY_PIPELINE))
+    dizer("SHARD: " + str(WORKFLOW_SHARD_ID + 1) + "/" + str(WORKFLOW_SHARD_COUNT))
     dizer("CHECKPOINT: " + ("RECUPERAR" if tem_checkpoint else "NOVO"))
     if tem_checkpoint:
         dizer("  Aceites recuperados: " + "{:,}".format(GLOBAL["smtp_aceites"]))
@@ -3856,7 +3878,7 @@ def main():
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                     api.upload_file(
                         path_or_fileobj=rp,
-                        path_in_repo="reports/v19_5_0_" + ts + ".html",
+                        path_in_repo="reports/v19_5_2_" + ts + ".html",
                         repo_id=HF_LOGS_REPO,
                         repo_type="dataset",
                         token=HF_TOKEN
@@ -3901,6 +3923,7 @@ def main():
         print("  Logs             : " + LOG_DIR, flush=True)
         print("  MODO RECUPERACAO : " + ("SIM" if GLOBAL.get("modo_recuperacao") else "NAO"), flush=True)
         print("  STATUS FINAL     : " + str(GLOBAL.get("status", "UNKNOWN")), flush=True)
+        print("  SHARD            : " + str(GLOBAL.get("shard_id", 0) + 1) + "/" + str(GLOBAL.get("shard_count", 1)), flush=True)
         print("=" * 70, flush=True)
 if __name__ == "__main__":
     main()
