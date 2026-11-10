@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V19.5.2 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
+VERISCOPE V19.6.0 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
+PARALELISMO HIERÁRQUICO: 407 PROVEDORES x 10 CONTAS PARALELAS
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
-V19.5.2: auditoria de throughput - retry queue fix, eviction global,
-sharding matrix (20 runs paralelos), contagem honesta RCPTs vs conexoes
+V19.6.0: paralelismo hierarquico real, pool 10 proxies + colab fallback,
+mail from variavel com 2116 variacoes, 500 emails por conta
 """
 import os
 import sys
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-WORKFLOW_SHARD_ID = int(os.environ.get("WORKFLOW_SHARD_ID", "0"))
-WORKFLOW_SHARD_COUNT = int(os.environ.get("WORKFLOW_SHARD_COUNT", "1"))
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
@@ -93,8 +92,8 @@ DESEC_TTL = 900
 DESEC_CHUNK = 400
 EXIT_IP_TIMEOUT = 8
 PORT25_TIMEOUT = 5
-TARGET_VALID_PROXIES = 100
-MIN_PROXIES_REFILL = 10
+TARGET_VALID_PROXIES = 10
+MIN_PROXIES_REFILL = 5
 PROXY_COOLDOWN_SEGUNDOS = 120
 MAX_TIMEOUTS_BAN = 3
 RESCRAPE_INTERVALO_MINIMO = 300
@@ -116,14 +115,8 @@ CHECKPOINT_TIME_INTERVAL = 3600
 DESEC_MIN_DELAY = 0.5
 DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
-PROXY_CONNECT_TIMEOUT = 8
-MAX_PROXY_POR_AQUISICAO = 10
-MAX_MX_POR_PROXY = 2
-PROXY_REMOCAO_FALHAS_GLOBAIS = 12
-CIRCUIT_BREAKER_FALHAS = 20
-COLAB_RETESTE_SEGUNDOS = 1800
-PROXY_FALHAS_GLOBAIS = {}
-PROXY_FALHAS_LOCK = threading.Lock()
+CONTAS_PARALELAS_POR_PROVEDOR = 10
+PROVEDORES_PARALELOS = 407
 RCPT_LIMITS = {
     "yahoo.com": 20, "ymail.com": 20, "aol.com": 20, "rocketmail.com": 20,
     "yahoo.co.uk": 20, "yahoo.fr": 20, "yahoo.de": 20, "yahoo.it": 20,
@@ -218,9 +211,8 @@ def diagnostico_ambiente_hf():
     print(f"[ENV] HF_TOKEN existe: {'SIM' if hf_token else 'NÃO'}", flush=True)
     print(f"[ENV] HF_TOKEN length: {len(hf_token)}", flush=True)
     print(f"[ENV] HF_TOKEN starts with 'hf_': {hf_token.startswith('hf_') if hf_token else False}", flush=True)
-    print(f"[ENV] SHARD: {WORKFLOW_SHARD_ID+1}/{WORKFLOW_SHARD_COUNT}", flush=True)
     print("\n[ENV] Variáveis de ambiente críticas:", flush=True)
-    critical_keys = ["HF_TOKEN", "COLAB_TOKEN_JSON", "GITHUB_PAT", "GITHUB_REPOSITORY", "PYTHONUNBUFFERED", "WORKFLOW_SHARD_ID", "WORKFLOW_SHARD_COUNT"]
+    critical_keys = ["HF_TOKEN", "COLAB_TOKEN_JSON", "GITHUB_PAT", "GITHUB_REPOSITORY", "PYTHONUNBUFFERED"]
     for k in critical_keys:
         v = os.environ.get(k, "")
         if k == "HF_TOKEN" and v:
@@ -474,12 +466,13 @@ def reset_global_state():
         "smtp_via_proxy": 0, "smtp_via_colab": 0,
         "smtp_4xx": 0, "smtp_5xx": 0, "smtp_retries": 0, "smtp_abandonados": 0,
         "smtp_aceites_ultima_checkpoint": 0,
-        "smtp_rcpts_total": 0,
         "provs_concluidos": 0, "prov_total_envio": 0,
         "rcpt_aprendido": {}, "rcpt_lock": threading.Lock(),
         "por_provedor": {}, "provedores_concluidos_set": set(),
         "contas": [],
         "mail_from_variations": [],
+        "mail_from_idx_counter": 0,
+        "mail_from_counter_lock": threading.Lock(),
         "logs_uploaded": False,
         "pool": [],
         "pool_lock": threading.Lock(),
@@ -520,9 +513,6 @@ def reset_global_state():
         "desec_last_request": 0,
         "status": "NEW",
         "ultimo_checkpoint_tempo": time.time(),
-        "shard_id": WORKFLOW_SHARD_ID,
-        "shard_count": WORKFLOW_SHARD_COUNT,
-        "colab_blacklisted_ate": 0,
     })
     return execution_id
 class RateController:
@@ -879,14 +869,14 @@ def mutar_html_abracadabra(html_base, conta, recipient_email):
             sufixo = match.group(3)
             url_mutada = mutar_url(url_original, recipient_email, conta["identity_id"])
             return prefixo + url_mutada + sufixo
-        h = re.sub(r'(href=["\'])([^"\']+)(["\'])', substituirHref, h)
-        def substituirSrc(match):
+        h = re.sub(r'(href=["\'])([^"\']+)(["\'])', substituir_href, h)
+        def substituir_src(match):
             prefixo = match.group(1)
             url_original = match.group(2)
             sufixo = match.group(3)
             url_mutada = mutar_url(url_original, recipient_email, conta["identity_id"])
             return prefixo + url_mutada + sufixo
-        h = re.sub(r'(src=["\'])([^"\']+)(["\'])', substituirSrc, h)
+        h = re.sub(r'(src=["\'])([^"\']+)(["\'])', substituir_src, h)
         comentario_extra = "<!-- " + hashlib.md5(
             (recipient_email + str(time.time())).encode()
         ).hexdigest()[:12] + " -->"
@@ -920,18 +910,44 @@ def carregar_mail_from_variations():
         except Exception as e:
             dizer("  AVISO: Erro ao ler " + ficheiro + ": " + str(e)[:120])
     else:
-        dizer("  AVISO: Ficheiro de variações não encontrado. Usando apenas 'Alex'.")
+        dizer("  AVISO: Ficheiro de variações não encontrado. Tentando download do HF...")
+        try:
+            local_mf = hf_hub_download(
+                repo_id=HF_LOGS_REPO,
+                filename="campaign_data/templates/" + MAIL_FROM_FILE_LOCAL,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                force_download=True
+            )
+            shutil.copy(local_mf, os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL))
+            with open(os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL), "r", encoding="utf-8", errors="ignore") as f:
+                for linha in f:
+                    linha = linha.strip()
+                    if linha and not linha.startswith("#"):
+                        variations.append(linha)
+            dizer("  Carregadas " + str(len(variations)) + " variacoes do HuggingFace")
+        except Exception as e2:
+            dizer("  AVISO: Falha no download HF: " + str(e2)[:120])
     GLOBAL["mail_from_variations"] = variations
+    GLOBAL["mail_from_idx_counter"] = 0
     return variations
+def obter_proxima_variacao_mail_from():
+    with GLOBAL["mail_from_counter_lock"]:
+        variations = GLOBAL.get("mail_from_varations", [])
+        if not variations:
+            return "Alex"
+        idx = GLOBAL["mail_from_idx_counter"] % len(variations)
+        GLOBAL["mail_from_idx_counter"] += 1
+        return variations[idx]
 def obter_display_name(conta, idx_conta):
     variations = GLOBAL.get("mail_from_variations", [])
-    if idx_conta == 0 or not variations:
+    if not variations:
         base = conta.get("base", "")
         if base:
             nome_limpo = base.replace("-", " ").replace("_", " ").title()
             return nome_limpo
         return "Alex"
-    idx_var = (idx_conta - 1) % len(variations)
+    idx_var = idx_conta % len(variations)
     return variations[idx_var]
 def render_dashboard_text():
     if not GLOBAL:
@@ -958,22 +974,18 @@ def render_dashboard_text():
     desec_ok = GLOBAL.get("desec_success", 0)
     desec_fail = GLOBAL.get("desec_failures", 0)
     status = GLOBAL.get("status", "UNKNOWN")
-    shard_id = GLOBAL.get("shard_id", 0) + 1
-    shard_count = GLOBAL.get("shard_count", 1)
-    rcpts_total = GLOBAL.get("smtp_rcpts_total", 0)
-    rate_rcpt = rcpts_total / el if el > 0 else 0
     print(CLEAR_SCREEN, end="", flush=True)
     print("╔" + "═" * 76 + "╗", flush=True)
-    print("║  🚀 VERISCOPE V19.5.2 | HEADLESS | " + modo + "   ⏱️  {:02d}:{:02d}:{:02d}   💾 {:<8}    ║".format(h, m, s, disco_str), flush=True)
+    print("║  🚀 VERISCOPE V19.6.0 | PARALELISMO HIERÁRQUICO | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
     print("║  STATUS: " + status.ljust(66) + " ║", flush=True)
-    print("║  FASE: " + fase_atual.ljust(46) + " SHARD: " + str(shard_id) + "/" + str(shard_count) + "  ║", flush=True)
+    print("║  FASE: " + fase_atual.ljust(66) + " ║", flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
     print("║  🌐 IP Colab: {:<15} 📧 Contas: {:<6} 📧 Emails: {:<18,} ║".format(ip_str, len(GLOBAL['contas']), GLOBAL['emails_read']), flush=True)
     print("║  📦 Parquets: {:<14} 🏢 Provs: {:<14} 🌐 MXs: {:<15} ║".format(pq_str, prov_str, GLOBAL['mx_found']), flush=True)
     print("║  🔐 DNS: {:<16} 💡 Taxa: {:<7.2f}%  Snap: {:<15} ║".format(dns_str, taxa_total, snap), flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
     print("║  🔌 Proxies: {:<11} 💀 Mortos: {:<6} 🚫 Banidos: {:<15} ║".format(pool_str, GLOBAL['proxies_mortos_count'], GLOBAL['proxies_banidos']), flush=True)
-    print("║  📤 RCPTs: {:<12,} ⚡ {:.1f}/s     🔌 Con: {:<15,} ║".format(rcpts_total, rate_rcpt, GLOBAL['smtp_conexoes']), flush=True)
+    print("║  📤 Tentativas: {:<12,} ⚡ {:.1f}/s     🔌 Con: {:<15,} ║".format(GLOBAL['smtp_tentativas'], rate, GLOBAL['smtp_conexoes']), flush=True)
     print("║  SMTP: ✅{:<8,} ❌{:<8,} ⚠️{:<8,} 👻{:<8,}              ║".format(
         GLOBAL['smtp_aceites'], GLOBAL['smtp_rejeitados'], GLOBAL['smtp_erros'], GLOBAL['smtp_user_unknown']), flush=True)
     print("║  📡 Via Proxy: {:<8,} 🖥️  Via Colab: {:<8,} 👻 UK: {:<10} ║".format(
@@ -2753,7 +2765,6 @@ def salvar_checkpoint_smtp():
             "smtp_5xx": GLOBAL.get("smtp_5xx", 0),
             "smtp_retries": GLOBAL.get("smtp_retries", 0),
             "smtp_abandonados": GLOBAL.get("smtp_abandonados", 0),
-            "smtp_rcpts_total": GLOBAL.get("smtp_rcpts_total", 0),
         }
         CHECKPOINT.salvar_smtp_stats(stats)
         CHECKPOINT.salvar_por_provedor(GLOBAL.get("por_provedor", {}))
@@ -2968,8 +2979,8 @@ def enviar_para_provedor(task):
     res["aceites"] = aceites_iniciais
     dizer("  CHECKPOINT " + prov + ": offset=" + str(offset_inicial) + "/" + str(total_linhas) + " aceites=" + str(aceites_iniciais))
     rcpt_limit = RCPT_LIMITS.get(prov, RCPT_DEFAULT)
-    conta_idx = random.randint(0, max(0, len(contas_pool) - 1))
-    smtp_log("\n" + "=" * 70 + "\nINICIO ENVIO: " + prov + " | MXs: " + str(mx_list) + "\n" + "=" * 70)
+    smtp_log("\n" + "=" * 70 + "\nINICIO ENVIO PARALELO: " + prov + " | MXs: " + str(mx_list) +
+             " | Contas paralelas: " + str(CONTAS_PARALELAS_POR_PROVEDOR) + "\n" + "=" * 70)
     try:
         fh = open(path, "r", encoding="utf-8", errors="ignore")
     except Exception as e:
@@ -2988,6 +2999,8 @@ def enviar_para_provedor(task):
             dizer("  " + prov + ": saltados " + str(emails_saltados) + " emails do checkpoint")
     except Exception as e:
         debug_log("saltar offset " + prov + ": " + str(e))
+    n_contas_paralelas = min(CONTAS_PARALELAS_POR_PROVEDOR, len(contas_pool))
+    contas_selecionadas = random.sample(contas_pool, n_contas_paralelas) if len(contas_pool) > n_contas_paralelas else list(contas_pool)
     try:
         while res["aceites"] < META_ACEITES_POR_PROVEDOR and not GLOBAL.get("emergency_stop"):
             if check_stop_file():
@@ -3012,255 +3025,280 @@ def enviar_para_provedor(task):
             if not janela:
                 break
             random.shuffle(janela)
-            fila = deque(janela)
-            while fila and res["aceites"] < META_ACEITES_POR_PROVEDOR and not GLOBAL.get("emergency_stop"):
-                if check_stop_file():
-                    break
-                with GLOBAL["pool_lock"]:
-                    pool_atual = len(GLOBAL["pool"])
-                if pool_atual == 0:
-                    aguardar_pool_ou_seguir(timeout_seg=min(180, PROXY_COOLDOWN_SEGUNDOS))
-                sock, mx_host, via_proxy, proxy_key = obter_socket_para_mx(
-                    mx_list, prov, GLOBAL.get("ip_colab")
-                )
-                if sock is None:
-                    res["erros"] += 1
-                    with GLOBAL["stats_lock"]:
-                        GLOBAL["smtp_erros"] += 1
-                    time.sleep(1.0)
-                    continue
-                with GLOBAL["stats_lock"]:
-                    GLOBAL["smtp_conexoes"] += 1
-                conta = contas_pool[conta_idx % len(contas_pool)]
-                conta_idx += 1
-                pode, espera = RATE_CTRL.pode_enviar(conta["identity_id"], prov)
-                if not pode and espera > 0:
-                    smtp_log("  Rate Controller: a aguardar " + "{:.2f}".format(espera) + "s para " + conta["identity_id"])
-                    time.sleep(min(espera, 5.0))
-                sock, hs_ok = handshake_smtp(sock, conta, mx_host)
-                if not hs_ok:
-                    res["erros"] += 1
-                    with GLOBAL["stats_lock"]:
-                        GLOBAL["smtp_erros"] += 1
-                    if via_proxy and proxy_key:
-                        registrar_timeout(proxy_key, prov)
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    continue
+            n_batches = n_contas_paralelas
+            tamanho_batch = max(1, len(janela) // n_batches)
+            batches = []
+            for i in range(n_batches):
+                inicio = i * tamanho_batch
+                fim = inicio + tamanho_batch if i < n_batches - 1 else len(janela)
+                batches.append(janela[inicio:fim])
+            def processar_batch_conta(args_batch):
+                idx_conta, batch_emails = args_batch
+                conta = contas_selecionadas[idx_conta % len(contas_selecionadas)]
+                res_local = {
+                    "aceites": 0, "tentados": 0, "rejeitados": 0,
+                    "erros": 0, "user_unknown": 0,
+                    "via_proxy": 0, "via_colab": 0,
+                    "smtp_4xx": 0, "smtp_5xx": 0,
+                }
+                fila = deque(batch_emails)
                 enviados_conta = 0
                 while (enviados_conta < MAX_EMAILS_POR_CONTA and fila and
-                       res["aceites"] < META_ACEITES_POR_PROVEDOR and
+                       res_local["aceites"] < META_ACEITES_POR_PROVEDOR and
                        not GLOBAL.get("emergency_stop")):
                     if check_stop_file():
                         break
-                    with GLOBAL["rcpt_lock"]:
-                        lr = GLOBAL["rcpt_aprendido"].get(prov)
-                    bs = min(lr or rcpt_limit, len(fila), MAX_RCPT_POR_CONEXAO)
-                    if bs <= 0:
-                        bs = min(1, len(fila))
-                    batch = [fila.popleft() for _ in range(bs)]
-                    if not batch:
-                        break
-                    res["tentados"] += len(batch)
+                    with GLOBAL["pool_lock"]:
+                        pool_atual = len(GLOBAL["pool"])
+                    if pool_atual == 0:
+                        aguardar_pool_ou_seguir(timeout_seg=min(180, PROXY_COOLDOWN_SEGUNDOS))
+                    sock, mx_host, via_proxy, proxy_key = obter_socket_para_mx(
+                        mx_list, prov, GLOBAL.get("ip_colab")
+                    )
+                    if sock is None:
+                        res_local["erros"] += 1
+                        with GLOBAL["stats_lock"]:
+                            GLOBAL["smtp_erros"] += 1
+                        time.sleep(1.0)
+                        continue
                     with GLOBAL["stats_lock"]:
-                        GLOBAL["smtp_tentativas"] += len(batch)
-                        GLOBAL["smtp_rcpts_total"] += len(batch)
-                    try:
-                        sock.sendall(("MAIL FROM:<" + conta['sender_email'] + ">\r\n").encode())
-                        smtp_log("  -> MAIL FROM:<" + conta['sender_email'] + ">")
-                        mr = recv_smtp(sock)
-                        smtp_log("  <- MAIL FROM: " + str(mr)[:140])
-                        if not mr or not mr[0].startswith("250"):
-                            smtp_log("  MAIL FROM rejeitado")
+                        GLOBAL["smtp_conexoes"] += 1
+                    pode, espera = RATE_CTRL.pode_enviar(conta["identity_id"], prov)
+                    if not pode and espera > 0:
+                        smtp_log("  Rate Controller: a aguardar " + "{:.2f}".format(espera) + "s para " + conta["identity_id"])
+                        time.sleep(min(espera, 5.0))
+                    sock, hs_ok = handshake_smtp(sock, conta, mx_host)
+                    if not hs_ok:
+                        res_local["erros"] += 1
+                        with GLOBAL["stats_lock"]:
+                            GLOBAL["smtp_erros"] += 1
+                        if via_proxy and proxy_key:
+                            registrar_timeout(proxy_key, prov)
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        continue
+                    while (enviados_conta < MAX_EMAILS_POR_CONTA and fila and
+                           res_local["aceites"] < META_ACEITES_POR_PROVEDOR and
+                           not GLOBAL.get("emergency_stop")):
+                        if check_stop_file():
+                            break
+                        with GLOBAL["rcpt_lock"]:
+                            lr = GLOBAL["rcpt_aprendido"].get(prov)
+                        bs = min(lr or rcpt_limit, len(fila), MAX_RCPT_POR_CONEXAO)
+                        if bs <= 0:
+                            bs = min(1, len(fila))
+                        batch = [fila.popleft() for _ in range(bs)]
+                        if not batch:
+                            break
+                        res_local["tentados"] += len(batch)
+                        with GLOBAL["stats_lock"]:
+                            GLOBAL["smtp_tentativas"] += len(batch)
+                        try:
+                            sock.sendall(("MAIL FROM:<" + conta['sender_email'] + ">\r\n").encode())
+                            smtp_log("  -> MAIL FROM:<" + conta['sender_email'] + ">")
+                            mr = recv_smtp(sock)
+                            smtp_log("  <- MAIL FROM: " + str(mr)[:140])
+                            if not mr or not mr[0].startswith("250"):
+                                smtp_log("  MAIL FROM rejeitado")
+                                try:
+                                    sock.close()
+                                except Exception:
+                                    pass
+                                res_local["erros"] += len(batch)
+                                with GLOBAL["stats_lock"]:
+                                    GLOBAL["smtp_erros"] += len(batch)
+                                fila.extendleft(reversed(batch))
+                                if via_proxy and proxy_key:
+                                    registrar_timeout(proxy_key, prov)
+                                break
+                        except Exception as e:
+                            smtp_log("  MAIL FROM erro: " + str(e)[:140])
                             try:
                                 sock.close()
                             except Exception:
                                 pass
-                            res["erros"] += len(batch)
+                            res_local["erros"] += len(batch)
                             with GLOBAL["stats_lock"]:
                                 GLOBAL["smtp_erros"] += len(batch)
                             fila.extendleft(reversed(batch))
-                            if via_proxy and proxy_key:
-                                registrar_timeout(proxy_key, prov)
                             break
-                    except Exception as e:
-                        smtp_log("  MAIL FROM erro: " + str(e)[:140])
-                        try:
-                            sock.close()
-                        except Exception:
-                            pass
-                        res["erros"] += len(batch)
-                        with GLOBAL["stats_lock"]:
-                            GLOBAL["smtp_erros"] += len(batch)
-                        fila.extendleft(reversed(batch))
-                        break
-                    aceitos = []
-                    rcpt_erro_fatal = False
-                    for em in batch:
-                        if GLOBAL.get("emergency_stop"):
+                        aceitos = []
+                        rcpt_erro_fatal = False
+                        for em in batch:
+                            if GLOBAL.get("emergency_stop"):
+                                break
+                            inicio_req = time.time()
+                            try:
+                                sock.sendall(("RCPT TO:<" + em + ">\r\n").encode())
+                                smtp_log("  -> RCPT TO:<" + em + ">")
+                                rr = recv_smtp(sock)
+                                response_time = time.time() - inicio_req
+                                smtp_log("  <- RCPT: " + str(rr)[:140] + " (" + "{:.2f}".format(response_time) + "s)")
+                                if rr:
+                                    primeira = rr[0]
+                                    smtp_code = 0
+                                    try:
+                                        smtp_code = int(primeira[:3])
+                                    except Exception:
+                                        pass
+                                    smtp_message = " ".join(rr)
+                                    registar_resposta_smtp(
+                                        message_id=None, smtp_code=smtp_code, smtp_message=smtp_message,
+                                        provider=prov, recipient_domain=em.split("@")[-1] if "@" in em else "",
+                                        sending_account=conta.get("sender_email", ""), sending_ip=GLOBAL.get("ip_colab", ""),
+                                        domain=conta.get("domain", ""), subdomain=conta.get("base", ""),
+                                        attempt_number=1, response_time=response_time,
+                                    )
+                                    if rr[0].startswith("250") or rr[0].startswith("251"):
+                                        aceitos.append(em)
+                                        RATE_CTRL.registar_sucesso(conta["identity_id"], prov)
+                                        if via_proxy and proxy_key:
+                                            registrar_sucesso(proxy_key, prov)
+                                    else:
+                                        classe, motivo = classificar_resposta_smtp(smtp_code, smtp_message, prov)
+                                        if classe == "USER_UNKNOWN":
+                                            res_local["user_unknown"] += 1
+                                            with GLOBAL["stats_lock"]:
+                                                GLOBAL["smtp_user_unknown"] += 1
+                                            salvar_unknown(em, prov)
+                                        elif classe == "TEMPORARIA" or classe == "THROTTLE":
+                                            res_local["smtp_4xx"] += 1
+                                            with GLOBAL["stats_lock"]:
+                                                GLOBAL["smtp_4xx"] += 1
+                                            RATE_CTRL.registar_erro_temporario(conta["identity_id"], prov, smtp_code)
+                                            RETRY_QUEUE.adicionar(em, prov, attempts=1)
+                                        elif classe == "PERMANENTE" or classe == "REPUTACAO":
+                                            res_local["smtp_5xx"] += 1
+                                            with GLOBAL["stats_lock"]:
+                                                GLOBAL["smtp_5xx"] += 1
+                                            RATE_CTRL.registar_erro_permanente(conta["identity_id"], prov, smtp_code)
+                                            registrar_rejeicao(em, prov, smtp_code, smtp_message)
+                                            res_local["rejeitados"] += 1
+                                            with GLOBAL["stats_lock"]:
+                                                GLOBAL["smtp_rejeitados"] += 1
+                                        if classe == "THROTTLE":
+                                            smtp_log("  THROTTLE DETECTADO - a pausar " + prov)
+                                            RATE_CTRL.registar_throttle(conta["identity_id"], prov, 60)
+                                            break
+                                time.sleep(DELAY_ENTRE_RCPT)
+                            except Exception as e:
+                                smtp_log("  RCPT erro: " + str(e)[:140])
+                                res_local["erros"] += 1
+                                with GLOBAL["stats_lock"]:
+                                    GLOBAL["smtp_erros"] += 1
+                                rcpt_erro_fatal = True
+                                break
+                        if rcpt_erro_fatal:
+                            nao_processados = [b for b in batch if b not in set(aceitos)]
+                            if nao_processados:
+                                fila.extendleft(reversed(nao_processados))
+                                smtp_log("  A devolver " + str(len(nao_processados)) + " emails para a fila")
+                            try:
+                                sock.close()
+                            except Exception:
+                                pass
                             break
-                        inicio_req = time.time()
-                        try:
-                            sock.sendall(("RCPT TO:<" + em + ">\r\n").encode())
-                            smtp_log("  -> RCPT TO:<" + em + ">")
-                            rr = recv_smtp(sock)
-                            response_time = time.time() - inicio_req
-                            smtp_log("  <- RCPT: " + str(rr)[:140] + " (" + "{:.2f}".format(response_time) + "s)")
-                            if rr:
-                                primeira = rr[0]
-                                smtp_code = 0
-                                try:
-                                    smtp_code = int(primeira[:3])
-                                except Exception:
-                                    pass
-                                smtp_message = " ".join(rr)
-                                registar_resposta_smtp(
-                                    message_id=None, smtp_code=smtp_code, smtp_message=smtp_message,
-                                    provider=prov, recipient_domain=em.split("@")[-1] if "@" in em else "",
-                                    sending_account=conta.get("sender_email", ""), sending_ip=GLOBAL.get("ip_colab", ""),
-                                    domain=conta.get("domain", ""), subdomain=conta.get("base", ""),
-                                    attempt_number=1, response_time=response_time,
-                                )
-                                if rr[0].startswith("250") or rr[0].startswith("251"):
-                                    aceitos.append(em)
-                                    RATE_CTRL.registar_sucesso(conta["identity_id"], prov)
-                                    if via_proxy and proxy_key:
-                                        registrar_sucesso(proxy_key, prov)
-                                else:
-                                    classe, motivo = classificar_resposta_smtp(smtp_code, smtp_message, prov)
-                                    if classe == "USER_UNKNOWN":
-                                        res["user_unknown"] += 1
-                                        with GLOBAL["stats_lock"]:
-                                            GLOBAL["smtp_user_unknown"] += 1
-                                        salvar_unknown(em, prov)
-                                    elif classe == "TEMPORARIA" or classe == "THROTTLE":
-                                        res["smtp_4xx"] += 1
-                                        with GLOBAL["stats_lock"]:
-                                            GLOBAL["smtp_4xx"] += 1
-                                        RATE_CTRL.registar_erro_temporario(conta["identity_id"], prov, smtp_code)
-                                        RETRY_QUEUE.adicionar(em, prov, attempts=1)
-                                    elif classe == "PERMANENTE" or classe == "REPUTACAO":
-                                        res["smtp_5xx"] += 1
-                                        with GLOBAL["stats_lock"]:
-                                            GLOBAL["smtp_5xx"] += 1
-                                        RATE_CTRL.registar_erro_permanente(conta["identity_id"], prov, smtp_code)
-                                        registrar_rejeicao(em, prov, smtp_code, smtp_message)
-                                        res["rejeitados"] += 1
-                                        with GLOBAL["stats_lock"]:
-                                            GLOBAL["smtp_rejeitados"] += 1
-                                    if classe == "THROTTLE":
-                                        smtp_log("  THROTTLE DETECTADO - a pausar " + prov)
-                                        RATE_CTRL.registar_throttle(conta["identity_id"], prov, 60)
-                                        break
-                            time.sleep(DELAY_ENTRE_RCPT)
-                        except Exception as e:
-                            smtp_log("  RCPT erro: " + str(e)[:140])
-                            res["erros"] += 1
-                            with GLOBAL["stats_lock"]:
-                                GLOBAL["smtp_erros"] += 1
-                            rcpt_erro_fatal = True
-                            break
-                    if rcpt_erro_fatal:
-                        nao_processados = [b for b in batch if b not in set(aceitos)]
-                        if nao_processados:
-                            fila.extendleft(reversed(nao_processados))
-                            smtp_log("  A devolver " + str(len(nao_processados)) + " emails para a fila")
-                        try:
-                            sock.close()
-                        except Exception:
-                            pass
-                        break
-                    if not aceitos:
-                        try:
-                            sock.sendall(b"RSET\r\n")
-                            recv_smtp(sock)
-                        except Exception:
-                            pass
-                        enviados_conta += bs
-                        continue
-                    try:
-                        sock.sendall(b"DATA\r\n")
-                        smtp_log("  -> DATA")
-                        dr = recv_smtp(sock)
-                        smtp_log("  <- DATA: " + str(dr)[:140])
-                        if not dr or not dr[0].startswith("354"):
-                            res["rejeitados"] += len(aceitos)
-                            with GLOBAL["stats_lock"]:
-                                GLOBAL["smtp_rejeitados"] += len(aceitos)
-                            enviados_conta += bs
+                        if not aceitos:
                             try:
                                 sock.sendall(b"RSET\r\n")
                                 recv_smtp(sock)
                             except Exception:
                                 pass
+                            enviados_conta += bs
                             continue
-                    except Exception as e:
-                        smtp_log("  DATA erro: " + str(e)[:140])
                         try:
-                            sock.close()
-                        except Exception:
-                            pass
-                        res["erros"] += len(aceitos)
-                        with GLOBAL["stats_lock"]:
-                            GLOBAL["smtp_erros"] += len(aceitos)
-                        fila.extendleft(reversed(aceitos))
-                        break
-                    try:
-                        payload = aplicar_mutacao_abracadabra(html_base, conta, aceitos)
-                        if not payload.endswith(b"\r\n"):
-                            payload += b"\r\n"
-                        payload = payload.replace(b"\r\n.", b"\r\n..")
-                        sock.sendall(payload)
-                        sock.sendall(b"\r\n.\r\n")
-                        smtp_log("  -> PAYLOAD (" + str(len(aceitos)) + " RCPTs, " +
-                                 str(len(payload)) + " bytes)")
-                        fr = recv_smtp(sock, timeout=30)
-                        smtp_log("  <- FINAL: " + str(fr)[:160])
-                        if fr and fr[0].startswith("250"):
-                            res["aceites"] += len(aceitos)
-                            with GLOBAL["stats_lock"]:
-                                GLOBAL["smtp_aceites"] += len(aceitos)
-                                if via_proxy:
-                                    GLOBAL["smtp_via_proxy"] += len(aceitos)
-                                else:
-                                    GLOBAL["smtp_via_colab"] += len(aceitos)
-                            for em_aceite in aceitos:
-                                registrar_aceite(em_aceite, prov, conta.get("identity_id", ""), mx_host)
-                            if via_proxy and proxy_key:
-                                registrar_sucesso(proxy_key, prov)
-                            talvez_salvar_checkpoint()
-                        else:
-                            res["rejeitados"] += len(aceitos)
-                            with GLOBAL["stats_lock"]:
-                                GLOBAL["smtp_rejeitados"] += len(aceitos)
-                    except Exception as e:
-                        smtp_log("  PAYLOAD erro: " + str(e)[:140])
-                        res["erros"] += len(aceitos)
-                        with GLOBAL["stats_lock"]:
-                            GLOBAL["smtp_erros"] += len(aceitos)
-                        try:
-                            sock.sendall(b"RSET\r\n")
-                            recv_smtp(sock)
-                        except Exception:
+                            sock.sendall(b"DATA\r\n")
+                            smtp_log("  -> DATA")
+                            dr = recv_smtp(sock)
+                            smtp_log("  <- DATA: " + str(dr)[:140])
+                            if not dr or not dr[0].startswith("354"):
+                                res_local["rejeitados"] += len(aceitos)
+                                with GLOBAL["stats_lock"]:
+                                    GLOBAL["smtp_rejeitados"] += len(aceitos)
+                                enviados_conta += bs
+                                try:
+                                    sock.sendall(b"RSET\r\n")
+                                    recv_smtp(sock)
+                                except Exception:
+                                    pass
+                                continue
+                        except Exception as e:
+                            smtp_log("  DATA erro: " + str(e)[:140])
                             try:
                                 sock.close()
                             except Exception:
                                 pass
-                        fila.extendleft(reversed(aceitos))
-                        break
-                    enviados_conta += bs
-                    time.sleep(0.1)
-                try:
-                    sock.sendall(b"QUIT\r\n")
-                    recv_smtp(sock, timeout=3)
-                except Exception:
-                    pass
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+                            res_local["erros"] += len(aceitos)
+                            with GLOBAL["stats_lock"]:
+                                GLOBAL["smtp_erros"] += len(aceitos)
+                            fila.extendleft(reversed(aceitos))
+                            break
+                        try:
+                            payload = aplicar_mutacao_abracadabra(html_base, conta, aceitos)
+                            if not payload.endswith(b"\r\n"):
+                                payload += b"\r\n"
+                            payload = payload.replace(b"\r\n.", b"\r\n..")
+                            sock.sendall(payload)
+                            sock.sendall(b"\r\n.\r\n")
+                            smtp_log("  -> PAYLOAD (" + str(len(aceitos)) + " RCPTs, " +
+                                     str(len(payload)) + " bytes)")
+                            fr = recv_smtp(sock, timeout=30)
+                            smtp_log("  <- FINAL: " + str(fr)[:160])
+                            if fr and fr[0].startswith("250"):
+                                res_local["aceites"] += len(aceitos)
+                                with GLOBAL["stats_lock"]:
+                                    GLOBAL["smtp_aceites"] += len(aceitos)
+                                    if via_proxy:
+                                        GLOBAL["smtp_via_proxy"] += len(aceitos)
+                                    else:
+                                        GLOBAL["smtp_via_colab"] += len(aceitos)
+                                for em_aceite in aceitos:
+                                    registrar_aceite(em_aceite, prov, conta.get("identity_id", ""), mx_host)
+                                if via_proxy and proxy_key:
+                                    registrar_sucesso(proxy_key, prov)
+                                talvez_salvar_checkpoint()
+                            else:
+                                res_local["rejeitados"] += len(aceitos)
+                                with GLOBAL["stats_lock"]:
+                                    GLOBAL["smtp_rejeitados"] += len(aceitos)
+                        except Exception as e:
+                            smtp_log("  PAYLOAD erro: " + str(e)[:140])
+                            res_local["erros"] += len(aceitos)
+                            with GLOBAL["stats_lock"]:
+                                GLOBAL["smtp_erros"] += len(aceitos)
+                            try:
+                                sock.sendall(b"RSET\r\n")
+                                recv_smtp(sock)
+                            except Exception:
+                                try:
+                                    sock.close()
+                                except Exception:
+                                    pass
+                            fila.extendleft(reversed(aceitos))
+                            break
+                        enviados_conta += bs
+                        time.sleep(0.1)
+                    try:
+                        sock.sendall(b"QUIT\r\n")
+                        recv_smtp(sock, timeout=3)
+                    except Exception:
+                        pass
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                return res_local
+            batch_args = [(i, b) for i, b in enumerate(batches) if b]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_contas_paralelas) as ex_batch:
+                resultados_batch = list(ex_batch.map(processar_batch_conta, batch_args))
+            for rb in resultados_batch:
+                for k in rb:
+                    if k in res:
+                        res[k] += rb[k]
+            if res["aceites"] >= META_ACEITES_POR_PROVEDOR:
+                break
         try:
             concluido = bool(total_linhas > 0 and linhas_consumidas >= total_linhas)
             CHECKPOINT.atualizar_provedor_index(
@@ -3304,7 +3342,7 @@ def aguardar_pool_minimo(minimo, timeout_seg=900):
     dizer("  AVISO: timeout a aguardar pool (tem " + str(n) + "). O envio usa IP Colab como fallback.")
     return n > 0
 def fase6_envio_massivo(mxs, contas, html_base):
-    definir_fase("FASE 6 - Envio massivo hibrido (PROXY-FIRST)")
+    definir_fase("FASE 6 - Envio massivo PARALELO HIERÁRQUICO")
     faltam = fases_faltantes_para_envio()
     if faltam:
         dizer("  FASE 6 BLOQUEADA - fases obrigatorias incompletas: " + ", ".join(faltam))
@@ -3332,11 +3370,12 @@ def fase6_envio_massivo(mxs, contas, html_base):
         return
     with GLOBAL["pool_lock"]:
         n_pool = len(GLOBAL["pool"])
-    trabalhadores = max(1, min(WORKERS_ENVIO, len(tasks), 400))
-    dizer("  Threads de envio: " + str(trabalhadores) + " (config=" + str(WORKERS_ENVIO) +
-          ") | pool=" + str(n_pool))
+    n_provedores_paralelos = min(PROVEDORES_PARALELOS, len(tasks))
+    dizer("  Threads de envio (provedores paralelos): " + str(n_provedores_paralelos))
+    dizer("  Contas paralelas por provedor: " + str(CONTAS_PARALELAS_POR_PROVEDOR))
+    dizer("  Pool de proxies: " + str(n_pool) + " + IP Colab fallback")
     marcar_fase("FASE6_ENVIO_INICIO", True, str(len(tasks)) + " provedores")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=trabalhadores) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_provedores_paralelos) as ex:
         futs = [ex.submit(enviar_para_provedor, t) for t in tasks]
         while not all(f.done() for f in futs) and not GLOBAL.get("emergency_stop"):
             time.sleep(3)
@@ -3516,7 +3555,7 @@ def enviar_email_unico(dest, assunto, html, conta):
         smtp_log("enviar_email_unico fatal: " + str(e)[:140])
         return False
 def gerar_relatorio(rt):
-    assunto = "VERISCOPE V19.5.2 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
+    assunto = "VERISCOPE V19.6.0 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
     linhas_fases = ""
     try:
         with GLOBAL["stats_lock"]:
@@ -3554,7 +3593,7 @@ tr:nth-child(even){background:#f6f9f6}
 .no{color:#c0392b;font-weight:bold}
 ul{line-height:1.7}
 </style></head><body>
-<h1>VERISCOPE V19.5.2 - HEADLESS COM AUTO-RESTART</h1>
+<h1>VERISCOPE V19.6.0 - PARALELISMO HIERÁRQUICO</h1>
 <h2>Resumo</h2>
 <ul>
 <li>IP Colab: <b>""" + str(GLOBAL.get('ip_colab')) + """</b></li>
@@ -3569,7 +3608,9 @@ ul{line-height:1.7}
 <li>Proxies descartados (mortos): <b>""" + str(GLOBAL.get('proxies_mortos_count')) + """</b></li>
 <li>Blocos proxy/provedor banidos: <b>""" + str(GLOBAL.get('proxies_banidos')) + """</b></li>
 <li>Bases DNS actualizadas: <b>""" + str(GLOBAL.get('dns_updated')) + "/" + str(GLOBAL.get('dns_total')) + """</b></li>
-<li>Variacoes Mail From: <b>""" + str(len(GLOBAL.get('mail_from_variations', []))) + """</b></li>
+<li>Variacoes Mail From: <b>""" + str(len(GLOBAL.get('mail_from_varations', []))) + """</b></li>
+<li>Contas paralelas por provedor: <b>""" + str(CONTAS_PARALELAS_POR_PROVEDOR) + """</b></li>
+<li>Provedores paralelos: <b>""" + str(PROVEDORES_PARALELOS) + """</b></li>
 <li><b>MODO RECUPERACAO: """ + ("SIM" if GLOBAL.get("modo_recuperacao") else "NAO") + """</b></li>
 <li><b>DESec Requests: """ + str(GLOBAL.get('desec_requests', 0)) + """ | OK: """ + str(GLOBAL.get('desec_success', 0)) + """ | Fail: """ + str(GLOBAL.get('desec_failures', 0)) + """</b></li>
 </ul>
@@ -3734,11 +3775,12 @@ def main():
     threading.Thread(target=time_limit_watcher, daemon=True).start()
     threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
     time.sleep(1)
-    dizer("VERISCOPE V19.5.2 HEADLESS [" + execution_id + "]")
+    dizer("VERISCOPE V19.6.0 HEADLESS [" + execution_id + "]")
+    dizer("PARALELISMO: " + str(PROVEDORES_PARALELOS) + " provedores x " +
+          str(CONTAS_PARALELAS_POR_PROVEDOR) + " contas paralelas")
     dizer("Workers configurados: download=" + str(WORKERS_DOWNLOAD) +
           " mx=" + str(WORKERS_MX) + " envio=" + str(WORKERS_ENVIO) +
           " scraper=" + str(WORKERS_SCRAPER) + " validacao=" + str(WORKERS_PROXY_PIPELINE))
-    dizer("SHARD: " + str(WORKFLOW_SHARD_ID + 1) + "/" + str(WORKFLOW_SHARD_COUNT))
     dizer("CHECKPOINT: " + ("RECUPERAR" if tem_checkpoint else "NOVO"))
     if tem_checkpoint:
         dizer("  Aceites recuperados: " + "{:,}".format(GLOBAL["smtp_aceites"]))
@@ -3878,7 +3920,7 @@ def main():
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                     api.upload_file(
                         path_or_fileobj=rp,
-                        path_in_repo="reports/v19_5_2_" + ts + ".html",
+                        path_in_repo="reports/v19_6_0_" + ts + ".html",
                         repo_id=HF_LOGS_REPO,
                         repo_type="dataset",
                         token=HF_TOKEN
@@ -3923,7 +3965,6 @@ def main():
         print("  Logs             : " + LOG_DIR, flush=True)
         print("  MODO RECUPERACAO : " + ("SIM" if GLOBAL.get("modo_recuperacao") else "NAO"), flush=True)
         print("  STATUS FINAL     : " + str(GLOBAL.get("status", "UNKNOWN")), flush=True)
-        print("  SHARD            : " + str(GLOBAL.get("shard_id", 0) + 1) + "/" + str(GLOBAL.get("shard_count", 1)), flush=True)
         print("=" * 70, flush=True)
 if __name__ == "__main__":
     main()
