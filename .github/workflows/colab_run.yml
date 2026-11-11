@@ -55,8 +55,6 @@ jobs:
           gh_pat = os.environ.get("GITHUB_PAT", "")
           gh_repo = os.environ.get("GITHUB_REPO", "")
           
-          # textwrap.dedent permite indentar o codigo aqui para o YAML nao reclamar,
-          # mas remove a indentacao na hora de escrever o ficheiro combined.py
           wrapper_code = textwrap.dedent(f"""\
               import os
               import sys
@@ -84,7 +82,7 @@ jobs:
         continue-on-error: true
 
       - name: Executar Veriscope via combined.py
-        run: colab exec -s veriscope-job -f combined.py
+        run: colab exec -s veriscope-job --timeout 7200 -f combined.py
         timeout-minutes: 350
         continue-on-error: true
 
