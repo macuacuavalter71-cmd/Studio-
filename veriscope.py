@@ -1,15 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V20.0.0 - ARQUITETURA HEADLESS COM PARALELISMO HIERÁRQUICO REAL
-CORREÇÕES CRÍTICAS APLICADAS:
-1. Checkpoint carrega estado COMPLETO (unknowns, aceites, provedores concluídos)
-2. DNS Bulk API - UMA requisição para TODOS os domínios
-3. Paralelismo hierárquico - 407 provedores × 2116 contas em paralelo
-4. Envio 1-a-1 (sem RCPT múltiplos)
-5. Persistência completa de unknowns e aceites entre runs
-6. Dashboard 3D em tempo real
-7. Retry com backoff exponencial
-8. Download condicional (não baixa se já existe)
+VERISCOPE V20.0.1 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
+PARALELISMO HIERÁRQUICO: 407 PROVEDORES x CONTAS EM ROTACAO | ENVIO 1-A-1
+CORRECOES CRITICAS DA V20.0.1 (apos run exec_1794603415_2872):
+1. deSEC: endpoint _bulk NAO EXISTE (404) -> bulk real documentado:
+   PUT /api/v1/domains/{name}/rrsets/ com array JSON, POR DOMINIO, com token certo.
+2. deSEC: rate limits reais (2/s, 15/min, 100/h, 300/dia por dominio; reads 50/min)
+   -> throttle global 1.5s + throttle por dominio 4.5s entre writes.
+3. deSEC: diff-check via GET rrsets -> so escreve o que mudou (0 writes em re-runs).
+4. deSEC: chunks por TAMANHO JSON (nao por contagem fixa de 400) + bissecao em erro 400.
+5. deSEC: 429 com Retry-After > 15min -> marca dominio rate-limited e SALTA (nao bloqueia run).
+6. CHECKPOINT: diretorios criados ANTES do download HF (copia falhava em silencio -> modo NEW).
+7. CHECKPOINT: download/upload HF com logging detalhado (nada mais falha em silencio).
+8. MONITOR: 'continue' mal posicionado corrigido (pool 28/10 nao dispara mais cooldown).
+9. MONITOR: refresh SPF so quando sujo E >= 900s E FASE3 completa (anti-storm de writes).
+10. RELATORIO FINAL: usar pool de proxies (Colab bloqueia porta 25 de saida - direto nunca funciona).
+11. REDE: deteccao de porta 25 bloqueada no Colab -> desativa fallback direto apos 5 falhas.
+12. PROXIES: remocao global de proxy morto (>=8 falhas globais) + revalidacao do pool recuperado.
+13. RETRIES: contagem real de tentativas por (email,provedor) - abandona apos MAX_RETRY_ATTEMPTS.
+14. USER_UNKNOWN/ACEITES: uniao CSV + checkpoint na recuperacao (nunca perde estado).
+Mantem: smart shutdown 5h40m + auto-restart + checkpoint HF + rastreio exato + envio 1-a-1.
 """
 import os
 import sys
@@ -67,7 +77,7 @@ STOP_FILE = "/tmp/veriscope_stop"
 MAX_EXECUTION_SECONDS = 5 * 3600 + 40 * 60
 GLOBAL_CONNECTION_SEMAPHORE = threading.Semaphore(300)
 GLOBAL_HF_SEMAPHORE = threading.Semaphore(16)
-GLOBAL_DESEC_SEMAPHORE = threading.Semaphore(4)
+GLOBAL_DESEC_SEMAPHORE = threading.Semaphore(2)
 GLOBAL_FILEWRITE_SEMAPHORE = threading.Semaphore(32)
 UNKNOWN_FILE_LOCK = threading.Lock()
 ACEITES_FILE_LOCK = threading.Lock()
@@ -117,9 +127,20 @@ RATE_RECUPERACAO_POR_SUCESSO = 0.05
 RATE_MINIMO = 5
 CHECKPOINT_SAVE_INTERVAL = 1000
 CHECKPOINT_TIME_INTERVAL = 3600
-DESEC_MIN_DELAY = 0.5
+# --- CORRECAO V20.0.1: limites reais da API deSEC (documentacao oficial rate-limits) ---
+# dns_api_cheap: 10/s e 50/min (reads) -> espacamento global 1.5s entre requests
+# dns_api_per_domain_expensive: 2/s, 15/min, 100/h, 300/dia (writes POR DOMINIO)
+#   -> intervalo minimo de 4.5s entre writes do MESMO dominio (13/min < 15/min)
+DESEC_MIN_DELAY = 1.5
+DESEC_PER_DOMAIN_WRITE_INTERVAL = 4.5
+DESEC_MAX_BODY_BYTES = 250000
+DESEC_MAX_RRSETS_PER_REQ = 150
+DESEC_MAX_WAIT_429 = 900
 DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
+SPF_REFRESH_INTERVALO_MINIMO = 900
+DIRECT_FAIL_BLOCK_THRESHOLD = 5
+PROXY_GLOBAL_FAIL_REMOVE = 8
 CONTAS_PARALELAS_POR_PROVEDOR = 10
 PROVEDORES_PARALELOS = 407
 RCPT_LIMITS = {
@@ -312,6 +333,9 @@ class CheckpointManager:
     def _salvar_um(self, nome):
         try:
             path = self.paths[nome]
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
             tmp = path + ".tmp"
             with GLOBAL_FILEWRITE_SEMAPHORE:
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -439,18 +463,36 @@ class CheckpointManager:
             self._salvar_um("contas")
     def salvar_unknowns(self, unknowns_set):
         with self.locks["unknown"]:
-            self.states["unknown"]["emails"] = list(unknowns_set)
+            try:
+                lista = list(unknowns_set)
+            except Exception:
+                lista = []
+            if len(lista) > 2000000:
+                lista = lista[-2000000:]
+            self.states["unknown"]["emails"] = lista
             self._salvar_um("unknown")
     def carregar_unknowns(self):
         with self.locks["unknown"]:
-            return set(self.states["unknown"].get("emails", []))
+            try:
+                return set(self.states["unknown"].get("emails", []))
+            except Exception:
+                return set()
     def salvar_aceites(self, aceites_set):
         with self.locks["aceites"]:
-            self.states["aceites"]["emails"] = list(aceites_set)
+            try:
+                lista = list(aceites_set)
+            except Exception:
+                lista = []
+            if len(lista) > 2000000:
+                lista = lista[-2000000:]
+            self.states["aceites"]["emails"] = lista
             self._salvar_um("aceites")
     def carregar_aceites(self):
         with self.locks["aceites"]:
-            return set(self.states["aceites"].get("emails", []))
+            try:
+                return set(self.states["aceites"].get("emails", []))
+            except Exception:
+                return set()
     def salvar_tudo(self):
         for nome in self.paths.keys():
             self._salvar_um(nome)
@@ -487,7 +529,7 @@ def reset_global_state():
         "prov_total": 0, "prov_processed": 0, "emails_read": 0, "mx_found": 0,
         "snapshot_ok": False,
         "repo_files_cache": None,
-        "dns_total": 0, "dns_updated": 0,
+        "dns_total": 0, "dns_updated": 0, "dns_escritos": 0,
         "smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0,
         "smtp_user_unknown": 0, "smtp_erros": 0, "smtp_conexoes": 0,
         "smtp_via_proxy": 0, "smtp_via_colab": 0,
@@ -509,6 +551,7 @@ def reset_global_state():
         "ips_vistos": set(),
         "proxy_state": {},
         "proxy_state_lock": threading.Lock(),
+        "proxy_fail_counts": {},
         "proxies_mortos_count": 0,
         "proxies_banidos": 0,
         "scraping_inicial_feito": False,
@@ -528,6 +571,11 @@ def reset_global_state():
         "ips_lock": threading.Lock(),
         "ultimo_refresh_spf": 0,
         "spf_sujo": True,
+        "spf_record_escrito": None,
+        "spf_ips_escritos": [],
+        "colab_port25_blocked": False,
+        "colab_direct_fails": 0,
+        "dominios_rate_limited": [],
         "rate_controller": {},
         "rate_lock": threading.Lock(),
         "smtp_responses": [],
@@ -617,7 +665,24 @@ class RateController:
         with self.lock:
             stats["throttled_ate"] = time.time() + duracao_segundos
 RATE_CTRL = RateController()
+def garantir_diretorios():
+    """CORRECAO V20.0.1: criar diretorios ANTES de qualquer download/copia HF.
+    Na run exec_1794603415_2872 o shutil.copy dos checkpoints falhou em silencio
+    porque /content/campaign_v19_0 ainda nao existia -> modo NEW indevido."""
+    for d in [BASE_LOCAL, LOG_DIR, DIR_EMAILS, DIR_AUDIT, DIR_PROXIES, DIR_REPO]:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+def garantir_diretorio_para(caminho):
+    try:
+        d = os.path.dirname(caminho)
+        if d:
+            os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
 def limpar_logs_antigos(preservar_checkpoints=True, preservar_saida=False):
+    garantir_diretorios()
     if os.path.exists(LOG_DIR):
         shutil.rmtree(LOG_DIR, ignore_errors=True)
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -723,6 +788,7 @@ def registar_resposta_smtp(message_id, smtp_code, smtp_message, provider,
 def log_desec_request(domain, url, method, status_code, response_body, headers, duration_ms, attempt, payload_preview=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     try:
+        garantir_diretorio_para(DESEC_LOG)
         with GLOBAL_FILEWRITE_SEMAPHORE:
             with open(DESEC_LOG, "a", encoding="utf-8") as f:
                 f.write("=" * 80 + "\n")
@@ -740,16 +806,20 @@ def log_desec_request(domain, url, method, status_code, response_body, headers, 
                 f.write("=" * 80 + "\n")
         with GLOBAL["stats_lock"]:
             GLOBAL["desec_requests"] = GLOBAL.get("desec_requests", 0) + 1
-            if 200 <= status_code < 300:
+            if status_code is not None and 200 <= int(status_code) < 300:
                 GLOBAL["desec_success"] = GLOBAL.get("desec_success", 0) + 1
-            else:
+            elif method != "GET":
                 GLOBAL["desec_failures"] = GLOBAL.get("desec_failures", 0) + 1
     except Exception as e:
-        debug_log("log_desec_request: " + str(e))
+        try:
+            print("[log_desec_request] erro: " + str(e)[:100], flush=True)
+        except Exception:
+            pass
 def upload_all_checkpoints_to_hf():
     dizer("[HF SYNC] A enviar checkpoints e resultados para HuggingFace...")
     try:
         api = HfApi(token=HF_TOKEN)
+        enviados = 0
         for nome, path in CHECKPOINT.paths.items():
             if os.path.exists(path):
                 try:
@@ -760,8 +830,10 @@ def upload_all_checkpoints_to_hf():
                         repo_type="dataset",
                         token=HF_TOKEN
                     )
+                    enviados += 1
                 except Exception as e:
-                    debug_log("HF upload " + nome + ": " + str(e)[:100])
+                    dizer("  [HF SYNC] AVISO upload " + nome + ": " + str(e)[:120])
+                    debug_log("HF upload " + nome + ": " + str(e))
         for fpath in [UNKNOWN_FILE_LOCAL, SAIDA_ACEITES, SAIDA_REJEICAOES]:
             if os.path.exists(fpath):
                 try:
@@ -772,47 +844,75 @@ def upload_all_checkpoints_to_hf():
                         repo_type="dataset",
                         token=HF_TOKEN
                     )
+                    enviados += 1
                 except Exception as e:
-                    debug_log("HF upload " + fpath + ": " + str(e)[:100])
-        dizer("[HF SYNC] Upload concluido.")
+                    dizer("  [HF SYNC] AVISO upload " + os.path.basename(fpath) + ": " + str(e)[:120])
+                    debug_log("HF upload " + fpath + ": " + str(e))
+        dizer("[HF SYNC] Upload concluido: " + str(enviados) + " ficheiros enviados/atualizados.")
     except Exception as e:
         dizer("[HF SYNC] ERRO geral: " + str(e)[:100])
 def download_all_checkpoints_from_hf():
+    """CORRECAO V20.0.1: garantir diretorios ANTES da copia + logging detalhado.
+    Antes, shutil.copy falhava em silencio (diretorio inexistente) -> modo NEW indevido."""
     dizer("[HF SYNC] A baixar checkpoints e resultados do HuggingFace...")
-    try:
-        for nome, path in CHECKPOINT.paths.items():
+    garantir_diretorios()
+    baixados = 0
+    ausentes = 0
+    falhados = 0
+    for nome, path in CHECKPOINT.paths.items():
+        try:
+            local = hf_hub_download(
+                repo_id=HF_LOGS_REPO,
+                filename="checkpoints/" + nome + ".json",
+                repo_type="dataset",
+                token=HF_TOKEN,
+                force_download=True
+            )
+            garantir_diretorio_para(path)
+            shutil.copy(local, path)
+            baixados += 1
             try:
-                local = hf_hub_download(
-                    repo_id=HF_LOGS_REPO,
-                    filename="checkpoints/" + nome + ".json",
-                    repo_type="dataset",
-                    token=HF_TOKEN,
-                    force_download=True
-                )
-                shutil.copy(local, path)
-                dizer("  Baixado: " + nome)
+                tam = os.path.getsize(path)
             except Exception:
-                pass
-        map_files = {
-            "user_unknowns_acumulado.csv": UNKNOWN_FILE_LOCAL,
-            "aceites_finais.csv": SAIDA_ACEITES,
-            "rejeicoes_finais.csv": SAIDA_REJEICAOES
-        }
-        for fname, dest in map_files.items():
-            try:
-                local = hf_hub_download(
-                    repo_id=HF_LOGS_REPO,
-                    filename="results/" + fname,
-                    repo_type="dataset",
-                    token=HF_TOKEN,
-                    force_download=True
-                )
-                shutil.copy(local, dest)
-                dizer("  Baixado: " + fname)
-            except Exception:
-                pass
-    except Exception as e:
-        dizer("[HF SYNC] ERRO geral no download: " + str(e)[:100])
+                tam = -1
+            dizer("  [HF SYNC] Checkpoint baixado: " + nome + ".json (" + "{:,}".format(tam) + " bytes)")
+        except Exception as e:
+            texto = str(e)
+            if "404" in texto or "EntryNotFound" in texto or "does not exist" in texto.lower():
+                ausentes += 1
+                dizer("  [HF SYNC] Checkpoint inexistente na HF: " + nome + ".json (normal na 1a execucao)")
+            else:
+                falhados += 1
+                dizer("  [HF SYNC] FALHA ao baixar " + nome + ".json: " + texto[:140])
+                debug_log("download checkpoint " + nome + ": " + traceback.format_exc())
+    map_files = {
+        "user_unknowns_acumulado.csv": UNKNOWN_FILE_LOCAL,
+        "aceites_finais.csv": SAIDA_ACEITES,
+        "rejeicoes_finais.csv": SAIDA_REJEICAOES
+    }
+    for fname, dest in map_files.items():
+        try:
+            local = hf_hub_download(
+                repo_id=HF_LOGS_REPO,
+                filename="results/" + fname,
+                repo_type="dataset",
+                token=HF_TOKEN,
+                force_download=True
+            )
+            garantir_diretorio_para(dest)
+            shutil.copy(local, dest)
+            baixados += 1
+            dizer("  [HF SYNC] Resultado baixado: " + fname + " -> " + dest)
+        except Exception as e:
+            texto = str(e)
+            if "404" in texto or "EntryNotFound" in texto or "does not exist" in texto.lower():
+                dizer("  [HF SYNC] Resultado inexistente na HF: " + fname + " (normal na 1a execucao)")
+            else:
+                falhados += 1
+                dizer("  [HF SYNC] FALHA ao baixar " + fname + ": " + texto[:140])
+    dizer("[HF SYNC] Downloads: " + str(baixados) + " ok | " + str(ausentes) + " ausentes | " +
+          str(falhados) + " falhados")
+    return baixados
 def trigger_next_run():
     pat = os.environ.get("GITHUB_PAT")
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -852,7 +952,7 @@ def marcar_fase(chave, ok, detalhe=""):
         pass
     CHECKPOINT.atualizar_fase(chave, ok, detalhe)
     simbolo = "[OK] " if ok else "[FALHOU] "
-    dizer(simbolo + " " + chave + " -> " + str(detalhe)[:150])
+    dizer(simbolo + chave + " -> " + str(detalhe)[:150])
 def fases_faltantes_para_envio():
     return CHECKPOINT.fases_faltantes(FASES_OBRIGATORIAS_ANTES_ENVIO)
 def fase_ja_completa(chave):
@@ -946,6 +1046,7 @@ def carregar_mail_from_variations():
                 token=HF_TOKEN,
                 force_download=True
             )
+            garantir_diretorio_para(os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL))
             shutil.copy(local_mf, os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL))
             with open(os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL), "r", encoding="utf-8", errors="ignore") as f:
                 for linha in f:
@@ -1003,7 +1104,7 @@ def render_dashboard_text():
     status = GLOBAL.get("status", "UNKNOWN")
     print(CLEAR_SCREEN, end="", flush=True)
     print("╔" + "═" * 76 + "╗", flush=True)
-    print("║  🚀 VERISCOPE V20.0.0 | PARALELISMO HIERÁRQUICO | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
+    print("║  🚀 VERISCOPE V20.0.1 | PARALELISMO HIERÁRQUICO | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
     print("║  STATUS: " + status.ljust(66) + " ║", flush=True)
     print("║  FASE: " + fase_atual.ljust(66) + " ║", flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
@@ -1020,7 +1121,8 @@ def render_dashboard_text():
     print("║  🏆 Concluídos: {:<14}  4xx:{:<7,}  5xx:{:<7,}  Retry:{:<7,}  ║".format(
         prov_conc, GLOBAL.get('smtp_4xx', 0), GLOBAL.get('smtp_5xx', 0), GLOBAL.get('smtp_retries', 0)), flush=True)
     print("║  📥 Aceites registados: {:<10,}  URLs scrapadas: {:<20} ║".format(aceites_set, scrape_str), flush=True)
-    print("║  🔒 DESec: {} req | {} OK | {} fail                               ║".format(desec_req, desec_ok, desec_fail), flush=True)
+    print("║  🔒 DESec: {} req | {} OK | {} fail | RL:{}                          ║".format(
+        desec_req, desec_ok, desec_fail, len(GLOBAL.get('dominios_rate_limited', []))), flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
     print("║  🛑 Para parar remotamente: touch /tmp/veriscope_stop                  ║", flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
@@ -1080,11 +1182,12 @@ def periodic_checkpoint_thread():
         try:
             salvar_checkpoint_smtp()
             CHECKPOINT.salvar_pool(GLOBAL["pool"], GLOBAL["scraping_checkpoint"], len(GLOBAL["raw_proxies"]))
-            CHECKPOINT.salvar_config(GLOBAL["exec_id"], GLOBAL.get("ip_colab"), status="RUNNING")
-            CHECKPOINT.salvar_unknowns(GLOBAL["user_unknowns"])
-            CHECKPOINT.salvar_aceites(GLOBAL["aceites_emails"])
+            CHECKPOINT.salvar_config(GLOBAL["exec_id"], GLOBAL.get("ip_colab"), status=GLOBAL.get("status", "RUNNING"))
+            CHECKPOINT.salvar_unknowns(GLOBAL.get("user_unknowns", set()))
+            CHECKPOINT.salvar_aceites(GLOBAL.get("aceites_emails", set()))
             upload_all_checkpoints_to_hf()
             GLOBAL["ultimo_checkpoint_tempo"] = time.time()
+            dizer("[CHECKPOINT 1h] Estado salvo e enviado para HF.")
         except Exception as e:
             debug_log("Erro checkpoint 1h: " + str(e))
 def check_stop_file():
@@ -1155,41 +1258,67 @@ def verificar_blacklists(ip):
     return listado
 DESEC_TOKENS_VALIDOS = []
 DOM_TOKEN = {}
+DOM_MIN_TTL = {}
 DOM_TOKEN_LOCK = threading.RLock()
+DOM_ULTIMA_ESCRITA = {}
+DOM_ESCRITA_LOCK = threading.Lock()
 def testar_tokens_desec():
-    definir_fase("FASE 1 - Validacao dos tokens deSEC")
-    if fase_ja_completa("FASE1_TOKENS"):
-        dizer("  Fase 1 ja concluida no checkpoint - a recarregar tokens")
-        DESEC_TOKENS_VALIDOS_LOCAL = list(DESEC_TOKENS_ALL)
-        dizer("  " + str(len(DESEC_TOKENS_VALIDOS_LOCAL)) + " tokens disponiveis (assumidos validos)")
-        return DESEC_TOKENS_VALIDOS_LOCAL
+    """CORRECAO V20.0.1: valida tokens E constroi o mapa dominio->token+minimum_ttl
+    a partir do GET /api/v1/domains/ de cada token (1 request por token, sem probing)."""
+    definir_fase("FASE 1 - Validacao dos tokens deSEC + mapa de dominios")
     def _testar_um(tok):
         if GLOBAL.get("emergency_stop"):
-            return None
+            return tok, None
         try:
             r = requests.get(
                 "https://desec.io/api/v1/domains/",
                 headers={"Authorization": "Token " + tok},
-                timeout=15
+                timeout=20
             )
+            time.sleep(0.4)
             if r.status_code == 200:
-                return tok
-        except Exception:
-            pass
-        return None
+                dados = r.json()
+                doms = []
+                if isinstance(dados, list):
+                    for d in dados:
+                        if isinstance(d, dict) and d.get("name"):
+                            try:
+                                min_ttl = int(d.get("minimum_ttl") or DESEC_TTL)
+                            except Exception:
+                                min_ttl = DESEC_TTL
+                            doms.append((str(d["name"]), min_ttl))
+                return tok, doms
+            debug_log("token " + tok[:6] + "... status " + str(r.status_code))
+        except Exception as e:
+            debug_log("token test " + tok[:6] + "...: " + str(e)[:120])
+        return tok, None
     validos = []
+    mapa_feito = 0
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(DESEC_TOKENS_ALL) or 1)) as ex:
-            for res in ex.map(_testar_um, DESEC_TOKENS_ALL):
-                if res:
-                    validos.append(res)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            for tok, doms in ex.map(_testar_um, DESEC_TOKENS_ALL):
+                if doms is None:
+                    continue
+                validos.append(tok)
+                with DOM_TOKEN_LOCK:
+                    for nome_dom, min_ttl in doms:
+                        DOM_TOKEN[nome_dom] = tok
+                        DOM_MIN_TTL[nome_dom] = min_ttl
+                        mapa_feito += 1
     except Exception as e:
         debug_log("testar_tokens_desec: " + str(e))
-    dizer("Tokens validos: " + str(len(validos)) + "/" + str(len(DESEC_TOKENS_ALL)))
+    DESEC_TOKENS_VALIDOS.clear()
+    DESEC_TOKENS_VALIDOS.extend(validos)
+    dizer("Tokens validos: " + str(len(validos)) + "/" + str(len(DESEC_TOKENS_ALL)) +
+          " | dominios mapeados: " + str(mapa_feito))
+    if mapa_feito > 0:
+        amostra = sorted(DOM_TOKEN.keys())[:5]
+        dizer("  Amostra de dominios: " + ", ".join(amostra) +
+              (" ..." if mapa_feito > 5 else ""))
     if not validos:
         marcar_fase("FASE1_TOKENS", False, "nenhum token valido")
         raise RuntimeError("Nenhum token deSEC valido")
-    marcar_fase("FASE1_TOKENS", True, str(len(validos)) + " tokens")
+    marcar_fase("FASE1_TOKENS", True, str(len(validos)) + " tokens, " + str(mapa_feito) + " dominios")
     return validos
 def download_hf_com_retry(repo_id, filename, repo_type, max_retries=4):
     ultima = None
@@ -1577,6 +1706,7 @@ def baixar_unknowns_acumulado():
             "dataset"
         )
         if local and os.path.exists(local):
+            garantir_diretorio_para(UNKNOWN_FILE_LOCAL)
             shutil.copy(local, UNKNOWN_FILE_LOCAL)
             baixou = True
             dizer("  Ficheiro de blacklist descarregado do HuggingFace")
@@ -1595,10 +1725,18 @@ def baixar_unknowns_acumulado():
             dizer("  AVISO: blacklist local ilegivel (" + str(e)[:80] + ") - a comecar vazia")
             debug_log("ler blacklist local: " + traceback.format_exc())
             unknowns = set()
-    GLOBAL["user_unknowns"] = unknowns
-    dizer("  USER_UNKNOWNs activos: " + "{:,}".format(len(unknowns)) +
-          (" (descarregado)" if baixou else " (ficheiro novo, sera criado)"))
-    return unknowns
+    # CORRECAO V20.0.1: unir CSV + checkpoint + estado atual (nunca perder unknowns)
+    try:
+        cp_unk = CHECKPOINT.carregar_unknowns()
+    except Exception:
+        cp_unk = set()
+    atual = GLOBAL.get("user_unknowns") or set()
+    GLOBAL["user_unknowns"] = unknowns | cp_unk | atual
+    dizer("  USER_UNKNOWNs activos: " + "{:,}".format(len(GLOBAL["user_unknowns"])) +
+          " (CSV: " + "{:,}".format(len(unknowns)) +
+          ", checkpoint: " + "{:,}".format(len(cp_unk)) + ")" +
+          (" [descarregado]" if baixou else " [ficheiro novo, sera criado]"))
+    return GLOBAL["user_unknowns"]
 def salvar_unknown(email, provedor):
     try:
         email = email.lower().strip()
@@ -1611,6 +1749,7 @@ def salvar_unknown(email, provedor):
             return
         GLOBAL["user_unknowns"].add(email)
     try:
+        garantir_diretorio_para(UNKNOWN_FILE_LOCAL)
         with UNKNOWN_FILE_LOCK:
             file_exists = os.path.exists(UNKNOWN_FILE_LOCAL)
             with open(UNKNOWN_FILE_LOCAL, "a", encoding="utf-8", newline="") as f:
@@ -1677,7 +1816,7 @@ def gerar_ficheiros_finais():
         aceites_set = set()
         with GLOBAL["aceites_lock"]:
             aceites_set = set(GLOBAL.get("aceites_emails", set()))
-        if os.path.exists(SAIDA_ACEITES):
+        if os.path.exists(SAIDA_ACEITES) and os.path.getsize(SAIDA_ACEITES) > 60:
             dizer("  Ficheiro " + SAIDA_ACEITES + " ja existe com " +
                   "{:,}".format(len(aceites_set)) + " aceites")
         else:
@@ -2228,6 +2367,57 @@ def validar_proxies_ate_target(target_count):
     if com_pool > 0:
         GLOBAL["spf_sujo"] = True
     return validos_novos
+def revalidar_pool_recuperado():
+    """CORRECAO V20.0.1: em modo recuperacao o pool vem do checkpoint da VM anterior
+    (proxies podem estar mortos). Revalida com banner test rapido antes do envio."""
+    with GLOBAL["pool_lock"]:
+        pool = list(GLOBAL["pool"])
+    if not pool:
+        return 0
+    dizer("  Revalidando " + str(len(pool)) + " proxies recuperados do checkpoint...")
+    def _testar(p):
+        if GLOBAL.get("emergency_stop"):
+            return False
+        sock = None
+        try:
+            with GLOBAL_CONNECTION_SEMAPHORE:
+                sock = _socket_proxy(p["ip"], p["port"], p.get("proto", "socks5"),
+                                     MX_TESTE_VALIDACAO, 25, PORT25_TIMEOUT)
+                banner = sock.recv(4096).decode(errors="ignore").strip()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                sock = None
+                return banner.startswith("220")
+        except Exception:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            return False
+    vivos = []
+    try:
+        trabalhadores = max(4, min(32, len(pool)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=trabalhadores) as ex:
+            resultados = list(ex.map(_testar, pool))
+        for p, vivo in zip(pool, resultados):
+            if vivo:
+                vivos.append(p)
+    except Exception as e:
+        debug_log("revalidar_pool_recuperado: " + traceback.format_exc())
+        vivos = pool
+    mortos = len(pool) - len(vivos)
+    with GLOBAL["pool_lock"]:
+        GLOBAL["pool"] = vivos
+    if mortos > 0:
+        GLOBAL["spf_sujo"] = True
+        with GLOBAL["stats_lock"]:
+            GLOBAL["proxies_mortos_count"] += mortos
+    dizer("  Pool recuperado: " + str(len(vivos)) + " vivos, " + str(mortos) + " mortos removidos")
+    CHECKPOINT.salvar_pool(GLOBAL["pool"], GLOBAL["scraping_checkpoint"], len(GLOBAL["raw_proxies"]))
+    return len(vivos)
 def carregar_proxy_state():
     if os.path.exists(PROXY_STATE_FILE):
         try:
@@ -2251,6 +2441,7 @@ def contar_banidos_no_state(estado):
     return n
 def salvar_proxy_state(estado):
     try:
+        garantir_diretorio_para(PROXY_STATE_FILE)
         with GLOBAL_FILEWRITE_SEMAPHORE:
             tmp = PROXY_STATE_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -2293,74 +2484,229 @@ def registrar_sucesso(proxy_key, provedor):
             if estado[proxy_key][provedor].get("timeouts_consecutivos", 0) != 0:
                 estado[proxy_key][provedor]["timeouts_consecutivos"] = 0
                 salvar_proxy_state(estado)
+def registrar_falha_global_proxy(proxy_key):
+    """CORRECAO V20.0.1: proxy com >= PROXY_GLOBAL_FAIL_REMOVE falhas globais
+    (somadas entre todos os provedores) e REMOVIDO do pool - mitiga proxies mortos
+    que o banimento por-provedor (3 falhas x 407 provedores) demoraria a filtrar."""
+    if not proxy_key or proxy_key == "colab":
+        return
+    remover = False
+    with GLOBAL["proxy_state_lock"]:
+        contagens = GLOBAL.setdefault("proxy_fail_counts", {})
+        contagens[proxy_key] = contagens.get(proxy_key, 0) + 1
+        if contagens[proxy_key] >= PROXY_GLOBAL_FAIL_REMOVE:
+            remover = True
+            contagens.pop(proxy_key, None)
+    if remover:
+        with GLOBAL["pool_lock"]:
+            antes = len(GLOBAL["pool"])
+            GLOBAL["pool"] = [p for p in GLOBAL["pool"]
+                              if (str(p.get("ip")) + ":" + str(p.get("port"))) != proxy_key]
+            removidos = antes - len(GLOBAL["pool"])
+        if removidos > 0:
+            with GLOBAL["stats_lock"]:
+                GLOBAL["proxies_mortos_count"] += removidos
+            GLOBAL["spf_sujo"] = True
+            smtp_log("PROXY " + str(proxy_key) + " REMOVIDO DO POOL (" +
+                     str(PROXY_GLOBAL_FAIL_REMOVE) + "+ falhas globais)")
+            dizer("  [PROXY] Removido proxy morto " + proxy_key + " do pool")
+def registrar_sucesso_global_proxy(proxy_key):
+    if not proxy_key or proxy_key == "colab":
+        return
+    with GLOBAL["proxy_state_lock"]:
+        contagens = GLOBAL.setdefault("proxy_fail_counts", {})
+        if proxy_key in contagens:
+            contagens[proxy_key] = max(0, contagens.get(proxy_key, 0) - 2)
+            if contagens[proxy_key] == 0:
+                contagens.pop(proxy_key, None)
+def registrar_falha_direta():
+    """CORRECAO V20.0.1: deteta bloqueio de porta 25 de saida no Colab (GCE bloqueia)
+    e desativa o fallback direto apos DIRECT_FAIL_BLOCK_THRESHOLD falhas consecutivas."""
+    with GLOBAL["stats_lock"]:
+        GLOBAL["colab_direct_fails"] = GLOBAL.get("colab_direct_fails", 0) + 1
+        if (not GLOBAL.get("colab_port25_blocked") and
+                GLOBAL["colab_direct_fails"] >= DIRECT_FAIL_BLOCK_THRESHOLD):
+            GLOBAL["colab_port25_blocked"] = True
+            msg = ("  [REDE] Porta 25 de saida do Colab confirmada como BLOQUEADA (" +
+                   str(GLOBAL["colab_direct_fails"]) +
+                   " falhas diretas). Desativando fallback direto - SO proxies.")
+    try:
+        if GLOBAL.get("colab_port25_blocked"):
+            dizer(msg)
+    except Exception:
+        pass
 def token_para_dominio(domain):
     with DOM_TOKEN_LOCK:
         if domain in DOM_TOKEN:
             return DOM_TOKEN[domain]
-        for tok in DESEC_TOKENS_VALIDOS:
-            if GLOBAL.get("emergency_stop"):
-                return None
-            try:
-                r = requests.get(
-                    "https://desec.io/api/v1/domains/" + domain + "/",
-                    headers={"Authorization": "Token " + tok},
-                    timeout=15
-                )
-                if r.status_code == 200:
-                    with DOM_TOKEN_LOCK:
-                        DOM_TOKEN[domain] = tok
-                    return tok
-            except Exception:
-                continue
-    return None
-def desec_bulk_update_all_domains(contas_por_dominio, spf_record):
-    """CORREÇÃO CRÍTICA: Bulk API - UMA requisição para TODOS os domínios"""
-    dizer("  [BULK DNS] Agrupando TODOS os rrsets de TODOS os domínios...")
-    todos_rrsets = []
-    dominios_processados = 0
-    for domain, contas_dom in contas_por_dominio.items():
-        tok = token_para_dominio(domain)
-        if not tok:
-            dizer("  AVISO: Token nao encontrado para " + domain)
-            continue
-        rrsets = construir_rrsets_completos(contas_dom, spf_record)
-        if not rrsets:
-            continue
-        todos_rrsets.extend(rrsets)
-        dominios_processados += 1
-    dizer(f"  [BULK DNS] Total: {len(todos_rrsets)} rrsets de {dominios_processados} domínios")
-    if not todos_rrsets:
-        return 0, 0
-    ok_count = 0
-    total_rrsets = len(todos_rrsets)
-    for i in range(0, total_rrsets, DESEC_CHUNK):
+    for tok in DESEC_TOKENS_VALIDOS:
         if GLOBAL.get("emergency_stop"):
-            break
-        chunk = todos_rrsets[i:i + DESEC_CHUNK]
-        chunk_num = (i // DESEC_CHUNK) + 1
-        total_chunks = (total_rrsets + DESEC_CHUNK - 1) // DESEC_CHUNK
-        dizer(f"    Chunk {chunk_num}/{total_chunks} ({len(chunk)} rrsets)...")
-        url = "https://desec.io/api/v1/domains/_bulk/rrsets/"
-        headers = {"Authorization": "Token " + DESEC_TOKENS_VALIDOS[0], "Content-Type": "application/json"}
-        ok, status = desec_put_com_retry(url, headers, chunk, "BULK")
-        if ok:
-            ok_count += len(chunk)
-            dizer(f"    Chunk {chunk_num} OK ({status})")
-        else:
-            dizer(f"    Chunk {chunk_num} FALHOU: {str(status)[:100]}")
-            debug_log(f"chunk bulk {chunk_num} falhou: {status}")
-        time.sleep(1.0)
-    return ok_count, total_rrsets
+            return None
+        try:
+            r = requests.get(
+                "https://desec.io/api/v1/domains/" + domain + "/",
+                headers={"Authorization": "Token " + tok},
+                timeout=15
+            )
+            if r.status_code == 200:
+                try:
+                    dados = r.json()
+                    min_ttl = int((dados or {}).get("minimum_ttl") or DESEC_TTL)
+                except Exception:
+                    min_ttl = DESEC_TTL
+                with DOM_TOKEN_LOCK:
+                    DOM_TOKEN[domain] = tok
+                    DOM_MIN_TTL[domain] = min_ttl
+                return tok
+        except Exception:
+            continue
+    return None
+def desec_throttle_dominio(domain):
+    """CORRECAO V20.0.1: limite real de writes por dominio = 15/min.
+    Garante >= 4.5s entre writes do MESMO dominio (13.3/min < 15/min)."""
+    with DOM_ESCRITA_LOCK:
+        ultima = DOM_ULTIMA_ESCRITA.get(domain, 0.0)
+        agora = time.time()
+        espera = DESEC_PER_DOMAIN_WRITE_INTERVAL - (agora - ultima)
+    if espera > 0:
+        time.sleep(espera)
+    with DOM_ESCRITA_LOCK:
+        DOM_ULTIMA_ESCRITA[domain] = time.time()
+def desec_get_com_retry(url, tok, domain, max_retries=4):
+    """CORRECAO V20.0.1: GET com throttle global (reads limitados a 50/min)."""
+    for tentativa in range(max_retries):
+        if GLOBAL.get("emergency_stop"):
+            return None, "STOP"
+        agora = time.time()
+        espera_min = DESEC_MIN_DELAY - (agora - GLOBAL.get("desec_last_request", 0))
+        if espera_min > 0:
+            time.sleep(espera_min)
+        inicio_req = time.time()
+        try:
+            with GLOBAL_DESEC_SEMAPHORE:
+                r = requests.get(url, headers={"Authorization": "Token " + tok}, timeout=60)
+                duracao_ms = (time.time() - inicio_req) * 1000
+                GLOBAL["desec_last_request"] = time.time()
+                if r.status_code == 200:
+                    log_desec_request(domain=domain, url=url, method="GET",
+                                      status_code=200, response_body="(lista de rrsets omitida: " +
+                                      str(len(r.text)) + " bytes)",
+                                      headers={}, duration_ms=duracao_ms, attempt=tentativa + 1)
+                    return r, None
+                if r.status_code == 429:
+                    try:
+                        wait = int(r.headers.get("Retry-After", 30))
+                    except Exception:
+                        wait = 30
+                    wait = min(wait, DESEC_MAX_WAIT_429)
+                    dizer("  Rate limit deSEC em GET " + domain + ". A esperar " + str(wait) + "s...")
+                    time.sleep(wait + 1)
+                    continue
+                if r.status_code in (500, 502, 503, 504):
+                    time.sleep(5 * (tentativa + 1))
+                    continue
+                log_desec_request(domain=domain, url=url, method="GET",
+                                  status_code=r.status_code, response_body=r.text,
+                                  headers=dict(r.headers), duration_ms=duracao_ms,
+                                  attempt=tentativa + 1)
+                return None, str(r.status_code) + ": " + r.text[:150]
+        except Exception as e:
+            debug_log("desec_get " + url + " tentativa " + str(tentativa + 1) + ": " + str(e)[:140])
+            time.sleep(3 * (tentativa + 1))
+    return None, "MAX_RETRIES"
+def _parse_next_link(headers):
+    try:
+        link = headers.get("Link", "") or ""
+        for parte in link.split(","):
+            if 'rel="next"' in parte:
+                m = re.search(r'<([^>]+)>', parte)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    return None
+def obter_rrsets_atuais(domain, tok):
+    """CORRECAO V20.0.1: le TODOS os rrsets atuais do dominio (com paginacao por cursor)
+    para diff - so escreve o que mudou. Retorna dict {(subname,type): rrset} ou None."""
+    atuais = {}
+    url = "https://desec.io/api/v1/domains/" + domain + "/rrsets/?cursor="
+    paginas = 0
+    while url and paginas < 60:
+        if GLOBAL.get("emergency_stop"):
+            return None
+        r, erro = desec_get_com_retry(url, tok, domain)
+        if r is None:
+            debug_log("obter_rrsets_atuais " + domain + ": " + str(erro))
+            return None
+        try:
+            dados = r.json()
+        except Exception as e:
+            debug_log("obter_rrsets_atuais json " + domain + ": " + str(e))
+            return None
+        if not isinstance(dados, list):
+            debug_log("obter_rrsets_atuais formato inesperado " + domain)
+            return None
+        for rs in dados:
+            if isinstance(rs, dict):
+                chave = (str(rs.get("subname", "")), str(rs.get("type", "")))
+                atuais[chave] = rs
+        paginas += 1
+        url = _parse_next_link(r.headers)
+    return atuais
+def _normalizar_record(tipo, s):
+    """Normaliza record para comparacao (deSEC pode reformatar quotes/token-splits de TXT)."""
+    try:
+        s = str(s).strip()
+        if tipo == "TXT":
+            s = re.sub(r'"\s*"', '', s)
+            s = s.strip().strip('"')
+            s = s.replace(" ", "").replace("\t", "")
+            return s.lower()
+        if tipo == "MX":
+            s = s.lower().rstrip(".")
+            s = re.sub(r"\s+", " ", s.strip())
+            return s
+        return s.lower().rstrip(".")
+    except Exception:
+        return str(s)
+def records_iguais(tipo, atuais_recs, desejados_recs):
+    try:
+        a = sorted(_normalizar_record(tipo, x) for x in (atuais_recs or []))
+        d = sorted(_normalizar_record(tipo, x) for x in (desejados_recs or []))
+        return a == d
+    except Exception:
+        return False
+def dividir_rrsets_por_tamanho(rrsets):
+    """CORRECAO V20.0.1: chunks por TAMANHO JSON (body ~250KB max) e contagem (150),
+    em vez de contagem fixa de 400 (que podia gerar bodies de 700KB+)."""
+    chunks = []
+    atual = []
+    tamanho = 2
+    for rs in rrsets:
+        try:
+            tam = len(json.dumps(rs, ensure_ascii=False).encode("utf-8")) + 1
+        except Exception:
+            tam = 3000
+        if atual and (tamanho + tam > DESEC_MAX_BODY_BYTES or len(atual) >= DESEC_MAX_RRSETS_PER_REQ):
+            chunks.append(atual)
+            atual = []
+            tamanho = 2
+        atual.append(rs)
+        tamanho += tam
+    if atual:
+        chunks.append(atual)
+    return chunks
 def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
     payload_preview = None
     try:
         if isinstance(payload, list) and len(payload) > 0:
+            amostra = payload[0]
             for rrset in payload:
-                if rrset.get("type") == "TXT":
-                    payload_preview = json.dumps(rrset, indent=2)
+                if isinstance(rrset, dict) and rrset.get("type") == "TXT":
+                    amostra = rrset
                     break
-            if not payload_preview:
-                payload_preview = json.dumps(payload[0], indent=2)
+            payload_preview = json.dumps(amostra, indent=2)[:2000]
+            payload_preview = "(bulk com " + str(len(payload)) + " rrsets; amostra) " + payload_preview
     except Exception as e:
         payload_preview = "erro ao serializar: " + str(e)
     for tentativa in range(max_retries):
@@ -2389,22 +2735,31 @@ def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
                         wait_hdr = int(r.headers.get("Retry-After", DESEC_BACKOFF_BASE))
                     except Exception:
                         wait_hdr = DESEC_BACKOFF_BASE
+                    # CORRECAO V20.0.1: NUNCA bloquear a run horas à espera de um dominio.
+                    if wait_hdr > DESEC_MAX_WAIT_429:
+                        dizer("  Rate limit LONGO em " + domain + " (Retry-After=" + str(wait_hdr) +
+                              "s > teto " + str(DESEC_MAX_WAIT_429) + "s). Dominio marcado rate-limited; a saltar.")
+                        return False, "RATE_LIMIT_LONGO"
                     wait_calc = int(DESEC_BACKOFF_BASE * (DESEC_BACKOFF_MULTIPLIER ** tentativa))
-                    wait = max(wait_hdr, wait_calc)
-                    dizer("  Rate limit deSEC (tentativa " + str(tentativa + 1) + "/" + str(max_retries) +
-                          "). A esperar " + str(wait) + "s...")
-                    debug_log("Rate limit deSEC: " + r.text[:200])
+                    wait = min(max(wait_hdr, wait_calc), DESEC_MAX_WAIT_429)
+                    dizer("  Rate limit deSEC em " + domain + " (tentativa " + str(tentativa + 1) +
+                          "/" + str(max_retries) + "). A esperar " + str(wait) + "s...")
+                    debug_log("Rate limit deSEC " + domain + ": " + r.text[:200])
                     time.sleep(wait + 1)
                     continue
                 if r.status_code in (500, 502, 503, 504):
                     wait = 5 * (tentativa + 1)
-                    dizer("  Erro de servidor deSEC (" + str(r.status_code) + "). A esperar " + str(wait) + "s...")
+                    dizer("  Erro de servidor deSEC (" + str(r.status_code) + ") em " + domain +
+                          ". A esperar " + str(wait) + "s...")
                     time.sleep(wait)
                     continue
                 if r.status_code == 400:
-                    dizer("  Erro 400 deSEC (formato invalido): " + r.text[:200])
-                    return False, str(r.status_code) + ": " + r.text[:200]
-                dizer("  Erro deSEC: " + str(r.status_code) + " - " + r.text[:150])
+                    dizer("  Erro 400 deSEC em " + domain + " (validacao): " + r.text[:250])
+                    return False, "400: " + r.text[:250]
+                if r.status_code == 404:
+                    dizer("  Erro 404 deSEC em " + domain + " (dominio nao pertence a este token?)")
+                    return False, "404: " + r.text[:150]
+                dizer("  Erro deSEC " + domain + ": " + str(r.status_code) + " - " + r.text[:150])
                 return False, str(r.status_code) + ": " + r.text[:150]
         except Exception as e:
             duracao_ms = (time.time() - inicio_req) * 1000
@@ -2414,12 +2769,41 @@ def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
                 headers={}, duration_ms=duracao_ms,
                 attempt=tentativa + 1, payload_preview=payload_preview
             )
-            debug_log("desec_put tentativa " + str(tentativa + 1) + ": " + str(e)[:160])
+            debug_log("desec_put tentativa " + str(tentativa + 1) + " " + domain + ": " + str(e)[:160])
             if tentativa < max_retries - 1:
                 wait = 3 * (tentativa + 1)
                 time.sleep(wait)
                 continue
             return False, "MAX_RETRIES"
+    return False, "MAX_RETRIES"
+def escrever_chunk_com_isolamento(url, headers, chunk, domain, profundidade=0):
+    """CORRECAO V20.0.1: bulk PUT e atomico - um rrset invalido reprova o chunk inteiro.
+    Em erro 400, bissecciona o chunk recursivamente para isolar e salvar os rrsets validos."""
+    if not chunk:
+        return 0, []
+    if domain in GLOBAL.get("dominios_rate_limited", []):
+        falhados = [(rs.get("subname"), rs.get("type"), "DOMAIN_RATE_LIMITED") for rs in chunk]
+        return 0, falhados
+    desec_throttle_dominio(domain)
+    ok, status = desec_put_com_retry(url, headers, chunk, domain, max_retries=4)
+    if ok:
+        return len(chunk), []
+    if isinstance(status, str) and status == "RATE_LIMIT_LONGO":
+        with GLOBAL["stats_lock"]:
+            rl = GLOBAL.setdefault("dominios_rate_limited", [])
+            if domain not in rl:
+                rl.append(domain)
+        falhados = [(rs.get("subname"), rs.get("type"), "RATE_LIMIT_LONGO") for rs in chunk]
+        return 0, falhados
+    if isinstance(status, str) and status.startswith("400") and len(chunk) > 1 and profundidade < 6:
+        meio = len(chunk) // 2
+        dizer("    Chunk com 400 em " + domain + " - a isolar por bisseccao (" +
+              str(len(chunk)) + " rrsets -> " + str(meio) + "+" + str(len(chunk) - meio) + ")...")
+        ok1, falhas1 = escrever_chunk_com_isolamento(url, headers, chunk[:meio], domain, profundidade + 1)
+        ok2, falhas2 = escrever_chunk_com_isolamento(url, headers, chunk[meio:], domain, profundidade + 1)
+        return ok1 + ok2, falhas1 + falhas2
+    falhados = [(rs.get("subname"), rs.get("type"), str(status)[:80]) for rs in chunk]
+    return 0, falhados
 def _dividir_em_chunks_com_aspas(texto, tamanho_max=255):
     if not texto:
         return '""'
@@ -2460,9 +2844,15 @@ def obter_ips_para_spf():
                 continue
     lista = [i for i in ips if i and ip_publico_valido(i)]
     return lista[:MAX_SPF_IPS]
-def construir_rrsets_completos(contas_do_dominio, spf_record):
+def construir_rrsets_completos(contas_do_dominio, spf_record, ttl=None):
+    """CORRECAO V20.0.1: ttl parametrizado (respeita minimum_ttl do dominio) + dedup
+    por (subname,type) - duplicados no mesmo request bulk sao rejeitados com 400."""
+    if ttl is None:
+        ttl = DESEC_TTL
     rrsets = []
+    vistos = set()
     dmarc_record = '"v=DMARC1; p=none; sp=none;"'
+    ip_colab = GLOBAL.get("ip_colab") or "127.0.0.1"
     for c in contas_do_dominio:
         base = c["base"]
         domain = c["domain"]
@@ -2472,50 +2862,100 @@ def construir_rrsets_completos(contas_do_dominio, spf_record):
             continue
         if not pub.startswith("v=DKIM1"):
             pub = ("v=DKIM1; k=rsa; p=" + pub) if "p=" in pub else ("v=DKIM1; k=rsa; " + pub)
-        rrsets.append({
-            "subname": base,
-            "type": "TXT",
-            "ttl": DESEC_TTL,
-            "records": [spf_record]
-        })
         dkim_wrapped = _dividir_em_chunks_com_aspas(pub, 255)
-        rrsets.append({
-            "subname": selector + "._domainkey." + base,
-            "type": "TXT",
-            "ttl": DESEC_TTL,
-            "records": [dkim_wrapped],
-        })
-        rrsets.append({
-            "subname": "_dmarc." + base,
-            "type": "TXT",
-            "ttl": DESEC_TTL,
-            "records": [dmarc_record]
-        })
-        ip_colab = GLOBAL.get("ip_colab") or "127.0.0.1"
-        rrsets.append({
-            "subname": "*." + base,
-            "type": "A",
-            "ttl": DESEC_TTL,
-            "records": [ip_colab]
-        })
-        rrsets.append({
-            "subname": base,
-            "type": "A",
-            "ttl": DESEC_TTL,
-            "records": [ip_colab]
-        })
-        rrsets.append({
-            "subname": base,
-            "type": "MX",
-            "ttl": DESEC_TTL,
-            "records": ["10 " + base + "." + domain + "."]
-        })
+        candidatos = [
+            (base, "TXT", [spf_record]),
+            (selector + "._domainkey." + base, "TXT", [dkim_wrapped]),
+            ("_dmarc." + base, "TXT", [dmarc_record]),
+            ("*." + base, "A", [ip_colab]),
+            (base, "A", [ip_colab]),
+            (base, "MX", ["10 " + base + "." + domain + "."]),
+        ]
+        for subname, tipo, records in candidatos:
+            chave = (subname, tipo)
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            rrsets.append({
+                "subname": subname,
+                "type": tipo,
+                "ttl": int(ttl),
+                "records": records,
+            })
     return rrsets
+def atualizar_dominio_completo(domain, contas_dom, spf_record):
+    """CORRECAO V20.0.1: bulk REAL documentado pela deSEC:
+    PUT https://desec.io/api/v1/domains/{name}/rrsets/ com array JSON (por dominio).
+    O endpoint /domains/_bulk/rrsets/ da V20.0.0 NAO EXISTE (404 em todas as 64 reqs).
+    Agora com diff: GET rrsets atuais -> so escreve o que mudou (0 writes em re-runs)."""
+    tok = token_para_dominio(domain)
+    if not tok:
+        dizer("    AVISO: Token nao encontrado para " + domain + " - dominio fora da conta?")
+        return domain, 0, 0, len(contas_dom), "SEM_TOKEN"
+    min_ttl = DOM_MIN_TTL.get(domain, DESEC_TTL)
+    ttl_eff = max(DESEC_TTL, min_ttl)
+    desejados = construir_rrsets_completos(contas_dom, spf_record, ttl=ttl_eff)
+    total_desejados = len(desejados)
+    bases = len(contas_dom)
+    if total_desejados == 0:
+        dizer("    AVISO: Nenhum rrset para " + domain)
+        return domain, 0, 0, bases, "SEM_RRSETS"
+    atuais = obter_rrsets_atuais(domain, tok)
+    para_escrever = []
+    confirmados = 0
+    if atuais is None:
+        dizer("    AVISO: GET rrsets falhou para " + domain + " - escrita cega de " +
+              str(total_desejados) + " rrsets")
+        para_escrever = desejados
+    else:
+        for rs in desejados:
+            chave = (rs.get("subname", ""), rs.get("type", ""))
+            atual = atuais.get(chave)
+            if atual is not None and records_iguais(rs["type"], atual.get("records"), rs.get("records")):
+                confirmados += 1
+            else:
+                para_escrever.append(rs)
+    if not para_escrever:
+        dizer("    " + domain + ": " + str(confirmados) + "/" + str(total_desejados) +
+              " rrsets ja corretos - NADA a escrever (0 writes)")
+        return domain, 0, confirmados, bases, "SEM_MUDANCAS"
+    chunks = dividir_rrsets_por_tamanho(para_escrever)
+    dizer("    " + domain + ": " + str(confirmados) + " ok, " + str(len(para_escrever)) +
+          " rrsets a escrever em " + str(len(chunks)) + " chunk(s) bulk (TTL=" + str(ttl_eff) + ")")
+    url = "https://desec.io/api/v1/domains/" + domain + "/rrsets/"
+    headers = {"Authorization": "Token " + tok, "Content-Type": "application/json"}
+    escritos_total = 0
+    falhas = []
+    for i, chunk in enumerate(chunks, 1):
+        if GLOBAL.get("emergency_stop"):
+            break
+        ok_n, falhas_chunk = escrever_chunk_com_isolamento(url, headers, chunk, domain)
+        escritos_total += ok_n
+        falhas.extend(falhas_chunk)
+        if ok_n > 0:
+            dizer("    Chunk " + str(i) + "/" + str(len(chunks)) + ": " + str(ok_n) +
+                  " rrsets OK (bulk PUT atomico)")
+        if falhas_chunk and ok_n == 0:
+            dizer("    Chunk " + str(i) + "/" + str(len(chunks)) + ": FALHOU (" +
+                  str(len(falhas_chunk)) + " rrsets) - " + str(falhas_chunk[0][2])[:80])
+        if domain in GLOBAL.get("dominios_rate_limited", []):
+            dizer("    " + domain + " rate-limited - a interromper chunks restantes deste dominio")
+            break
+    if falhas:
+        debug_log("falhas DNS " + domain + ": " + json.dumps(falhas[:50], default=str)[:2000])
+    confirmados_final = confirmados + escritos_total
+    if escritos_total > 0 and not falhas:
+        status = "OK"
+    elif confirmados_final > 0:
+        status = "PARCIAL"
+    else:
+        status = "FALHOU"
+    return domain, escritos_total, confirmados_final, bases, status
 def fase3_dns_completo(contas):
-    definir_fase("FASE 3 - DNS BULK (SPF + DKIM + DMARC + A + MX)")
-    if fase_ja_completa("FASE3_DNS"):
-        dizer("  Fase 3 ja concluida no checkpoint - a saltar")
-        return True
+    """CORRECAO V20.0.1: corre SEMPRE em modo diff (mesmo com fase ja completa no
+    checkpoint) - o IP do Colab e os IPs dos proxies MUDAM a cada run, e o diff
+    garante SPF fresco com o minimo de writes (so escreve o que mudou)."""
+    definir_fase("FASE 3 - DNS bulk por dominio com diff (SPF+DKIM+DMARC+A+MX)")
     ips_spf = obter_ips_para_spf()
     spf_record = montar_spf_record(ips_spf)
     dizer("  SPF com " + str(len(ips_spf)) + " IPs (proxies + Colab)")
@@ -2525,28 +2965,116 @@ def fase3_dns_completo(contas):
         por_dom[c["domain"]].append(c)
     total_bases = sum(len(v) for v in por_dom.values())
     GLOBAL["dns_total"] = total_bases
+    with GLOBAL["stats_lock"]:
+        GLOBAL["dominios_rate_limited"] = []
     dizer("  Dominios: " + str(len(por_dom)) + " | bases: " + str(total_bases))
-    ok_bases, total_rrsets = desec_bulk_update_all_domains(por_dom, spf_record)
-    bases_sucesso = (ok_bases // 6) if ok_bases > 0 else 0
-    GLOBAL["dns_updated"] = bases_sucesso
+    dizer("  Endpoint: PUT /api/v1/domains/{name}/rrsets/ (bulk documentado deSEC)")
+    dizer("  Throttling: global " + str(DESEC_MIN_DELAY) + "s | por dominio " +
+          str(DESEC_PER_DOMAIN_WRITE_INTERVAL) + "s entre writes (limite real 15/min)")
+    if fase_ja_completa("FASE3_DNS"):
+        dizer("  Fase 3 ja concluida antes - diff vai atualizar APENAS o que mudou (SPF stale)")
+    ok_bases = 0
+    escritos_total = 0
+    falhados = 0
+    sem_mudancas = 0
+    dominios_lista = sorted(por_dom.keys())
+    for idx, domain in enumerate(dominios_lista, 1):
+        if GLOBAL.get("emergency_stop"):
+            break
+        contas_dom = por_dom[domain]
+        dizer("  [" + str(idx) + "/" + str(len(dominios_lista)) + "] " + domain +
+              " (" + str(len(contas_dom)) + " bases)...")
+        try:
+            dom, escritos, confirmados, bases, status = atualizar_dominio_completo(
+                domain, contas_dom, spf_record)
+        except Exception as e:
+            debug_log("atualizar_dominio_completo " + domain + ": " + traceback.format_exc())
+            dizer("    EXCECAO em " + domain + ": " + str(e)[:120])
+            falhados += 1
+            continue
+        escritos_total += escritos
+        with GLOBAL["stats_lock"]:
+            GLOBAL["dns_escritos"] = GLOBAL.get("dns_escritos", 0) + escritos
+        if status in ("SEM_MUDANCAS", "OK", "PARCIAL"):
+            ok_bases += confirmados // 6
+            if status == "SEM_MUDANCAS":
+                sem_mudancas += 1
+            dizer("    " + status + " (" + str(confirmados) + " rrsets confirmados, " +
+                  str(escritos) + " escritos agora)")
+        else:
+            falhados += 1
+            dizer("    " + status + " - dominio nao configurado nesta run")
+        GLOBAL["dns_updated"] = ok_bases
+    GLOBAL["dns_updated"] = ok_bases
     GLOBAL["ultimo_refresh_spf"] = time.time()
     GLOBAL["spf_sujo"] = False
-    dizer("  DNS: " + str(bases_sucesso) + "/" + str(total_bases) + " bases atualizadas via BULK")
-    marcar_fase("FASE3_DNS", bases_sucesso > 0, str(bases_sucesso) + "/" + str(total_bases) + " bases")
-    return bases_sucesso > 0
+    GLOBAL["spf_record_escrito"] = spf_record
+    GLOBAL["spf_ips_escritos"] = list(ips_spf)
+    dizer("  DNS: " + str(ok_bases) + "/" + str(total_bases) + " bases confirmadas | " +
+          str(escritos_total) + " rrsets escritos | " + str(sem_mudancas) +
+          " dominios sem mudancas | " + str(falhados) + " falhados | rate-limited: " +
+          str(len(GLOBAL.get("dominios_rate_limited", []))))
+    marcar_fase("FASE3_DNS", ok_bases > 0,
+                str(ok_bases) + "/" + str(total_bases) + " bases, " + str(falhados) + " dom falhados")
+    return ok_bases > 0
 def refresh_spf_bulk(motivo=""):
+    """CORRECAO V20.0.1: so reescreve SPF se o record mudou realmente (comparado com
+    o ultimo escrito) - evita a tempestade de writes que causou os rate limits de 3.4h."""
     ips_spf = obter_ips_para_spf()
     if not ips_spf:
         return
     spf_record = montar_spf_record(ips_spf)
+    if spf_record == GLOBAL.get("spf_record_escrito"):
+        GLOBAL["spf_sujo"] = False
+        GLOBAL["ultimo_refresh_spf"] = time.time()
+        dizer("  Refresh SPF (" + str(motivo) + "): SPF inalterado - 0 writes necessarios")
+        return
     dizer("  Refresh SPF (" + str(motivo) + ") com " + str(len(ips_spf)) + " IPs")
     por_dom = defaultdict(list)
     for c in GLOBAL["contas"]:
         por_dom[c["domain"]].append(c)
-    ok_dom, _ = desec_bulk_update_all_domains(por_dom, spf_record)
+    escritos_total = 0
+    doms_ok = 0
+    for domain in sorted(por_dom.keys()):
+        if GLOBAL.get("emergency_stop"):
+            break
+        if domain in GLOBAL.get("dominios_rate_limited", []):
+            continue
+        tok = token_para_dominio(domain)
+        if not tok:
+            continue
+        min_ttl = DOM_MIN_TTL.get(domain, DESEC_TTL)
+        ttl_eff = max(DESEC_TTL, min_ttl)
+        rrsets = []
+        vistos = set()
+        for c in por_dom[domain]:
+            base = c["base"]
+            if (base, "TXT") in vistos:
+                continue
+            vistos.add((base, "TXT"))
+            rrsets.append({
+                "subname": base,
+                "type": "TXT",
+                "ttl": int(ttl_eff),
+                "records": [spf_record],
+            })
+        chunks = dividir_rrsets_por_tamanho(rrsets)
+        url = "https://desec.io/api/v1/domains/" + domain + "/rrsets/"
+        headers = {"Authorization": "Token " + tok, "Content-Type": "application/json"}
+        dom_ok = True
+        for chunk in chunks:
+            ok_n, falhas = escrever_chunk_com_isolamento(url, headers, chunk, domain)
+            escritos_total += ok_n
+            if falhas:
+                dom_ok = False
+        if dom_ok:
+            doms_ok += 1
+    GLOBAL["spf_record_escrito"] = spf_record
+    GLOBAL["spf_ips_escritos"] = list(ips_spf)
     GLOBAL["ultimo_refresh_spf"] = time.time()
     GLOBAL["spf_sujo"] = False
-    dizer("  SPF actualizado em bulk")
+    dizer("  SPF actualizado: " + str(escritos_total) + " rrsets em " + str(doms_ok) +
+          "/" + str(len(por_dom)) + " dominios")
 def fase4_esperar_propagacao():
     definir_fase("FASE 4 - Propagacao DNS (" + str(DNS_PROPAGACAO_SEGUNDOS) + "s)")
     if fase_ja_completa("FASE4_PROPAGACAO"):
@@ -2710,21 +3238,33 @@ def classificar_resposta_smtp(smtp_code, smtp_message, provedor):
         return "PERMANENTE", "Rejeicao permanente generica"
     return "DESCONHECIDA", "Codigo " + str(code)
 class RetryQueue:
+    """CORRECAO V20.0.1: contagem REAL de tentativas por (email, provedor).
+    Antes, cada re-queue usava attempts=1 -> retries infinitos, nunca abandonava."""
     def __init__(self):
         self.items = deque()
+        self.tentativas = {}
         self.lock = threading.Lock()
-    def adicionar(self, email, provedor, attempts=1):
-        if attempts > MAX_RETRY_ATTEMPTS:
+    def adicionar(self, email, provedor, attempts=None):
+        chave = (email, provedor)
+        abandonar = False
+        with self.lock:
+            total = self.tentativas.get(chave, 0) + 1
+            if total > MAX_RETRY_ATTEMPTS:
+                self.tentativas.pop(chave, None)
+                abandonar = True
+            else:
+                self.tentativas[chave] = total
+                delay = RETRY_BACKOFF_BASE * (RETRY_BACKOFF_MULTIPLIER ** (total - 1))
+                next_try = time.time() + delay
+                self.items.append((email, provedor, total, next_try))
+        if abandonar:
             with GLOBAL["stats_lock"]:
                 GLOBAL["smtp_abandonados"] += 1
-            smtp_log("ABANDONADO (max retries): " + email + " para " + provedor)
+            smtp_log("ABANDONADO (max retries " + str(MAX_RETRY_ATTEMPTS) + "): " +
+                     email + " para " + provedor)
             return False
-        delay = RETRY_BACKOFF_BASE * (RETRY_BACKOFF_MULTIPLIER ** (attempts - 1))
-        next_try = time.time() + delay
-        with self.lock:
-            self.items.append((email, provedor, attempts, next_try))
-            with GLOBAL["stats_lock"]:
-                GLOBAL["smtp_retries"] += 1
+        with GLOBAL["stats_lock"]:
+            GLOBAL["smtp_retries"] += 1
         return True
     def obter_prontos(self, max_items=100):
         agora = time.time()
@@ -2739,6 +3279,10 @@ class RetryQueue:
                     remaining.append(item)
             self.items = remaining
         return prontos
+    def limpar(self, email, provedor):
+        chave = (email, provedor)
+        with self.lock:
+            self.tentativas.pop(chave, None)
     def count(self):
         with self.lock:
             return len(self.items)
@@ -2761,8 +3305,6 @@ def salvar_checkpoint_smtp():
         }
         CHECKPOINT.salvar_smtp_stats(stats)
         CHECKPOINT.salvar_por_provedor(GLOBAL.get("por_provedor", {}))
-        CHECKPOINT.salvar_unknowns(GLOBAL["user_unknowns"])
-        CHECKPOINT.salvar_aceites(GLOBAL["aceites_emails"])
         GLOBAL["smtp_aceites_ultima_checkpoint"] = GLOBAL["smtp_aceites"]
     except Exception as e:
         debug_log("salvar_checkpoint_smtp: " + str(e))
@@ -2770,6 +3312,11 @@ def talvez_salvar_checkpoint():
     diff = GLOBAL["smtp_aceites"] - GLOBAL.get("smtp_aceites_ultima_checkpoint", 0)
     if diff >= CHECKPOINT_SAVE_INTERVAL:
         salvar_checkpoint_smtp()
+        try:
+            CHECKPOINT.salvar_unknowns(GLOBAL.get("user_unknowns", set()))
+            CHECKPOINT.salvar_aceites(GLOBAL.get("aceites_emails", set()))
+        except Exception as e:
+            debug_log("talvez_salvar_checkpoint uk/ac: " + str(e))
 def tentar_conexao_com_proxy(proxy_info, mx_host, timeout, provedor):
     proxy_key = str(proxy_info['ip']) + ":" + str(proxy_info['port'])
     if not proxy_pode_usar(proxy_key, provedor):
@@ -2790,11 +3337,14 @@ def tentar_conexao_com_proxy(proxy_info, mx_host, timeout, provedor):
                 except Exception:
                     pass
                 registrar_timeout(proxy_key, provedor)
+                registrar_falha_global_proxy(proxy_key)
                 return None, None, "banner_invalido"
+            registrar_sucesso_global_proxy(proxy_key)
             return sock, banner, "ok"
     except socket.timeout:
         smtp_log("    TIMEOUT em " + mx_host + " via " + proxy_key)
         registrar_timeout(proxy_key, provedor)
+        registrar_falha_global_proxy(proxy_key)
         if sock is not None:
             try:
                 sock.close()
@@ -2804,6 +3354,7 @@ def tentar_conexao_com_proxy(proxy_info, mx_host, timeout, provedor):
     except (ConnectionResetError, BrokenPipeError, OSError) as e:
         smtp_log("    RESET/ERRO " + proxy_key + ": " + str(e)[:110])
         registrar_timeout(proxy_key, provedor)
+        registrar_falha_global_proxy(proxy_key)
         if sock is not None:
             try:
                 sock.close()
@@ -2813,6 +3364,7 @@ def tentar_conexao_com_proxy(proxy_info, mx_host, timeout, provedor):
     except Exception as e:
         smtp_log("    ERRO " + proxy_key + ": " + str(e)[:110])
         registrar_timeout(proxy_key, provedor)
+        registrar_falha_global_proxy(proxy_key)
         if sock is not None:
             try:
                 sock.close()
@@ -2832,10 +3384,14 @@ def tentar_conexao_direta(mx_host, timeout, provedor):
                     sock.close()
                 except Exception:
                     pass
+                registrar_falha_direta()
                 return None, None, "banner_invalido"
+            with GLOBAL["stats_lock"]:
+                GLOBAL["colab_direct_fails"] = 0
             return sock, banner, "ok"
     except socket.timeout:
         smtp_log("    TIMEOUT direto em " + mx_host)
+        registrar_falha_direta()
         if sock is not None:
             try:
                 sock.close()
@@ -2844,6 +3400,7 @@ def tentar_conexao_direta(mx_host, timeout, provedor):
         return None, None, "timeout"
     except (ConnectionResetError, BrokenPipeError, OSError) as e:
         smtp_log("    RESET direto " + mx_host + ": " + str(e)[:110])
+        registrar_falha_direta()
         if sock is not None:
             try:
                 sock.close()
@@ -2852,6 +3409,7 @@ def tentar_conexao_direta(mx_host, timeout, provedor):
         return None, None, "reset"
     except Exception as e:
         smtp_log("    ERRO direto " + mx_host + ": " + str(e)[:110])
+        registrar_falha_direta()
         if sock is not None:
             try:
                 sock.close()
@@ -2880,7 +3438,9 @@ def obter_socket_para_mx(mx_list, provedor, ip_colab):
                 sock, banner, status = tentar_conexao_com_proxy(proxy, mx_host, timeout, provedor)
                 if sock is not None:
                     return sock, mx_host, True, proxy_key
-    if ip_colab:
+    # CORRECAO V20.0.1: se a porta 25 de saida do Colab ja foi confirmada como
+    # bloqueada (GCE bloqueia), nao desperdicar 15s x MXs x 407 provedores em fallback direto.
+    if ip_colab and not GLOBAL.get("colab_port25_blocked"):
         smtp_log("  IP COLAB (fallback) a percorrer " + str(len(mx_list)) + " MX de " + provedor)
         for mx_host in mx_list:
             if GLOBAL.get("emergency_stop"):
@@ -2888,7 +3448,8 @@ def obter_socket_para_mx(mx_list, provedor, ip_colab):
             sock, banner, status = tentar_conexao_direta(mx_host, timeout, provedor)
             if sock is not None:
                 return sock, mx_host, False, "colab"
-    smtp_log("  TODOS os proxies e o IP Colab falharam para " + provedor)
+    smtp_log("  TODOS os proxies" + (" e o IP Colab" if not GLOBAL.get("colab_port25_blocked") else "") +
+             " falharam para " + provedor)
     return None, None, None, None
 def handshake_smtp(sock, conta, mx_host):
     try:
@@ -2933,7 +3494,7 @@ def aguardar_pool_ou_seguir(timeout_seg=180):
             smtp_log("  Pool vazio - a aguardar reposicao (" + str(timeout_seg) + "s max)")
             avisado = True
         time.sleep(10)
-    smtp_log("  Pool continua vazio apos " + str(timeout_seg) + "s - seguir com IP Colab")
+    smtp_log("  Pool continua vazio apos " + str(timeout_seg) + "s - seguir sem conexao")
     return False
 def enviar_para_provedor(task):
     prov, mx_list, contas_pool, html_base = task
@@ -3053,6 +3614,7 @@ def enviar_para_provedor(task):
                         GLOBAL["smtp_erros"] += 1
                     if via_proxy and proxy_key:
                         registrar_timeout(proxy_key, prov)
+                        registrar_falha_global_proxy(proxy_key)
                     try:
                         sock.close()
                     except Exception:
@@ -3134,8 +3696,10 @@ def enviar_para_provedor(task):
                                 if rr[0].startswith("250") or rr[0].startswith("251"):
                                     aceitos.append(em)
                                     RATE_CTRL.registar_sucesso(conta["identity_id"], prov)
+                                    RETRY_QUEUE.limpar(em, prov)
                                     if via_proxy and proxy_key:
                                         registrar_sucesso(proxy_key, prov)
+                                        registrar_sucesso_global_proxy(proxy_key)
                                 else:
                                     classe, motivo = classificar_resposta_smtp(smtp_code, smtp_message, prov)
                                     if classe == "USER_UNKNOWN":
@@ -3148,7 +3712,7 @@ def enviar_para_provedor(task):
                                         with GLOBAL["stats_lock"]:
                                             GLOBAL["smtp_4xx"] += 1
                                         RATE_CTRL.registar_erro_temporario(conta["identity_id"], prov, smtp_code)
-                                        RETRY_QUEUE.adicionar(em, prov, attempts=1)
+                                        RETRY_QUEUE.adicionar(em, prov)
                                     elif classe == "PERMANENTE" or classe == "REPUTACAO":
                                         res["smtp_5xx"] += 1
                                         with GLOBAL["stats_lock"]:
@@ -3222,7 +3786,7 @@ def enviar_para_provedor(task):
                         payload = payload.replace(b"\r\n.", b"\r\n..")
                         sock.sendall(payload)
                         sock.sendall(b"\r\n.\r\n")
-                        smtp_log("  -> PAYLOAD (" + str(len(aceitos)) + " RCPTs, " +
+                        smtp_log("  -> PAYLOAD (" + str(len(aceitos)) + " RCPT(s), " +
                                  str(len(payload)) + " bytes)")
                         fr = recv_smtp(sock, timeout=30)
                         smtp_log("  <- FINAL: " + str(fr)[:160])
@@ -3240,6 +3804,7 @@ def enviar_para_provedor(task):
                                 registrar_aceite(em_aceite, prov, conta.get("identity_id", ""), mx_host)
                             if via_proxy and proxy_key:
                                 registrar_sucesso(proxy_key, prov)
+                                registrar_sucesso_global_proxy(proxy_key)
                             talvez_salvar_checkpoint()
                         else:
                             res["rejeitados"] += len(aceitos)
@@ -3313,10 +3878,10 @@ def aguardar_pool_minimo(minimo, timeout_seg=900):
         time.sleep(20)
     with GLOBAL["pool_lock"]:
         n = len(GLOBAL["pool"])
-    dizer("  AVISO: timeout a aguardar pool (tem " + str(n) + "). O envio usa IP Colab como fallback.")
+    dizer("  AVISO: timeout a aguardar pool (tem " + str(n) + ").")
     return n > 0
 def fase6_envio_massivo(mxs, contas, html_base):
-    definir_fase("FASE 6 - Envio massivo PARALELO HIERÁRQUICO")
+    definir_fase("FASE 6 - Envio massivo PARALELO HIERÁRQUICO (1-a-1)")
     faltam = fases_faltantes_para_envio()
     if faltam:
         dizer("  FASE 6 BLOQUEADA - fases obrigatorias incompletas: " + ", ".join(faltam))
@@ -3346,8 +3911,11 @@ def fase6_envio_massivo(mxs, contas, html_base):
         n_pool = len(GLOBAL["pool"])
     n_provedores_paralelos = min(PROVEDORES_PARALELOS, len(tasks))
     dizer("  Threads de envio (provedores paralelos): " + str(n_provedores_paralelos))
-    dizer("  Contas paralelas por provedor: " + str(CONTAS_PARALELAS_POR_PROVEDOR))
-    dizer("  Pool de proxies: " + str(n_pool) + " + IP Colab fallback")
+    dizer("  Contas em rotacao por provedor: " + str(len(contas)) +
+          " (MAX_EMAILS_POR_CONTA=" + str(MAX_EMAILS_POR_CONTA) + " por conexao)")
+    dizer("  Envio 1-a-1: MAX_RCPT_POR_CONEXAO=" + str(MAX_RCPT_POR_CONEXAO))
+    dizer("  Pool de proxies: " + str(n_pool) +
+          (" (fallback direto ATIVO)" if not GLOBAL.get("colab_port25_blocked") else " (porta 25 Colab BLOQUEADA - so proxies)"))
     marcar_fase("FASE6_ENVIO_INICIO", True, str(len(tasks)) + " provedores")
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_provedores_paralelos) as ex:
         futs = [ex.submit(enviar_para_provedor, t) for t in tasks]
@@ -3374,8 +3942,8 @@ def fase6_envio_massivo(mxs, contas, html_base):
         GLOBAL["status"] = "COMPLETED"
         CHECKPOINT.salvar_config(GLOBAL["exec_id"], GLOBAL.get("ip_colab"), status="COMPLETED")
         upload_all_checkpoints_to_hf()
-        marcar_fase("FASE6_ENVIO", True,
-                    str(GLOBAL['smtp_aceites']) + " aceites / " + str(GLOBAL['smtp_tentativas']) + " tentativas")
+    marcar_fase("FASE6_ENVIO", True,
+                str(GLOBAL['smtp_aceites']) + " aceites / " + str(GLOBAL['smtp_tentativas']) + " tentativas")
 def monitor_proxies_continuo():
     dizer("[MONITOR] Thread de monitoramento de proxies iniciada (aguarda scraping inicial)")
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
@@ -3392,13 +3960,21 @@ def monitor_proxies_continuo():
             checkpoint = GLOBAL["scraping_checkpoint"]
         smtp_log("[MONITOR] pool=" + str(pool_atual) + " raw=" + str(raw_total) +
                  " checkpoint=" + str(checkpoint))
+        # CORRECAO V20.0.1: 'continue' estava DENTRO do if spf_sujo -> com pool saudavel
+        # (28/10) o monitor caia no ramo de cooldown/refill a cada ciclo (log: "Pool baixo (28/10)").
+        # CORRECAO V20.0.1: refresh SPF so quando sujo E >= 900s desde o ultimo E FASE3 completa
+        # (a condicao OR anterior + proxies novos a cada validacao causava tempestade de writes
+        #  -> rate limits deSEC de 3.4h-6.6h vistos na run de 12/11).
         if pool_atual >= MIN_PROXIES_REFILL:
-            if GLOBAL.get("spf_sujo") or (time.time() - GLOBAL.get("ultimo_refresh_spf", 0) > 900):
+            decorrido_refresh = time.time() - GLOBAL.get("ultimo_refresh_spf", 0)
+            if (GLOBAL.get("spf_sujo") and
+                    decorrido_refresh >= SPF_REFRESH_INTERVALO_MINIMO and
+                    fase_ja_completa("FASE3_DNS")):
                 try:
                     refresh_spf_bulk("agendado")
                 except Exception as e:
                     debug_log("refresh SPF agendado: " + str(e))
-                continue
+            continue
         dizer("[MONITOR] Pool baixo (" + str(pool_atual) + "/" + str(TARGET_VALID_PROXIES) +
               ") - cooldown " + str(PROXY_COOLDOWN_SEGUNDOS) + "s")
         for _i in range(PROXY_COOLDOWN_SEGUNDOS // 10):
@@ -3415,25 +3991,25 @@ def monitor_proxies_continuo():
                 pool_atual = len(GLOBAL["pool"])
                 if pool_atual >= MIN_PROXIES_REFILL:
                     continue
-                checkpoint = GLOBAL["scraping_checkpoint"]
+            checkpoint = GLOBAL["scraping_checkpoint"]
+            with GLOBAL["raw_lock"]:
                 com_raw = len(GLOBAL["raw_proxies"])
-                agora = time.time()
-                if checkpoint >= com_raw and (agora - GLOBAL.get("ultimo_rescrape", 0)) >= RESCRAPE_INTERVALO_MINIMO:
-                    dizer("[MONITOR] Candidatos esgotados - a fazer novo scraping das listas")
-                    GLOBAL["ultimo_rescrape"] = agora
-                    try:
-                        carregar_e_scrapear_proxies(motivo="refill-monitor")
-                    except Exception as e:
-                        debug_log("rescrape monitor: " + traceback.format_exc())
-                    dizer("[MONITOR] Re-scrape falhou: " + str(e)[:120])
-                dizer("[MONITOR] Refill (checkpoint=" + str(GLOBAL["scraping_checkpoint"]) + ")")
+            agora = time.time()
+            if checkpoint >= com_raw and (agora - GLOBAL.get("ultimo_rescrape", 0)) >= RESCRAPE_INTERVALO_MINIMO:
+                dizer("[MONITOR] Candidatos esgotados - a fazer novo scraping das listas")
+                GLOBAL["ultimo_rescrape"] = agora
                 try:
-                    novos = validar_proxies_ate_target(TARGET_VALID_PROXIES)
-                    if novos > 0:
-                        GLOBAL["spf_sujo"] = True
-                        refresh_spf_bulk("refill +" + str(novos))
+                    carregar_e_scrapear_proxies(motivo="refill-monitor")
                 except Exception as e:
-                    debug_log("refill monitor: " + traceback.format_exc())
+                    debug_log("rescrape monitor: " + traceback.format_exc())
+                    dizer("[MONITOR] Re-scrape falhou: " + str(e)[:120])
+            dizer("[MONITOR] Refill (checkpoint=" + str(GLOBAL["scraping_checkpoint"]) + ")")
+            try:
+                novos = validar_proxies_ate_target(TARGET_VALID_PROXIES)
+                if novos > 0 and fase_ja_completa("FASE3_DNS"):
+                    GLOBAL["spf_sujo"] = True
+            except Exception as e:
+                debug_log("refill monitor: " + traceback.format_exc())
                 dizer("[MONITOR] Refill falhou: " + str(e)[:120])
         except Exception as e:
             debug_log("monitor_proxies_continuo: " + str(e))
@@ -3443,6 +4019,9 @@ def monitor_proxies_continuo():
             except Exception:
                 pass
 def enviar_email_unico(dest, assunto, html, conta):
+    """CORRECAO V20.0.1: usar pool de proxies (proxy-first + fallback direto).
+    Antes so usava conexao direta -> Colab/GCE bloqueia porta 25 de saida ->
+    'Email da campanha: FALHOU' e 'Relatorio HTML: FALHOU' em todas as runs."""
     sock = None
     try:
         payload = aplicar_mutacao_abracadabra(html, conta, dest, subject=assunto)
@@ -3450,86 +4029,76 @@ def enviar_email_unico(dest, assunto, html, conta):
         try:
             answers = dns.resolver.resolve(dominio, 'MX')
             mxs_sorted = sorted([(r.preference, str(r.exchange).rstrip('.')) for r in answers])
+            mx_list = [mm[1] for mm in mxs_sorted]
         except Exception as e:
             smtp_log("FINAL: sem MX para " + dominio + " (" + str(e)[:100] + ")")
             return False
-        for _pref, mxh in mxs_sorted:
-            sock = None
+        if not mx_list:
+            return False
+        sock, mx_host, via_proxy, proxy_key = obter_socket_para_mx(
+            mx_list, dominio, GLOBAL.get("ip_colab")
+        )
+        if sock is None:
+            smtp_log("FINAL: sem conexao (proxies + direto) para " + dominio)
+            return False
+        smtp_log("FINAL: conexao via " + ("proxy " + str(proxy_key) if via_proxy else "IP Colab") +
+                 " -> " + str(mx_host))
+        sock, hs_ok = handshake_smtp(sock, conta, mx_host)
+        if not hs_ok:
             try:
-                sock = socket.create_connection((mxh, 25), timeout=30)
-                sock.settimeout(30)
-                banner = sock.recv(4096).decode(errors="ignore").strip()
-                smtp_log("FINAL: " + mxh + " -> " + banner[:60])
-                if not banner.startswith("220"):
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    sock = None
-                    continue
-                sock.sendall(("EHLO " + str(conta['identity_id']) + "\r\n").encode())
-                recv_smtp(sock)
-                sock.sendall(("MAIL FROM:<" + conta['sender_email'] + ">\r\n").encode())
-                mr = recv_smtp(sock)
-                if not mr or not mr[0].startswith("250"):
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    sock = None
-                    continue
-                sock.sendall(("RCPT TO:<" + dest + ">\r\n").encode())
-                rr = recv_smtp(sock)
-                if not rr or not rr[0].startswith("250"):
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    sock = None
-                    continue
-                sock.sendall(b"DATA\r\n")
-                dr = recv_smtp(sock)
-                if not dr or not dr[0].startswith("354"):
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    sock = None
-                    continue
-                corpo = payload
-                if not corpo.endswith(b"\r\n"):
-                    corpo += b"\r\n"
-                corpo = corpo.replace(b"\r\n.", b"\r\n..")
-                sock.sendall(corpo)
-                sock.sendall(b"\r\n.\r\n")
-                fr = recv_smtp(sock, timeout=30)
-                try:
-                    sock.sendall(b"QUIT\r\n")
-                except Exception:
-                    pass
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-                sock = None
-                if fr and fr[0].startswith("250"):
-                    return True
-            except Exception as e:
-                smtp_log("FINAL erro em " + mxh + ": " + str(e)[:140])
-                if sock is not None:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                    sock = None
-                    continue
-        return False
+                sock.close()
+            except Exception:
+                pass
+            return False
+        try:
+            sock.sendall(("MAIL FROM:<" + conta['sender_email'] + ">\r\n").encode())
+            mr = recv_smtp(sock)
+            smtp_log("FINAL MAIL FROM: " + str(mr)[:120])
+            if not mr or not mr[0].startswith("250"):
+                return False
+            sock.sendall(("RCPT TO:<" + dest + ">\r\n").encode())
+            rr = recv_smtp(sock)
+            smtp_log("FINAL RCPT: " + str(rr)[:120])
+            if not rr or not rr[0].startswith("250"):
+                return False
+            sock.sendall(b"DATA\r\n")
+            dr = recv_smtp(sock)
+            if not dr or not dr[0].startswith("354"):
+                return False
+            corpo = payload
+            if not corpo.endswith(b"\r\n"):
+                corpo += b"\r\n"
+            corpo = corpo.replace(b"\r\n.", b"\r\n..")
+            sock.sendall(corpo)
+            sock.sendall(b"\r\n.\r\n")
+            fr = recv_smtp(sock, timeout=30)
+            smtp_log("FINAL DATA: " + str(fr)[:140])
+            try:
+                sock.sendall(b"QUIT\r\n")
+            except Exception:
+                pass
+            if fr and fr[0].startswith("250"):
+                if via_proxy and proxy_key:
+                    registrar_sucesso(proxy_key, dominio)
+                    registrar_sucesso_global_proxy(proxy_key)
+                return True
+            return False
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
     except Exception as e:
         debug_log("enviar_email_unico: " + traceback.format_exc())
         smtp_log("enviar_email_unico fatal: " + str(e)[:140])
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
         return False
 def gerar_relatorio(rt):
-    assunto = "VERISCOPE V20.0.0 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
+    assunto = "VERISCOPE V20.0.1 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
     linhas_fases = ""
     try:
         with GLOBAL["stats_lock"]:
@@ -3556,6 +4125,7 @@ def gerar_relatorio(rt):
     except Exception:
         linhas_prov = "<tr><td colspan='7'>sem dados</td></tr>"
     mail_from_count = len(GLOBAL.get('mail_from_variations', []))
+    rl_doms = ", ".join(GLOBAL.get("dominios_rate_limited", [])[:20]) or "nenhum"
     html = """<html><head><meta charset="utf-8"><style>
 body{font-family:Arial,Helvetica,sans-serif;margin:20px;color:#222}
 h1{color:#2c5f2d}
@@ -3568,10 +4138,10 @@ tr:nth-child(even){background:#f6f9f6}
 .no{color:#c0392b;font-weight:bold}
 ul{line-height:1.7}
 </style></head><body>
-<h1>VERISCOPE V20.0.0 - PARALELISMO HIERÁRQUICO CORRIGIDO</h1>
+<h1>VERISCOPE V20.0.1 - BULK deSEC CORRIGIDO + CHECKPOINT HF CORRIGIDO</h1>
 <h2>Resumo</h2>
 <ul>
-<li>IP Colab: <b>""" + str(GLOBAL.get('ip_colab')) + """</b></li>
+<li>IP Colab: <b>""" + str(GLOBAL.get('ip_colab')) + """</b> (porta 25 saida: """ + ("BLOQUEADA" if GLOBAL.get('colab_port25_blocked') else "ativa/por testar") + """)</li>
 <li>Snapshot HuggingFace: <b>""" + ("SIM" if GLOBAL.get('snapshot_ok') else "nao") + """</b></li>
 <li>Parquets processados: <b>""" + str(GLOBAL.get('pq_downloaded')) + "/" + str(GLOBAL.get('pq_total')) + """</b> (falhas: """ + str(GLOBAL.get('pq_falhados')) + """)</li>
 <li>Emails na base local: <b>""" + "{:,}".format(GLOBAL.get('emails_read', 0)) + """</b></li>
@@ -3580,12 +4150,12 @@ ul{line-height:1.7}
 <li>URLs de proxy scrapadas: <b>""" + str(GLOBAL.get('urls_scraped')) + "/" + str(GLOBAL.get('urls_total')) + """</b></li>
 <li>Candidatos extraidos: <b>""" + "{:,}".format(GLOBAL.get('proxies_extracted', 0)) + """</b></li>
 <li>Proxies validos no pool: <b>""" + str(len(GLOBAL.get('pool', []))) + "/" + str(TARGET_VALID_PROXIES) + """</b></li>
-<li>Proxies descartados (mortos): <b>""" + str(GLOBAL.get('proxies_mortos_count')) + """</b></li>
+<li>Proxies descartados (mortos/removidos): <b>""" + str(GLOBAL.get('proxies_mortos_count')) + """</b></li>
 <li>Blocos proxy/provedor banidos: <b>""" + str(GLOBAL.get('proxies_banidos')) + """</b></li>
-<li>Bases DNS actualizadas: <b>""" + str(GLOBAL.get('dns_updated')) + "/" + str(GLOBAL.get('dns_total')) + """</b></li>
+<li>Bases DNS confirmadas: <b>""" + str(GLOBAL.get('dns_updated')) + "/" + str(GLOBAL.get('dns_total')) + """</b> | rrsets escritos: <b>""" + str(GLOBAL.get('dns_escritos', 0)) + """</b></li>
+<li>Dominios deSEC rate-limited nesta run: <b>""" + rl_doms + """</b></li>
 <li>Variacoes Mail From: <b>""" + str(mail_from_count) + """</b></li>
-<li>Contas paralelas por provedor: <b>""" + str(CONTAS_PARALELAS_POR_PROVEDOR) + """</b></li>
-<li>Provedores paralelos: <b>""" + str(PROVEDORES_PARALELOS) + """</b></li>
+<li>Provedores paralelos: <b>""" + str(PROVEDORES_PARALELOS) + """</b> | RCPT por transacao: <b>""" + str(MAX_RCPT_POR_CONEXAO) + """</b></li>
 <li><b>MODO RECUPERACAO: """ + ("SIM" if GLOBAL.get("modo_recuperacao") else "NAO") + """</b></li>
 <li><b>DESec Requests: """ + str(GLOBAL.get('desec_requests', 0)) + """ | OK: """ + str(GLOBAL.get('desec_success', 0)) + """ | Fail: """ + str(GLOBAL.get('desec_failures', 0)) + """</b></li>
 </ul>
@@ -3677,7 +4247,8 @@ def baixar_ficheiros_campanha():
             token=HF_TOKEN,
             force_download=True
         )
-        shutil.copy(local_mailfrom, os.path.join(BASE_LOCAL, "mail_from_alex_liquidity_alert_2115.txt"))
+        garantir_diretorio_para(os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL))
+        shutil.copy(local_mailfrom, os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL))
         dizer("  mail_from descarregado para " + BASE_LOCAL)
     except Exception as e:
         dizer("  AVISO: Falha ao baixar ficheiros de campanha: " + str(e)[:100])
@@ -3685,7 +4256,11 @@ def main():
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG
     diagnostico_ambiente_hf()
     execution_id = reset_global_state()
-    download_all_checkpoints_from_hf()
+    # CORRECAO V20.0.1 CRITICA: criar diretorios ANTES do download HF.
+    # Na run exec_1794603415_2872 o shutil.copy dos checkpoints falhou em silencio
+    # (diretorio /content/campaign_v19_0 nao existia) -> deteccao NEW -> run recomecou do zero.
+    garantir_diretorios()
+    n_baixados = download_all_checkpoints_from_hf()
     CHECKPOINT._carregar_tudo()
     config = CHECKPOINT.obter_config()
     if config.get("status") == "COMPLETED":
@@ -3731,15 +4306,17 @@ def main():
         with GLOBAL["stats_lock"]:
             for chave, info in CHECKPOINT.states["fases"].items():
                 GLOBAL["fases"][chave] = info
-        # CORREÇÃO CRÍTICA: Carregar unknowns e aceites do checkpoint
-        unknowns_cp = CHECKPOINT.carregar_unknowns()
-        if unknowns_cp:
-            GLOBAL["user_unknowns"] = unknowns_cp
-            dizer("[RECUPERACAO] User unknowns carregados: " + "{:,}".format(len(unknowns_cp)))
-        aceites_cp = CHECKPOINT.carregar_aceites()
-        if aceites_cp:
-            GLOBAL["aceites_emails"] = aceites_cp
-            dizer("[RECUPERACAO] Aceites carregados: " + "{:,}".format(len(aceites_cp)))
+        try:
+            unknowns_cp = CHECKPOINT.carregar_unknowns()
+            if unknowns_cp:
+                GLOBAL["user_unknowns"] = set(GLOBAL.get("user_unknowns", set())) | unknowns_cp
+                dizer("[RECUPERACAO] User unknowns do checkpoint: " + "{:,}".format(len(unknowns_cp)))
+            aceites_cp = CHECKPOINT.carregar_aceites()
+            if aceites_cp:
+                GLOBAL["aceites_emails"] = set(GLOBAL.get("aceites_emails", set())) | aceites_cp
+                dizer("[RECUPERACAO] Aceites do checkpoint: " + "{:,}".format(len(aceites_cp)))
+        except Exception as e:
+            debug_log("recuperar unknowns/aceites do CP: " + str(e))
         if os.path.exists(SAIDA_ACEITES):
             try:
                 with open(SAIDA_ACEITES, "r", encoding="utf-8", errors="ignore") as f:
@@ -3747,11 +4324,13 @@ def main():
                     for row in reader:
                         if row and row.get("email"):
                             GLOBAL["aceites_emails"].add(row["email"].lower().strip())
-                dizer("[RECUPERACAO] Aceites anteriores carregados do ficheiro: " + "{:,}".format(len(GLOBAL["aceites_emails"])))
+                dizer("[RECUPERACAO] Aceites totais (CSV + CP): " + "{:,}".format(len(GLOBAL["aceites_emails"])))
             except Exception as e:
                 debug_log("recuperar aceites do ficheiro: " + str(e))
         limpar_logs_antigos(preservar_checkpoints=True, preservar_saida=True)
     else:
+        dizer("[CHECKPOINT] Nenhum checkpoint encontrado (baixados da HF: " + str(n_baixados) +
+              ") - execucao NOVA")
         limpar_logs_antigos(preservar_checkpoints=False, preservar_saida=False)
     LOG_FILE = os.path.join(LOG_DIR, "log_" + execution_id + ".txt")
     SMTP_LOG = os.path.join(LOG_DIR, "smtp_" + execution_id + ".txt")
@@ -3771,9 +4350,9 @@ def main():
     threading.Thread(target=time_limit_watcher, daemon=True).start()
     threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
     time.sleep(1)
-    dizer("VERISCOPE V20.0.0 HEADLESS [" + execution_id + "]")
-    dizer("PARALELISMO: " + str(PROVEDORES_PARALELOS) + " provedores x " +
-          str(CONTAS_PARALELAS_POR_PROVEDOR) + " contas paralelas")
+    dizer("VERISCOPE V20.0.1 HEADLESS [" + execution_id + "]")
+    dizer("PARALELISMO: " + str(PROVEDORES_PARALELOS) + " provedores paralelos x " +
+          "rotacao de contas | envio 1-a-1 (MAX_RCPT=" + str(MAX_RCPT_POR_CONEXAO) + ")")
     dizer("Workers configurados: download=" + str(WORKERS_DOWNLOAD) +
           " mx=" + str(WORKERS_MX) + " envio=" + str(WORKERS_ENVIO) +
           " scraper=" + str(WORKERS_SCRAPER) + " validacao=" + str(WORKERS_PROXY_PIPELINE))
@@ -3815,10 +4394,16 @@ def main():
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
         definir_fase("FASE 2.5 - Proxies: leitura do disco + scraping + validacao")
+        pool_ok = False
         if len(GLOBAL["pool"]) >= TARGET_VALID_PROXIES:
-            dizer("  Pool ja recuperado do checkpoint: " + str(len(GLOBAL["pool"])) + " proxies")
-            marcar_fase("FASE25_PROXIES", True, "pool recuperado " + str(len(GLOBAL["pool"])))
-        else:
+            dizer("  Pool recuperado do checkpoint: " + str(len(GLOBAL["pool"])) + " proxies")
+            vivos = revalidar_pool_recuperado()
+            if vivos >= MIN_PROXIES_REFILL:
+                pool_ok = True
+                marcar_fase("FASE25_PROXIES", True, "pool recuperado e revalidado " + str(vivos))
+            else:
+                dizer("  Pool recuperado morreu (so " + str(vivos) + " vivos) - a fazer scraping novo")
+        if not pool_ok:
             try:
                 carregar_e_scrapear_proxies(motivo="inicial")
             except Exception as e:
@@ -3838,13 +4423,13 @@ def main():
                         "pool=" + str(n_pool) + " raw=" + "{:,}".format(n_raw) +
                         " urls=" + str(GLOBAL['urls_scraped']) + "/" + str(GLOBAL['urls_total']))
             if n_pool == 0:
-                dizer("  AVISO: pool de proxies vazio. O envio vai usar o IP do Colab como fallback.")
+                dizer("  AVISO: pool de proxies vazio. O Colab bloqueia porta 25 - sem proxies nao ha envio.")
                 dizer("         Verifique se colocou proxies.txt em " + DIR_PROXIES)
         GLOBAL["scraping_inicial_feito"] = True
         GLOBAL["ultimo_rescrape"] = time.time()
         proxy_monitor_thread = threading.Thread(target=monitor_proxies_continuo, daemon=True)
         proxy_monitor_thread.start()
-        dizer("  Monitor de proxies activado (refill automatico + SPF bulk)")
+        dizer("  Monitor de proxies activado (refill automatico + SPF throttled)")
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
         fase3_dns_completo(contas)
@@ -3921,7 +4506,7 @@ def main():
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                     api.upload_file(
                         path_or_fileobj=rp,
-                        path_in_repo="reports/v20_0_0_" + ts + ".html",
+                        path_in_repo="reports/v20_0_1_" + ts + ".html",
                         repo_id=HF_LOGS_REPO,
                         repo_type="dataset",
                         token=HF_TOKEN
@@ -3958,8 +4543,11 @@ def main():
         print("  Abandonados      : " + "{:,}".format(GLOBAL.get('smtp_abandonados', 0)), flush=True)
         print("  Parquets         : " + str(GLOBAL['pq_downloaded']) + "/" + str(GLOBAL['pq_total']) +
               " (falhas " + str(GLOBAL['pq_falhados']) + ")", flush=True)
+        print("  DNS confirmado   : " + str(GLOBAL.get('dns_updated', 0)) + "/" + str(GLOBAL.get('dns_total', 0)) +
+              " bases | escritos: " + str(GLOBAL.get('dns_escritos', 0)) + " rrsets", flush=True)
         print("  DESec Requests   : " + str(GLOBAL.get('desec_requests', 0)) + " | OK: " +
-              str(GLOBAL.get('desec_success', 0)) + " | Fail: " + str(GLOBAL.get('desec_failures', 0)), flush=True)
+              str(GLOBAL.get('desec_success', 0)) + " | Fail: " + str(GLOBAL.get('desec_failures', 0)) +
+              " | RL doms: " + str(len(GLOBAL.get('dominios_rate_limited', []))), flush=True)
         print("  Ficheiros saida  : " + SAIDA_ACEITES + " | " + SAIDA_UNKNOWN, flush=True)
         print("  Checkpoints      : " + BASE_LOCAL + "/cp_*.json", flush=True)
         print("  Log DESec        : " + DESEC_LOG, flush=True)
