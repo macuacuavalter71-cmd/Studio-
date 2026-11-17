@@ -1,8 +1,3 @@
-# 🚀 VERISCOPE V21.0.0 — CÓDIGO COMPLETO
-
-Aqui está o código completo, pronto para colar numa única célula do Google Colab. Inclui todas as correções discutidas, arquitetura asyncio, 501 workers, checkpoints robustos, dashboard 3D e continuidade perfeita entre runs.
-
-```python
 # -*- coding: utf-8 -*-
 """
 VERISCOPE V21.0.0 - ARQUITETURA ASSÍNCRONA + 501 WORKERS FIXOS
@@ -4209,53 +4204,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-```
-
----
-
-## 📋 RELATÓRIO FINAL DE IMPLEMENTAÇÃO
-
-### ✅ Correções Implementadas (V21.0.0)
-
-| # | Correção | Estado |
-|---|---|---|
-| 1 | **asyncio** em Fase 6 com 501 workers fixos | ✅ CONCLUÍDO |
-| 2 | **Colab como worker #501** paralelo (não fallback) | ✅ CONCLUÍDO |
-| 3 | **4 regras de parada**: morto, timeout, 421, 500 emails | ✅ CONCLUÍDO |
-| 4 | **RCPT dinâmico aprendido** por provedor | ✅ CONCLUÍDO |
-| 5 | **Checkpoint robusto** com campaign_started_at vs run_started_at | ✅ CONCLUÍDO |
-| 6 | **Dashboard 3D HTML** profissional com cubo rotativo | ✅ CONCLUÍDO |
-| 7 | **Upload HF apenas no final** (não periódico) | ✅ CONCLUÍDO |
-| 8 | **Descoberta inteligente** do domínio com 501+ contas | ✅ CONCLUÍDO |
-| 9 | **SPF bulk** com chunks por tamanho | ✅ CONCLUÍDO |
-| 10 | **Sem truncamento** de históricos (removido limite de 2M) | ✅ CONCLUÍDO |
-| 11 | **Todos os tokens deSEC** preservados no código | ✅ CONCLUÍDO |
-| 12 | **Novo repositório HF**: Valter3B/Veriscope_Checkpoints | ✅ CONCLUÍDO |
-| 13 | **Continuidade perfeita** Run #1 → Run #2 | ✅ CONCLUÍDO |
-
-### 📦 Dependências Instaladas Automaticamente
-
-- `aiohttp` - Cliente HTTP assíncrono
-- `aiosmtplib` - Cliente SMTP assíncrono (usado via socket direto para compatibilidade)
-- `nest_asyncio` - Permite asyncio.run() no Colab
-
-### 🎯 Como Usar
-
-1. **Cole o código completo** numa única célula do Google Colab
-2. **Configure as secrets**: `HF_TOKEN`, `GITHUB_PAT`, `GITHUB_REPOSITORY`
-3. **Execute** - o sistema fará:
-   - Download automático de checkpoints do HF
-   - Recuperação do estado anterior (se existir)
-   - Execução assíncrona com 501 workers
-   - Upload final para `Valter3B/Veriscope_Checkpoints`
-
-### 🔄 Continuidade Entre Runs
-
-- **Run #1**: Executa até timeout/interrupção → salva checkpoint
-- **Run #2**: Baixa checkpoint → continua de onde parou
-- **Dashboard**: Mostra contadores acumulados entre runs
-- **Sem perda de dados**: Todos os aceites/unknowns preservados
-
-### 🚀 Próximos Passos
-
-O código está pronto para execução. Basta colar no Colab e executar!
