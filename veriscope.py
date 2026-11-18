@@ -1,24 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V21.0.0 - ARQUITETURA ASYNCIO COMPLETA + CHECKPOINTS TRANSACIONAIS
-501 WORKERS FIXOS (500 PROXIES + 1 COLAB) | DOMINIO UNICO | RCPT DINAMICO
-CORRECOES CRITICAS V21.0.0:
-- CheckpointManager transacional com manifesto SHA-256 + integridade
-- Separacao campaign_started_at vs run_started_at (nao reinicia relogio)
-- Sem truncamento de listas (removido limite 2M)
-- Upload HF apenas no SHUTDOWN (nao periodico) - poupa rate limit
-- Repositorio HF dedicado: Valter3B/Veriscope_Checkpoints
-- Descoberta inteligente de dominio com >=501 contas
-- 501 workers fixos (1 proxy + 1 conta por worker)
-- Worker #501 = IP Colab (PARALELO, nao fallback)
-- SPF Colab atualizado UMA VEZ, depois so novos proxies
-- Orcamento 500 emails/IP/provedor com 4 regras de hibernacao
-- RCPT dinamico aprendido por provedor
-- Scheduler global com anti-colisao IP x provedor
-- Dashboard HTML 3D profissional com dados reais
-- Continuidade perfeita Run#1 -> Run#2 sem perda de estado
-- Tokens deSEC mantidos no codigo (conforme pedido)
-- Logging adaptativo para GitHub Actions (grupos colapsaveis, tickers, emojis)
+VERISCOPE V21.1.0 - MODO AUDITORIA E VALIDACAO DE PROVEDORES
+CORRECOES CRITICAS:
+- Validacao de Proxy robusta (SOCKS5 -> SOCKS4 -> HTTP CONNECT)
+- I/O de Socket nao-bloqueante (run_in_executor) para nao congelar o asyncio
+- smtp_send_recv robusto para respostas SMTP multilinha
+- FASE 6 substituida por Auditoria de Provedores (RCPT-100 + DATA)
+- Logging SMTP cru e detalhado restaurado e melhorado
+- Salvamento de smtp_log no HuggingFace e como Artefato local
+- Paralelismo hierarquico (500 workers simultaneos)
+- Correcao de instalacao de pacotes (dnspython -> dns, dkimpy -> dkim)
+- Correcao de CGNAT na validacao de IPs publicos
 """
 import os
 import sys
@@ -45,7 +37,7 @@ from email.utils import make_msgid, format_datetime
 from itertools import islice
 from urllib.parse import urlparse, urlunparse
 
-# === TOKEN DESEC (mantido conforme pedido) ===
+# === TOKENS E CONFIGURACOES ===
 DESEC_TOKEN = os.environ.get("DESEC_TOKEN", "LuWfqx1GL3uXDmyUEExH1tF4Nena").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 GITHUB_PAT = os.environ.get("GITHUB_PAT", "").strip()
@@ -61,17 +53,24 @@ os.environ["HF_HUB_ETAG_TIMEOUT"] = "60"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 os.environ["PYTHONUNBUFFERED"] = "1"
 
-# === INSTALACAO DE DEPENDENCIAS ===
+# === INSTALACAO DE DEPENDENCIAS (CORRIGIDO) ===
 def install_packages():
-    packages = [
-        "requests", "dnspython", "dkimpy", "cryptography", "pandas",
-        "pyarrow", "huggingface_hub", "psutil", "pysocks",
-        "aiohttp", "aiosmtplib", "nest_asyncio"
-    ]
-    for pkg in packages:
+    packages = {
+        "requests": "requests",
+        "dnspython": "dns",
+        "dkimpy": "dkim",
+        "cryptography": "cryptography",
+        "pandas": "pandas",
+        "pyarrow": "pyarrow",
+        "huggingface_hub": "huggingface_hub",
+        "psutil": "psutil",
+        "pysocks": "socks",
+        "aiohttp": "aiohttp",
+        "aiosmtplib": "aiosmtplib",
+        "nest_asyncio": "nest_asyncio"
+    }
+    for pkg, mod in packages.items():
         try:
-            mod = pkg.replace("-", "_")
-            if mod == "pysocks": mod = "socks"
             __import__(mod)
         except ImportError:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
@@ -82,13 +81,11 @@ import logging
 for _lg in ["huggingface_hub", "datasets", "fsspec", "httpx", "pyarrow",
             "urllib3", "asyncio", "filelock", "aiohttp", "aiosmtplib"]:
     logging.getLogger(_lg).setLevel(logging.ERROR)
-
 import warnings
 warnings.filterwarnings("ignore")
 
 import asyncio
 import aiohttp
-import aiosmtplib
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -106,7 +103,7 @@ except Exception:
 # === CONSTANTES GLOBAIS ===
 CLEAR_SCREEN = "\033[2J\033[H"
 STOP_FILE = "/tmp/veriscope_stop"
-MAX_EXECUTION_SECONDS = 5 * 3600 + 40 * 60  # 5h40m
+MAX_EXECUTION_SECONDS = 5 * 3600 + 40 * 60
 GLOBAL_CONNECTION_SEMAPHORE = threading.Semaphore(300)
 GLOBAL_HF_SEMAPHORE = threading.Semaphore(16)
 GLOBAL_DESEC_SEMAPHORE = threading.Semaphore(2)
@@ -115,12 +112,10 @@ UNKNOWN_FILE_LOCK = threading.Lock()
 ACEITES_FILE_LOCK = threading.Lock()
 REJEICOES_FILE_LOCK = threading.Lock()
 
-# Repositorios HF
 HF_LOGS_REPO = "Valter3B/Campaign_Logs"
 HF_TRADER_REPO = "Valter3B/Trader_Emails"
 HF_CHECKPOINT_REPO = "Valter3B/Veriscope_Checkpoints"
 
-# Configuracoes de campanha
 META_ACEITES_POR_PROVEDOR = 50000
 MAX_EMAILS_POR_CONTA = 500
 MAX_EMAILS_POR_PROVEDOR_DOWNLOAD = float('inf')
@@ -129,21 +124,18 @@ DNS_PROPAGACAO_SEGUNDOS = 300
 FINAL_DESTINATARIO = "bingo_192@naver.com"
 DIA_ATUAL = 1
 
-# Paralelismo asyncio
 WORKERS_DOWNLOAD_ASYNC = 15000
 WORKERS_MX_ASYNC = 99999
 WORKERS_VALIDACAO_ASYNC = 200
-WORKERS_ENVIO_ASYNC = 501
+WORKERS_ENVIO_ASYNC = 500
 WORKERS_DNS_ASYNC = 500
 
-# Configuracoes SMTP
 SMTP_TIMEOUT = 15
 SMTP_TIMEOUT_ASIATICO = 30
 SMTP_RECV_TIMEOUT = 10
 DELAY_ENTRE_RCPT = 0.3
-MAX_RCPT_POR_CONEXAO = 50
+MAX_RCPT_POR_CONEXAO = 100
 
-# deSEC
 DESEC_TTL = 900
 DESEC_CHUNK_BYTES = 400000
 DESEC_MAX_RRSETS_PER_REQ = 150
@@ -153,7 +145,6 @@ DESEC_MAX_WAIT_429 = 900
 DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
 
-# Proxies
 TARGET_VALID_PROXIES = 500
 MIN_PROXIES_REFILL = 5
 PROXY_COOLDOWN_SEGUNDOS = 120
@@ -161,26 +152,21 @@ MAX_TIMEOUTS_BAN = 3
 PROXY_GLOBAL_FAIL_REMOVE = 8
 RESCRAPE_INTERVALO_MINIMO = 300
 
-# SPF
 MAX_SPF_IPS = 250
 SPF_REFRESH_INTERVALO_MINIMO = 900
 
-# Retry
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_BASE = 30
 RETRY_BACKOFF_MULTIPLIER = 2.0
 
-# Rate controller
 RATE_BASELINE_EMAILS_MIN = 60
 RATE_REDUCAO_POR_ERRO = 0.15
 RATE_RECUPERACAO_POR_SUCESSO = 0.05
 RATE_MINIMO = 5
 
-# Checkpoint
 CHECKPOINT_SAVE_INTERVAL = 1000
 CHECKPOINT_TIME_INTERVAL = 3600
 
-# Orcamento IP
 MAX_EMAILS_IP_PROVEDOR = 500
 MIN_INTERVALO_IP_PROVEDOR = 5
 WORKER_HIBERNACAO_421 = 60
@@ -224,15 +210,13 @@ CAMPAIGN = CAMPAIGN_MAP[DIA_ATUAL]
 DESEC_TOKENS_ALL = [DESEC_TOKEN] if DESEC_TOKEN else []
 FALLBACK_PROXY_URLS = []
 
-# Diretorios
-BASE_LOCAL = "/content/campaign_v21_0"
+BASE_LOCAL = "/content/campaign_v21_1"
 DIR_EMAILS = "/content/emails_db"
 DIR_AUDIT = os.path.join(BASE_LOCAL, "audit")
 DIR_PROXIES = "/content/proxies"
 LOG_DIR = os.path.join(BASE_LOCAL, "logs")
 DIR_REPO = "/content/trader_repo"
 
-# Ficheiros de estado
 PROXY_STATE_FILE = os.path.join(BASE_LOCAL, "proxy_state.json")
 UNKNOWN_FILE_LOCAL = os.path.join(BASE_LOCAL, "user_unknowns_acumulado.csv")
 MAIL_FROM_FILE_LOCAL = "mail_from_alex_liquidity_alert_2115.txt"
@@ -241,7 +225,6 @@ SAIDA_UNKNOWN = "/content/user_unknowns_final.csv"
 SAIDA_REJEICAOES = "/content/rejeicoes_finais.csv"
 DESEC_LOG = os.path.join(BASE_LOCAL, "desec_requests.log")
 MANIFEST_FILE = os.path.join(BASE_LOCAL, "checkpoint_manifest.json")
-
 CP_DIR = os.path.join(BASE_LOCAL, "checkpoints")
 CP_FASES = os.path.join(CP_DIR, "cp_fases.json")
 CP_PROVEDORES = os.path.join(CP_DIR, "cp_provedores.json")
@@ -261,13 +244,11 @@ PROXY_SEARCH_DIRS = [
     "/content/uploads", "./", "/content/drive/MyDrive",
     "/content/drive/MyDrive/proxies", "/content/drive/MyDrive/Proxies",
 ]
-
 FASES_OBRIGATORIAS_ANTES_ENVIO = [
     "FASE0_IP", "FASE1_TOKENS", "FASE2A_CONTAS", "FASE2B_MX",
     "FASE2C_DOWNLOAD", "FASE25_PROXIES", "FASE3_DNS", "FASE4_PROPAGACAO",
 ]
 
-# === CONSOLE BONITO PARA GITHUB ACTIONS ===
 EM_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
 LARGURA_PAINEL = 88
 
@@ -324,7 +305,7 @@ def painel_completo():
     L = []
     T = "═" * LARGURA_PAINEL
     L.append("╔" + T + "╗")
-    L.append(f"║ 🚀 VERISCOPE V21.0.0 · run #{CHECKPOINT.obter_config().get('total_runs', 1)} · {GLOBAL['exec_id']}")
+    L.append(f"║ 🚀 VERISCOPE V21.1.0 · run #{CHECKPOINT.obter_config().get('total_runs', 1)} · {GLOBAL['exec_id']}")
     L.append(f"║ ⏱️  {h:02d}:{m:02d}:{s:02d} / 05:40:00  [{barra(pct_tempo, 20)}] {pct_tempo:.0f}%   💾 {espaco_disco_livre_gb():.0f} GB")
     L.append("╠" + T + "╣")
     L.append(f"║ ✅ aceites    {GLOBAL['smtp_aceites']:>8,}  {sparkline(hist)}  (últimos {len(hist)} min)")
@@ -348,10 +329,9 @@ def painel_completo():
     L.append("╚" + T + "╝")
     return "\n".join(L)
 
-# === DIAGNOSTICO DE AMBIENTE ===
 def diagnostico_ambiente_hf():
     print("\n" + "=" * 80, flush=True)
-    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.0.0", flush=True)
+    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.1.0", flush=True)
     print("=" * 80, flush=True)
     print(f"[ENV] HF_TOKEN: {'✅ SIM' if HF_TOKEN else '❌ NÃO'} ({len(HF_TOKEN)} chars)", flush=True)
     print(f"[ENV] DESEC_TOKEN: {'✅ SIM' if DESEC_TOKEN else '❌ NÃO'}", flush=True)
@@ -369,7 +349,6 @@ def diagnostico_ambiente_hf():
             print(f"[HF] ❌ whoami FAILED: {str(e)[:100]}", flush=True)
     print("=" * 80 + "\n", flush=True)
 
-# === GARANTIR DIRETORIOS ===
 def garantir_diretorios():
     for d in [BASE_LOCAL, LOG_DIR, DIR_EMAILS, DIR_AUDIT, DIR_PROXIES, DIR_REPO, CP_DIR]:
         try: os.makedirs(d, exist_ok=True)
@@ -383,7 +362,7 @@ def garantir_diretorio_para(caminho):
 
 # === CHECKPOINT MANAGER TRANSACIONAL ===
 class CheckpointManager:
-    VERSION = "21.0.0"
+    VERSION = "21.1.0"
     def __init__(self):
         self.locks = {k: threading.Lock() for k in ["fases", "provedores", "pool", "smtp", "contas", "config", "unknown", "aceites", "workers", "orcamento", "rcpt", "dashboard"]}
         self.states = {
@@ -421,7 +400,7 @@ class CheckpointManager:
                             for k, v in self.states[nome].items():
                                 if k not in dados: dados[k] = v
                         self.states[nome] = dados
-                    print(f"[CHECKPOINT] 📥 Carregado local: {nome}", flush=True)
+                        print(f"[CHECKPOINT] 📥 Carregado local: {nome}", flush=True)
                 except Exception as e:
                     print(f"[CHECKPOINT] ⚠️ AVISO ao carregar {nome}: {str(e)[:100]}", flush=True)
 
@@ -802,6 +781,14 @@ def upload_all_checkpoints_to_hf():
                     api.upload_file(path_or_fileobj=fpath, path_in_repo=f"results/{os.path.basename(fpath)}", repo_id=HF_CHECKPOINT_REPO, repo_type="dataset", token=HF_TOKEN)
                     enviados += 1
                 except Exception as e: dizer(f"  [HF SYNC] ⚠️ AVISO upload {os.path.basename(fpath)}: {str(e)[:120]}")
+                
+        # Upload SMTP LOG
+        if os.path.exists(SMTP_LOG):
+            try:
+                api.upload_file(path_or_fileobj=SMTP_LOG, path_in_repo=f"logs/smtp_audit_{GLOBAL['exec_id']}.txt", repo_id=HF_CHECKPOINT_REPO, repo_type="dataset", token=HF_TOKEN)
+                enviados += 1
+            except Exception as e: dizer(f"  [HF SYNC] ⚠️ AVISO upload smtp_log: {str(e)[:120]}")
+            
         dizer(f"[HF SYNC] ✅ Upload concluido: {enviados} ficheiros enviados.")
     except Exception as e: dizer(f"[HF SYNC] ❌ ERRO geral: {str(e)[:100]}")
 
@@ -817,6 +804,7 @@ def download_all_checkpoints_from_hf():
     except Exception as e:
         if "404" in str(e) or "EntryNotFound" in str(e): dizer("[HF SYNC] ℹ️ Sem manifesto na HF (normal na 1a execucao)")
         else: dizer(f"[HF SYNC] ⚠️ Falha manifesto: {str(e)[:100]}")
+        
     for nome, path in CHECKPOINT.paths.items():
         try:
             local = hf_hub_download(repo_id=HF_CHECKPOINT_REPO, filename=f"checkpoints/{nome}.json", repo_type="dataset", token=HF_TOKEN, force_download=True)
@@ -832,6 +820,7 @@ def download_all_checkpoints_from_hf():
             else:
                 falhados += 1
                 dizer(f"  [HF SYNC] ❌ FALHA ao baixar {nome}.json: {texto[:140]}")
+                
     map_files = {"user_unknowns_acumulado.csv": UNKNOWN_FILE_LOCAL, "aceites_finais.csv": SAIDA_ACEITES, "rejeicoes_finais.csv": SAIDA_REJEICAOES}
     for fname, dest in map_files.items():
         try:
@@ -845,14 +834,13 @@ def download_all_checkpoints_from_hf():
             if "404" in texto or "EntryNotFound" in texto: pass
             else:
                 falhados += 1
-                dizer(f"[HF SYNC] ❌ Downloads: {baixados} ok | {ausentes} ausentes | {falhados} falhados")
+    dizer(f"[HF SYNC] ❌ Downloads: {baixados} ok | {ausentes} ausentes | {falhados} falhados")
     if os.path.exists(MANIFEST_FILE):
         ok, msg = CHECKPOINT.validar_manifesto()
         if ok: dizer("[HF SYNC] ✅ Manifesto validado - integridade OK")
         else: dizer(f"[HF SYNC] ⚠️ Manifesto invalido: {msg}")
     return baixados
 
-# === AUTO RESTART ===
 def trigger_next_run():
     pat = os.environ.get("GITHUB_PAT")
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -917,6 +905,7 @@ async def obter_ip_colab():
             marcar_fase("FASE0_IP", True, f"IP recuperado {ip}")
             return ip
         except Exception: pass
+        
     servicos = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com", "https://ipinfo.io/ip", "https://checkip.amazonaws.com"]
     ips = []
     async with aiohttp.ClientSession() as session:
@@ -928,6 +917,7 @@ async def obter_ip_colab():
                         socket.inet_aton(ip)
                         ips.append(ip)
             except Exception: pass
+            
     if not ips:
         marcar_fase("FASE0_IP", False, "nenhum servico respondeu")
         raise RuntimeError("Nao foi possivel obter IP do Colab")
@@ -981,6 +971,7 @@ async def testar_tokens_desec():
                         return tok, doms
         except Exception as e: debug_log(f"token test {tok[:6]}...: {str(e)[:120]}")
         return tok, None
+
     validos, mapa_feito = [], 0
     try:
         tasks = [_testar_um(tok) for tok in DESEC_TOKENS_ALL]
@@ -994,6 +985,7 @@ async def testar_tokens_desec():
                     DOM_MIN_TTL[nome_dom] = min_ttl
                     mapa_feito += 1
     except Exception as e: debug_log(f"testar_tokens_desec: {str(e)}")
+    
     DESEC_TOKENS_VALIDOS.clear()
     DESEC_TOKENS_VALIDOS.extend(validos)
     dizer(f"🔐 Tokens validos: {len(validos)}/{len(DESEC_TOKENS_ALL)} | dominios mapeados: {mapa_feito}")
@@ -1029,6 +1021,7 @@ async def carregar_contas_inteligente():
         dizer("  ♻️ Fase 2A ja concluida - a recarregar")
         dominio_salvo = CHECKPOINT.obter_dominio_principal()
         if dominio_salvo: GLOBAL["dominio_principal"] = dominio_salvo
+        
     p = await download_hf_com_retry(HF_LOGS_REPO, "campaign_data/phase1_accounts_keys.csv", "dataset")
     with open(p, "r", encoding="utf-8") as f: rows = list(csv.DictReader(f))
     todas_contas = []
@@ -1036,9 +1029,11 @@ async def carregar_contas_inteligente():
         priv = (r.get("dkim_private_key_pem") or "").strip()
         if not priv.startswith("-----BEGIN "): continue
         todas_contas.append({"identity_id": (r.get("identity_id") or "").strip(), "sender_email": (r.get("sender_email") or "").strip(), "domain": (r.get("domain") or "").strip(), "base": (r.get("base") or "").strip(), "selector": (r.get("dkim_selector") or "default").strip(), "private_key_pem": priv, "public_key_txt": (r.get("dkim_public_txt") or "").strip()})
+        
     if not todas_contas:
         marcar_fase("FASE2A_CONTAS", False, "0 contas com chave DKIM")
         raise RuntimeError("Nenhuma conta valida carregada")
+        
     por_dominio = defaultdict(list)
     for conta in todas_contas: por_dominio[conta["domain"]].append(conta)
     dominio_principal = None
@@ -1050,6 +1045,7 @@ async def carregar_contas_inteligente():
         dominio_principal = max(por_dominio.keys(), key=lambda d: len(por_dominio[d]))
         dizer(f"⚠️ AVISO: Nenhum dominio com 501+ contas. Usando {dominio_principal} com {len(por_dominio[dominio_principal])} contas")
     else: dizer(f"✅ Dominio principal encontrado: {dominio_principal} com {len(por_dominio[dominio_principal])} contas")
+    
     contas_selecionadas = por_dominio[dominio_principal][:501]
     GLOBAL["contas"] = contas_selecionadas
     GLOBAL["dominio_principal"] = dominio_principal
@@ -1096,6 +1092,7 @@ async def carregar_mail_from_variations():
                     if linha and not linha.startswith("#"): variations.append(linha)
             dizer(f"  ☁️ Carregadas {len(variations)} variacoes do HuggingFace")
         except Exception as e2: dizer(f"  ⚠️ AVISO: Falha no download HF: {str(e2)[:120]}")
+        
     GLOBAL["mail_from_variations"] = variations
     GLOBAL["mail_from_idx_counter"] = 0
     return variations
@@ -1117,7 +1114,7 @@ async def listar_ficheiros_repo():
     for tentativa in range(4):
         try:
             with GLOBAL_HF_SEMAPHORE:
-                todos = list(api.listRepo_files(HF_TRADER_REPO, repo_type="dataset")) if hasattr(api, 'listRepo_files') else list(api.list_repo_files(HF_TRADER_REPO, repo_type="dataset"))
+                todos = list(api.list_repo_files(HF_TRADER_REPO, repo_type="dataset"))
                 GLOBAL["repo_files_cache"] = todos
                 return todos
         except Exception as e:
@@ -1234,6 +1231,7 @@ def processar_provedor_emails_sync(args):
                     GLOBAL["emails_read"] += n
                 return prov, n
             except Exception: pass
+            
     path = os.path.join(DIR_EMAILS, prov + ".txt")
     seen, total, ok_pq, falha_pq = set(), 0, 0, 0
     try:
@@ -1279,7 +1277,7 @@ def processar_provedor_emails_sync(args):
                         if buf:
                             fout.write("\n".join(buf) + "\n")
                             buf = []
-                    ok_pq += 1
+                        ok_pq += 1
                 except Exception as e:
                     falha_pq += 1
                     debug_log(f"parquet {rel} ({prov}): {str(e)[:200]}")
@@ -1321,6 +1319,7 @@ async def baixar_todos_emails_paralelo(provedores):
         if p in por_prov: args.append((p, por_prov[p]))
     GLOBAL["pq_total"] = sum(len(v) for v in por_prov.values())
     dizer(f"  🗂️ Parquets identificados: {GLOBAL['pq_total']} em {len(args)} provedores")
+    
     emails_recuperados = 0
     for p in ja_baixados:
         path_p = os.path.join(DIR_EMAILS, p + ".txt")
@@ -1331,9 +1330,10 @@ async def baixar_todos_emails_paralelo(provedores):
                     GLOBAL["emails_read"] += n
                     GLOBAL["prov_processed"] += 1
                     GLOBAL["pq_downloaded"] += len(por_prov.get(p, []))
-                emails_recuperados += n
+                    emails_recuperados += n
             except Exception: pass
     if emails_recuperados > 0: dizer(f"  📥 Emails recuperados do checkpoint: {emails_recuperados:,}")
+    
     raiz_local = await baixar_snapshot_repo()
     if raiz_local:
         itens_args = []
@@ -1344,14 +1344,17 @@ async def baixar_todos_emails_paralelo(provedores):
                 pares.append((rel, cand if os.path.exists(cand) else None))
             itens_args.append((p, pares))
     else: itens_args = [(p, [(rel, None) for rel in rels]) for p, rels in args]
+    
     if GLOBAL.get("emergency_stop"):
         marcar_fase("FASE2C_DOWNLOAD", False, "paragem de emergencia")
         return
+        
     dizer(f"  ⚙️ A extrair emails para {DIR_EMAILS} ...")
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS_DOWNLOAD_ASYNC, len(itens_args) or 1, 200)) as ex:
         tasks = [loop.run_in_executor(ex, processar_provedor_emails_sync, a) for a in itens_args]
         await asyncio.gather(*tasks)
+        
     dizer(f"  📧 Emails extraidos: {GLOBAL['emails_read']:,}")
     dizer(f"  📊 Parquets processados: {GLOBAL['pq_downloaded']}/{GLOBAL['pq_total']} | falhas: {GLOBAL['pq_falhados']}")
     completos = (GLOBAL['pq_downloaded'] + GLOBAL['pq_falhados']) >= GLOBAL['pq_total']
@@ -1370,6 +1373,7 @@ async def baixar_unknowns_acumulado():
             baixou = True
             dizer("  ☁️ Ficheiro de blacklist descarregado do HuggingFace")
     except Exception as e: dizer("  ℹ️ Ficheiro ainda nao existe no HuggingFace (normal na 1a execucao)")
+    
     unknowns = set()
     if os.path.exists(UNKNOWN_FILE_LOCAL):
         try:
@@ -1380,6 +1384,7 @@ async def baixar_unknowns_acumulado():
         except Exception as e:
             dizer(f"  ⚠️ AVISO: blacklist local ilegivel ({str(e)[:80]})")
             unknowns = set()
+            
     try: cp_unk = CHECKPOINT.carregar_unknowns()
     except Exception: cp_unk = set()
     atual = GLOBAL.get("user_unknowns") or set()
@@ -1447,12 +1452,13 @@ def ip_publico_valido(ip):
     for p in partes:
         if p < 0 or p > 255: return False
     a, b = partes[0], partes[1]
-    if a in (0, 10, 127, 255): return False
+    if a in (0, 127, 255): return False
+    if a == 10: return False
     if a == 172 and 16 <= b <= 31: return False
     if a == 192 and b == 168: return False
     if a == 169 and b == 254: return False
     if a >= 224: return False
-    if a == 100 and 64 <= b <= 127: return False
+    # CGNAT permitido para proxies moveis
     if a == 198 and b in (18, 19): return False
     return True
 
@@ -1466,7 +1472,7 @@ def inferir_protocolo_url(u):
 
 def descobrir_ficheiros_proxy():
     candidatos, dirs_vistos = [], set()
-    bloqueados = {"emails_db", "logs", "audit", ".git", ".cache", ".ipynb_checkpoints", "campaign_v19_0", "campaign_v21_0", "sample_data", "trainer_repo", "__pycache__"}
+    bloqueados = {"emails_db", "logs", "audit", ".git", ".cache", ".ipynb_checkpoints", "campaign_v19_0", "campaign_v21_0", "campaign_v21_1", "sample_data", "trainer_repo", "__pycache__"}
     for base in PROXY_SEARCH_DIRS:
         if not base or not os.path.isdir(base): continue
         real = os.path.realpath(base)
@@ -1596,6 +1602,7 @@ async def carregar_e_scrapear_proxies_async(motivo="inicial"):
         dizer("  ℹ️ Sem URLs para scraping - a usar apenas IPs diretos")
         with GLOBAL["raw_lock"]: GLOBAL["proxies_extracted"] = len(GLOBAL["raw_proxies"])
         return GLOBAL["raw_proxies"]
+        
     dizer(f"  🕸️ A descarregar {len(urls)} listas em paralelo asyncio...")
     pares = [(u, inferir_protocolo_url(u)) for u in urls]
     connector = aiohttp.TCPConnector(limit=min(WORKERS_VALIDACAO_ASYNC, 500), limit_per_host=20)
@@ -1627,7 +1634,7 @@ async def carregar_e_scrapear_proxies_async(motivo="inicial"):
         dizer(f"  📦 Candidatos acumulados: {total_raw:,}")
     return GLOBAL["raw_proxies"]
 
-# === VALIDACAO DE PROXIES (ASYNCIO) ===
+# === VALIDACAO DE PROXIES (CORRIGIDO E ROBUSTO) ===
 async def _obter_exit_ip_async(proxy_ip, proxy_port, proto):
     servicos = [("api.ipify.org", 80, b"GET /?format=json HTTP/1.0\r\nHost: api.ipify.org\r\n\r\n", "ip"), ("ifconfig.me", 80, b"GET /ip HTTP/1.0\r\nHost: ifconfig.me\r\n\r\n", None), ("icanhazip.com", 80, b"GET / HTTP/1.0\r\nHost: icanhazip.com\r\n\r\n", None)]
     loop = asyncio.get_event_loop()
@@ -1675,56 +1682,75 @@ async def _obter_exit_ip_async(proxy_ip, proxy_port, proto):
 
 async def validar_proxy_rapido_async(item, proto_sugerido):
     ip, port = item
-    proto = proto_sugerido if proto_sugerido else 'socks5'
-    MX_TESTE, PORT25_TIMEOUT = "mxs.mail.ru", 5
-    if proto == 'socks5': ordem = ['socks5', 'socks4', 'http']
-    elif proto == 'socks4': ordem = ['socks4', 'socks5', 'http']
-    else: ordem = ['http', 'socks5', 'socks4']
-    proto_funcional = None
+    MX_TESTE, PORT25_TIMEOUT = "mxs.mail.ru", 10
     loop = asyncio.get_event_loop()
-    for p in ordem:
-        if GLOBAL.get("emergency_stop"): return None
-        def _test_connect():
-            try:
-                if p in ('socks5', 'socks4'):
-                    s = socks.socksocket()
-                    if p == 'socks5': s.set_proxy(socks.SOCKS5, ip, port)
-                    else: s.set_proxy(socks.SOCKS4, ip, port)
-                    s.settimeout(PORT25_TIMEOUT)
-                    s.connect((MX_TESTE, 25))
-                else:
-                    s = socket.socket()
-                    s.settimeout(PORT25_TIMEOUT)
-                    s.connect((ip, port))
-                    s.sendall(f"CONNECT {MX_TESTE}:25 HTTP/1.1\r\nHost: {MX_TESTE}\r\n\r\n".encode())
-                    r = s.recv(4096)
-                    if b"200" not in r:
-                        s.close()
-                        return None
-                banner = s.recv(4096).decode(errors="ignore").strip()
-                try: s.close()
-                except Exception: pass
-                return banner
-            except Exception: return None
+    
+    def _test_socks5():
         try:
-            banner = await asyncio.wait_for(loop.run_in_executor(None, _test_connect), timeout=PORT25_TIMEOUT + 2)
-            if banner and banner.startswith("220"):
-                proto_funcional = p
-                break
-        except asyncio.TimeoutError: continue
-        except Exception: continue
+            s = socks.socksocket()
+            s.set_proxy(socks.SOCKS5, ip, port)
+            s.settimeout(PORT25_TIMEOUT)
+            s.connect((MX_TESTE, 25))
+            banner = s.recv(4096).decode(errors="ignore").strip()
+            s.close()
+            return banner
+        except Exception: return None
+
+    def _test_socks4():
+        try:
+            s = socks.socksocket()
+            s.set_proxy(socks.SOCKS4, ip, port)
+            s.settimeout(PORT25_TIMEOUT)
+            s.connect((MX_TESTE, 25))
+            banner = s.recv(4096).decode(errors="ignore").strip()
+            s.close()
+            return banner
+        except Exception: return None
+
+    def _test_http():
+        try:
+            s = socket.socket()
+            s.settimeout(PORT25_TIMEOUT)
+            s.connect((ip, port))
+            s.sendall(f"CONNECT {MX_TESTE}:25 HTTP/1.1\r\nHost: {MX_TESTE}\r\n\r\n".encode())
+            r = s.recv(4096)
+            if b"200" not in r:
+                s.close()
+                return None
+            banner = s.recv(4096).decode(errors="ignore").strip()
+            s.close()
+            return banner
+        except Exception: return None
+
+    proto_funcional = None
+    
+    try:
+        banner = await asyncio.wait_for(loop.run_in_executor(None, _test_socks5), timeout=PORT25_TIMEOUT + 2)
+        if banner and banner.startswith("220"): proto_funcional = 'socks5'
+    except asyncio.TimeoutError: pass
+    
+    if not proto_funcional:
+        try:
+            banner = await asyncio.wait_for(loop.run_in_executor(None, _test_socks4), timeout=PORT25_TIMEOUT + 2)
+            if banner and banner.startswith("220"): proto_funcional = 'socks4'
+        except asyncio.TimeoutError: pass
+        
+    if not proto_funcional:
+        try:
+            banner = await asyncio.wait_for(loop.run_in_executor(None, _test_http), timeout=PORT25_TIMEOUT + 2)
+            if banner and banner.startswith("220"): proto_funcional = 'http'
+        except asyncio.TimeoutError: pass
+
     if proto_funcional is None:
         with GLOBAL["stats_lock"]: GLOBAL["proxies_mortos_count"] += 1
         return None
+        
     exit_ip = await _obter_exit_ip_async(ip, port, proto_funcional)
     if not ip_publico_valido(exit_ip): exit_ip = ip
+    
     info = {"ip": ip, "port": port, "proto": proto_funcional, "exit_ip": exit_ip, "added_at": time.time()}
     with GLOBAL["pool_lock"]:
-        ja = False
-        for existente in GLOBAL["pool"]:
-            if existente["ip"] == ip and existente["port"] == port:
-                ja = True
-                break
+        ja = any(e["ip"] == ip and e["port"] == port for e in GLOBAL["pool"])
         if not ja: GLOBAL["pool"].append(info)
         else: return None
     GLOBAL["spf_sujo"] = True
@@ -1745,11 +1771,14 @@ async def validar_proxies_ate_target_async(target_count):
     if validos_iniciais >= target_count:
         dizer(f"  ✅ Pool ja tem {validos_iniciais} >= alvo {target_count}")
         return 0
+        
     dizer(f"  🔍 A validar: {total - start_idx:,} candidatos a partir do indice {start_idx} (pool {validos_iniciais}/{target_count})")
     sem = asyncio.Semaphore(WORKERS_VALIDACAO_ASYNC)
     validos_novos, next_i = 0, start_idx
+    
     async def validar_one(item, proto):
         async with sem: return await validar_proxy_rapido_async(item, proto)
+        
     while next_i < total and not GLOBAL.get("emergency_stop"):
         batch_end = min(next_i + 500, total)
         batch = raw[next_i:batch_end]
@@ -1761,6 +1790,7 @@ async def validar_proxies_ate_target_async(target_count):
         GLOBAL["scraping_checkpoint"] = next_i
         dizer(f"  📈 Progresso: {next_i}/{total} testados | {validos_novos} novos | pool {len(GLOBAL['pool'])}/{target_count}")
         if validos_iniciais + validos_novos >= target_count: break
+        
     com_pool = len(GLOBAL["pool"])
     CHECKPOINT.salvar_pool(GLOBAL["pool"], GLOBAL["scraping_checkpoint"], len(GLOBAL["raw_proxies"]))
     dizer(f"  🏁 Validacao terminada: +{validos_novos} | pool agora {com_pool}/{target_count}")
@@ -1772,8 +1802,9 @@ async def revalidar_pool_recuperado():
     if not pool: return 0
     dizer(f"  🔄 Revalidando {len(pool)} proxies recuperados...")
     sem = asyncio.Semaphore(64)
-    MX_TESTE, PORT25_TIMEOUT = "mxs.mail.ru", 5
+    MX_TESTE, PORT25_TIMEOUT = "mxs.mail.ru", 10
     loop = asyncio.get_event_loop()
+    
     async def _testar(p):
         async with sem:
             def _connect():
@@ -1801,6 +1832,7 @@ async def revalidar_pool_recuperado():
                 except Exception: return False
             try: return await asyncio.wait_for(loop.run_in_executor(None, _connect), timeout=PORT25_TIMEOUT + 2)
             except asyncio.TimeoutError: return False
+            
     tasks = [_testar(p) for p in pool]
     resultados = await asyncio.gather(*tasks, return_exceptions=True)
     vivos = []
@@ -1818,20 +1850,20 @@ async def revalidar_pool_recuperado():
 def token_para_dominio(domain):
     with DOM_TOKEN_LOCK:
         if domain in DOM_TOKEN: return DOM_TOKEN[domain]
-    for tok in DESEC_TOKENS_VALIDOS:
-        if GLOBAL.get("emergency_stop"): return None
-        try:
-            r = requests.get(f"https://desec.io/api/v1/domains/{domain}/", headers={"Authorization": f"Token {tok}"}, timeout=15)
-            if r.status_code == 200:
-                try:
-                    dados = r.json()
-                    min_ttl = int((dados or {}).get("minimum_ttl") or DESEC_TTL)
-                except Exception: min_ttl = DESEC_TTL
-                with DOM_TOKEN_LOCK:
-                    DOM_TOKEN[domain] = tok
-                    DOM_MIN_TTL[domain] = min_ttl
-                return tok
-        except Exception: continue
+        for tok in DESEC_TOKENS_VALIDOS:
+            if GLOBAL.get("emergency_stop"): return None
+            try:
+                r = requests.get(f"https://desec.io/api/v1/domains/{domain}/", headers={"Authorization": f"Token {tok}"}, timeout=15)
+                if r.status_code == 200:
+                    try:
+                        dados = r.json()
+                        min_ttl = int((dados or {}).get("minimum_ttl") or DESEC_TTL)
+                    except Exception: min_ttl = DESEC_TTL
+                    with DOM_TOKEN_LOCK:
+                        DOM_TOKEN[domain] = tok
+                        DOM_MIN_TTL[domain] = min_ttl
+                    return tok
+            except Exception: continue
     return None
 
 def desec_throttle_dominio(domain):
@@ -1950,6 +1982,7 @@ async def desec_put_com_retry_async(url, headers, payload, domain, max_retries=5
             payload_preview = json.dumps(payload[0], indent=2)[:2000]
             payload_preview = f"(bulk com {len(payload)} rrsets; amostra) " + payload_preview
     except Exception as e: payload_preview = f"erro: {str(e)}"
+    
     for tentativa in range(max_retries):
         if GLOBAL.get("emergency_stop"): return False, "STOP"
         inicio_req = time.time()
@@ -2366,429 +2399,164 @@ class RCPTDinamico:
 
 RCPT_CTRL = RCPTDinamico()
 
-# === FASE 6: ENVIO MASSIVO ASYNCIO ===
-class RetryQueueAsync:
-    def __init__(self):
-        self.items = deque()
-        self.tentativas = {}
-        self.lock = threading.Lock()
-    def adicionar(self, email, provedor):
-        chave = (email, provedor)
-        abandonar = False
-        with self.lock:
-            total = self.tentativas.get(chave, 0) + 1
-            if total > MAX_RETRY_ATTEMPTS:
-                self.tentativas.pop(chave, None)
-                abandonar = True
-            else:
-                self.tentativas[chave] = total
-                delay = RETRY_BACKOFF_BASE * (RETRY_BACKOFF_MULTIPLIER ** (total - 1))
-                next_try = time.time() + delay
-                self.items.append((email, provedor, total, next_try))
-        if abandonar:
-            with GLOBAL["stats_lock"]: GLOBAL["smtp_abandonados"] += 1
-            return False
-        with GLOBAL["stats_lock"]: GLOBAL["smtp_retries"] += 1
-        return True
-    def obter_prontos(self, max_items=100):
-        agora = time.time()
-        prontos = []
-        with self.lock:
-            remaining = deque()
-            for item in self.items:
-                email, provedor, attempts, next_try = item
-                if next_try <= agora and len(prontos) < max_items: prontos.append((email, provedor, attempts))
-                else: remaining.append(item)
-            self.items = remaining
-        return prontos
-    def limpar(self, email, provedor):
-        chave = (email, provedor)
-        with self.lock: self.tentativas.pop(chave, None)
+# === FASE 6: AUDITORIA E VALIDACAO DE PROVEDORES (NOVO MODO) ===
+async def smtp_send_recv(sock, cmd, timeout=15):
+    loop = asyncio.get_event_loop()
+    def _io():
+        try:
+            sock.settimeout(timeout)
+            if cmd:
+                if isinstance(cmd, str): sock.sendall(cmd.encode('utf-8'))
+                else: sock.sendall(cmd)
+            data = b""
+            while True:
+                try:
+                    chunk = sock.recv(8192)
+                    if not chunk: break
+                    data += chunk
+                    lines = data.split(b'\r\n')
+                    if len(lines) >= 2:
+                        last_line = lines[-2] if lines[-1] == b'' else lines[-1]
+                        if len(last_line) >= 3 and last_line[:3].isdigit() and last_line[3:4] == b' ':
+                            break
+                except socket.timeout: break
+                except Exception: break
+            return data.decode('utf-8', errors='ignore').strip()
+        except Exception as e: return f"ERRO_IO: {str(e)}"
+    return await loop.run_in_executor(None, _io)
 
-RETRY_QUEUE = RetryQueueAsync()
-
-def classificar_resposta_smtp(smtp_code, smtp_message, provedor):
-    code = int(smtp_code) if smtp_code else 0
-    msg_low = str(smtp_message or "").lower()
-    if 200 <= code < 300: return "ACEITE", "SMTP acceptance"
-    if 400 <= code < 500:
-        throttle_keywords = ["too many", "rate limit", "try again later", "temporarily", "throttl", "limit exceeded", "too fast", "slow down", "please wait", "retry later", "greylist", "temporarily rejected", "please try again", "quota exceeded"]
-        if any(kw in msg_low for kw in throttle_keywords): return "THROTTLE", "Throttling detected"
-        return "TEMPORARIA", "Falha temporaria"
-    if 500 <= code < 600:
-        if any(kw in msg_low for kw in ["user unknown", "no such user", "does not exist", "invalid recipient", "mailbox not found", "unknown user", "recipient rejected"]): return "USER_UNKNOWN", "Destinatario inexistente"
-        if any(kw in msg_low for kw in ["spam", "blocked", "blacklist", "rbl", "rejected for policy", "not allowed", "reputation"]): return "REPUTACAO", "Problema de reputacao"
-        return "PERMANENTE", "Rejeicao permanente"
-    return "DESCONHECIDA", f"Codigo {code}"
-
-async def enviar_email_smtp_async(worker_id, proxy_info, conta, email, mx_host, html_base):
-    prov = email.split("@")[-1] if "@" in email else ""
-    timeout = SMTP_TIMEOUT_ASIATICO if prov in PROVEDORES_ASIATICOS else SMTP_TIMEOUT
-    proxy_key = f"{proxy_info['ip']}:{proxy_info['port']}" if proxy_info else "colab"
-    try:
-        if proxy_info:
-            loop = asyncio.get_event_loop()
-            def _connect_proxy():
-                proto = proxy_info.get("proto", "socks5")
-                if proto in ('socks5', 'socks4'):
-                    s = socks.socksocket()
-                    if proto == 'socks5': s.set_proxy(socks.SOCKS5, proxy_info["ip"], proxy_info["port"])
-                    else: s.set_proxy(socks.SOCKS4, proxy_info["ip"], proxy_info["port"])
-                    s.settimeout(timeout)
-                    s.connect((mx_host, 25))
+async def validar_provedor_smtp(worker_id, proxy_info, conta, provedor, emails, mx_host, html_base, sem):
+    async with sem:
+        smtp_log(f"\n{'='*70}")
+        smtp_log(f"[WORKER {worker_id:03d}] INICIO AUDITORIA: {provedor} | MX: {mx_host}")
+        smtp_log(f"{'='*70}")
+        
+        loop = asyncio.get_event_loop()
+        sock = None
+        try:
+            def _connect():
+                if proxy_info:
+                    proto = proxy_info.get("proto", "socks5")
+                    if proto in ('socks5', 'socks4'):
+                        s = socks.socksocket()
+                        if proto == 'socks5': s.set_proxy(socks.SOCKS5, proxy_info["ip"], proxy_info["port"])
+                        else: s.set_proxy(socks.SOCKS4, proxy_info["ip"], proxy_info["port"])
+                        s.settimeout(15)
+                        s.connect((mx_host, 25))
+                        return s
+                    else:
+                        s = socket.socket()
+                        s.settimeout(15)
+                        s.connect((proxy_info["ip"], proxy_info["port"]))
+                        s.sendall(f"CONNECT {mx_host}:25 HTTP/1.1\r\nHost: {mx_host}\r\n\r\n".encode())
+                        r = s.recv(4096)
+                        if b"200" not in r:
+                            s.close()
+                            raise ConnectionError("HTTP CONNECT fail")
+                        return s
                 else:
                     s = socket.socket()
-                    s.settimeout(timeout)
-                    s.connect((proxy_info["ip"], proxy_info["port"]))
-                    s.sendall(f"CONNECT {mx_host}:25 HTTP/1.1\r\nHost: {mx_host}\r\n\r\n".encode())
-                    r = s.recv(4096)
-                    if b"200" not in r:
-                        s.close()
-                        raise ConnectionError("CONNECT fail")
-                return s
-            sock = await asyncio.wait_for(loop.run_in_executor(None, _connect_proxy), timeout=timeout + 3)
-            banner = sock.recv(4096).decode(errors="ignore").strip()
+                    s.settimeout(15)
+                    s.connect((mx_host, 25))
+                    return s
+                    
+            sock = await asyncio.wait_for(loop.run_in_executor(None, _connect), timeout=20)
+            
+            banner = await smtp_send_recv(sock, None)
+            smtp_log(f"[W{worker_id:03d}] <- BANNER: {banner}")
             if not banner.startswith("220"):
-                sock.close()
-                return False, "BANNER_INVALIDO"
-        else:
-            sock = await asyncio.wait_for(asyncio.get_event_loop().run_in_executor(None, lambda: socket.create_connection((mx_host, 25), timeout=timeout)), timeout=timeout + 3)
-            banner = sock.recv(4096).decode(errors="ignore").strip()
-            if not banner.startswith("220"):
-                sock.close()
-                return False, "BANNER_INVALIDO"
-        with GLOBAL["stats_lock"]: GLOBAL["smtp_conexoes"] += 1
-        sock.sendall(f"EHLO {conta['identity_id']}\r\n".encode())
-        ehlo_resp = sock.recv(8192).decode(errors="ignore")
-        sock.sendall(f"MAIL FROM: <{conta['sender_email']}>\r\n".encode())
-        mr = sock.recv(4096).decode(errors="ignore")
-        if not mr.startswith("250"):
-            sock.close()
-            return False, "MAIL_FROM_REJEITADO"
-        rcpt_atual = RCPT_CTRL.obter(prov)
-        sock.sendall(f"RCPT TO: <{email}>\r\n".encode())
-        rr = sock.recv(4096).decode(errors="ignore")
-        if rr.startswith("250") or rr.startswith("251"): RCPT_CTRL.registar_sucesso(prov)
-        elif "452" in rr or "552" in rr:
-            RCPT_CTRL.registar_erro(prov, "too_many")
-            sock.sendall(b"RSET\r\n")
-            sock.close()
-            return False, "RCPT_TOO_MANY"
-        elif rr.startswith("4"):
-            sock.sendall(b"RSET\r\n")
-            sock.close()
-            return False, "RCPT_TEMP"
-        else:
-            sock.sendall(b"RSET\r\n")
-            sock.close()
-            return False, "RCPT_REJEITADO"
-        sock.sendall(b"DATA\r\n")
-        dr = sock.recv(4096).decode(errors="ignore")
-        if not dr.startswith("354"):
-            sock.sendall(b"RSET\r\n")
-            sock.close()
-            return False, "DATA_REJEITADO"
-        payload = aplicar_mutacao_abracadabra(html_base, conta, [email])
-        if not payload.endswith(b"\r\n"): payload += b"\r\n"
-        payload = payload.replace(b"\r\n.", b"\r\n..")
-        sock.sendall(payload)
-        sock.sendall(b"\r\n.\r\n")
-        fr = sock.recv(4096).decode(errors="ignore")
-        try:
-            sock.sendall(b"QUIT\r\n")
-            sock.close()
-        except Exception: pass
-        if fr.startswith("250"): return True, "OK"
-        else: return False, f"DATA_FINAL_{fr[:3]}"
-    except asyncio.TimeoutError: return False, "TIMEOUT"
-    except Exception as e: return False, f"ERRO_{str(e)[:50]}"
-
-async def worker_envio_async(worker_id, proxy_info, conta, email_queue, html_base, mxs_por_provedor):
-    enviados_total, timeouts_consecutivos, erros_421 = 0, 0, 0
-    proxy_key = f"{proxy_info['ip']}:{proxy_info['port']}" if proxy_info else "colab"
-    via_proxy = proxy_info is not None
-    dizer(f"  🚀 [Worker #{worker_id:03d}] iniciado | proxy={proxy_key} | conta={conta['identity_id']}")
-    while not GLOBAL.get("emergency_stop"):
-        if enviados_total >= MAX_EMAILS_IP_PROVEDOR * 10:
-            dizer(f"  💤 [Worker #{worker_id:03d}] orcamento global esgotado ({enviados_total} emails) - hibernar")
-            break
-        if erros_421 >= 5:
-            dizer(f"  💤 [Worker #{worker_id:03d}] 5x 421 - hibernar 60s")
-            await asyncio.sleep(60)
-            erros_421 = 0
-        if timeouts_consecutivos >= WORKER_TIMEOUTS_CONSECUTIVOS_MAX:
-            dizer(f"  💤 [Worker #{worker_id:03d}] {timeouts_consecutivos} timeouts consecutivos - hibernar 60s")
-            await asyncio.sleep(60)
-            timeouts_consecutivos = 0
-        try: email = await asyncio.wait_for(email_queue.get(), timeout=5.0)
-        except asyncio.TimeoutError: continue
-        if not email or "@" not in email:
-            email_queue.task_done()
-            continue
-        with GLOBAL["user_unknowns_lock"]:
-            if email.lower() in GLOBAL["user_unknowns"]:
-                email_queue.task_done()
-                continue
-        prov = email.split("@")[-1].lower()
-        pode, razao = ORCAMENTO.pode_enviar(proxy_key, prov)
-        if not pode:
-            email_queue.put_nowait(email)
-            email_queue.task_done()
-            await asyncio.sleep(1)
-            continue
-        mx_list = mxs_por_provedor.get(prov, [])
-        if not mx_list:
-            email_queue.task_done()
-            continue
-        sucesso = False
-        for mx_host in mx_list:
-            if GLOBAL.get("emergency_stop"): break
-            with GLOBAL["stats_lock"]: GLOBAL["smtp_tentativas"] += 1
-            inicio = time.time()
-            ok, motivo = await enviar_email_smtp_async(worker_id, proxy_info, conta, email, mx_host, html_base)
-            response_time = time.time() - inicio
-            if ok:
-                with GLOBAL["stats_lock"]:
-                    GLOBAL["smtp_aceites"] += 1
-                    if via_proxy: GLOBAL["smtp_via_proxy"] += 1
-                    else: GLOBAL["smtp_via_colab"] += 1
-                enviados_total += 1
-                timeouts_consecutivos = 0
-                erros_421 = 0
-                ORCAMENTO.registar_envio(proxy_key, prov)
-                registrar_aceite(email, prov, conta["identity_id"], mx_host)
-                RETRY_QUEUE.limpar(email, prov)
-                sucesso = True
-                break
-            else:
-                if "TIMEOUT" in motivo:
-                    timeouts_consecutivos += 1
-                    with GLOBAL["stats_lock"]: GLOBAL["smtp_erros"] += 1
-                elif "421" in motivo or "TOO_MANY" in motivo:
-                    erros_421 += 1
-                    with GLOBAL["stats_lock"]: GLOBAL["smtp_4xx"] += 1
-                    RCPT_CTRL.registar_erro(prov, "too_many")
-                    RETRY_QUEUE.adicionar(email, prov)
-                elif "RCPT_TEMP" in motivo or "TEMP" in motivo:
-                    with GLOBAL["stats_lock"]: GLOBAL["smtp_4xx"] += 1
-                    RETRY_QUEUE.adicionar(email, prov)
-                elif "USER_UNKNOWN" in motivo:
-                    with GLOBAL["stats_lock"]: GLOBAL["smtp_user_unknown"] += 1
-                    salvar_unknown(email, prov)
+                smtp_log(f"[W{worker_id:03d}] ❌ BANNER INVALIDO")
+                return
+                
+            resp = await smtp_send_recv(sock, f"EHLO {conta['identity_id']}\r\n")
+            smtp_log(f"[W{worker_id:03d}] -> EHLO {conta['identity_id']}")
+            smtp_log(f"[W{worker_id:03d}] <- {resp}")
+            
+            resp = await smtp_send_recv(sock, f"MAIL FROM:<{conta['sender_email']}>\r\n")
+            smtp_log(f"[W{worker_id:03d}] -> MAIL FROM:<{conta['sender_email']}>")
+            smtp_log(f"[W{worker_id:03d}] <- {resp}")
+            if not resp.startswith("250"):
+                smtp_log(f"[W{worker_id:03d}] ❌ MAIL FROM REJEITADO")
+                return
+                
+            aceites = 0
+            rejeitados = 0
+            for email in emails[:100]:
+                resp = await smtp_send_recv(sock, f"RCPT TO:<{email}>\r\n")
+                smtp_log(f"[W{worker_id:03d}] -> RCPT TO:<{email}>")
+                smtp_log(f"[W{worker_id:03d}] <- {resp}")
+                if resp.startswith("250") or resp.startswith("251"):
+                    aceites += 1
+                    with GLOBAL["stats_lock"]: GLOBAL["smtp_aceites"] += 1
                 else:
-                    with GLOBAL["stats_lock"]:
-                        if "REJEITADO" in motivo:
-                            GLOBAL["smtp_5xx"] += 1
-                            GLOBAL["smtp_rejeitados"] += 1
-                        else: GLOBAL["smtp_erros"] += 1
-                    registrar_rejeicao(email, prov, 0, motivo)
-                if "ERRO" in motivo and "Connection" in motivo: break
-        email_queue.task_done()
-        if enviados_total % CHECKPOINT_SAVE_INTERVAL == 0 and enviados_total > 0:
-            ORCAMENTO.salvar()
-            RCPT_CTRL.salvar()
-    ORCAMENTO.salvar()
-    RCPT_CTRL.salvar()
-    dizer(f"  🏁 [Worker #{worker_id:03d}] terminado | {enviados_total} emails enviados")
+                    rejeitados += 1
+                    with GLOBAL["stats_lock"]: GLOBAL["smtp_rejeitados"] += 1
+                await asyncio.sleep(DELAY_ENTRE_RCPT)
+                
+            resp = await smtp_send_recv(sock, "DATA\r\n")
+            smtp_log(f"[W{worker_id:03d}] -> DATA")
+            smtp_log(f"[W{worker_id:03d}] <- {resp}")
+            
+            if resp.startswith("354"):
+                payload = aplicar_mutacao_abracadabra(html_base, conta, emails[:1])
+                if not payload.endswith(b"\r\n.\r\n"):
+                    if not payload.endswith(b"\r\n"): payload += b"\r\n"
+                    payload += b".\r\n"
+                resp = await smtp_send_recv(sock, payload, timeout=30)
+                smtp_log(f"[W{worker_id:03d}] -> [PAYLOAD ENVIADO - {len(payload)} bytes]")
+                smtp_log(f"[W{worker_id:03d}] <- {resp}")
+                
+            await smtp_send_recv(sock, "QUIT\r\n")
+            smtp_log(f"[W{worker_id:03d}] 🏁 FIM AUDITORIA {provedor} | RCPT Aceites: {aceites} | Rejeitados: {rejeitados}")
+            
+        except Exception as e:
+            smtp_log(f"[W{worker_id:03d}] ❌ ERRO FATAL: {str(e)}")
+        finally:
+            if sock:
+                try: sock.close()
+                except: pass
 
-async def fase6_envio_massivo_async(mxs, contas, html_base):
-    definir_fase("🔥 FASE 6 - Envio massivo ASYNCIO (501 workers)")
-    faltam = fases_faltantes_para_envio()
-    if faltam:
-        dizer(f"  ⛔ FASE 6 BLOQUEADA - fases faltantes: {', '.join(faltam)}")
-        marcar_fase("FASE6_ENVIO", False, f"bloqueada por: {', '.join(faltam)}")
-        return
+async def fase6_validacao_provedores(mxs, contas, html_base):
+    definir_fase("🔍 FASE 6 - AUDITORIA E VALIDACAO DE PROVEDORES (RCPT+DATA)")
     if not contas:
         dizer("  ⛔ FASE 6 BLOQUEADA - sem contas")
         marcar_fase("FASE6_ENVIO", False, "sem contas")
         return
-    email_queue = asyncio.Queue(maxsize=100000)
-    dizer("  📥 A carregar emails para a queue global...")
-    emails_carregados = 0
-    for prov in mxs.keys():
-        path = os.path.join(DIR_EMAILS, prov + ".txt")
-        if not os.path.exists(path) or os.path.getsize(path) == 0: continue
-        cp_info = CHECKPOINT.obter_provedor_index(prov)
-        if cp_info and cp_info.get("concluido", False): continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                offset = 0
-                if cp_info: offset = cp_info.get("offset", 0)
-                for i, linha in enumerate(f):
-                    if i < offset: continue
-                    email = linha.strip()
-                    if email and "@" in email:
-                        await email_queue.put(email)
-                        emails_carregados += 1
-        except Exception as e: debug_log(f"carregar emails {prov}: {str(e)}")
-    dizer(f"  📧 {emails_carregados:,} emails carregados na queue")
-    if emails_carregados == 0:
-        marcar_fase("FASE6_ENVIO", False, "0 emails pendentes")
-        return
-    retries = RETRY_QUEUE.obter_prontos(max_items=10000)
-    for email, prov, attempts in retries: await email_queue.put(email)
-    with GLOBAL["pool_lock"]:
-        n_proxies = len(GLOBAL["pool"])
-        n_workers = min(n_proxies + 1, len(contas), WORKERS_ENVIO_ASYNC)
-    if n_workers == 0:
-        dizer("  ⚠️ AVISO: sem proxies nem Colab - nao ha workers")
-        marcar_fase("FASE6_ENVIO", False, "sem workers")
-        return
-    dizer(f"  ⚙️ A criar {n_workers} workers asyncio ({n_proxies} proxies + 1 Colab)")
-    dizer(f"  👥 Contas disponiveis: {len(contas)}")
-    workers = []
-    with GLOBAL["pool_lock"]:
-        pool = list(GLOBAL["pool"])
-        for i in range(n_workers):
-            if i < len(pool): proxy_info = pool[i]
-            else: proxy_info = None
-            conta = contas[i % len(contas)]
-            workers.append((i + 1, proxy_info, conta))
+        
+    conta = contas[0]
+    dizer(f"  📧 Conta selecionada para auditoria: {conta['sender_email']}")
+    
+    sem = asyncio.Semaphore(min(500, len(GLOBAL["pool"]) if GLOBAL["pool"] else 1, len(mxs)))
     tasks = []
-    for worker_id, proxy_info, conta in workers:
-        task = asyncio.create_task(worker_envio_async(worker_id, proxy_info, conta, email_queue, html_base, mxs))
-        tasks.append(task)
+    worker_id = 1
+    
+    for provedor, mx_list in mxs.items():
+        path = os.path.join(DIR_EMAILS, provedor + ".txt")
+        emails = []
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for i, line in enumerate(f):
+                    if i >= 100: break
+                    e = line.strip()
+                    if e and "@" in e: emails.append(e)
+        if not emails: continue
+        
+        proxy_info = None
+        with GLOBAL["pool_lock"]:
+            if GLOBAL["pool"]:
+                proxy_info = GLOBAL["pool"][(worker_id - 1) % len(GLOBAL["pool"])]
+                
+        mx_host = mx_list[0] if mx_list else None
+        if not mx_host: continue
+        
+        tasks.append(validar_provedor_smtp(worker_id, proxy_info, conta, provedor, emails, mx_host, html_base, sem))
+        worker_id += 1
+        
     GLOBAL["n_workers_ativos"] = len(tasks)
-    marcar_fase("FASE6_ENVIO_INICIO", True, f"{len(tasks)} workers ativos")
-    async def monitor_progresso():
-        while not GLOBAL.get("emergency_stop") and not email_queue.empty():
-            await asyncio.sleep(30)
-            qsize = email_queue.qsize()
-            with GLOBAL["stats_lock"]:
-                aceitos = GLOBAL["smtp_aceites"]
-                tentativas = GLOBAL["smtp_tentativas"]
-                taxa = aceitos / max(1, tentativas) * 100
-            dizer(f"  📊 [PROGRESSO] Queue: {qsize:,} | Aceites: {aceitos:,} | Tentativas: {tentativas:,} | Taxa: {taxa:.1f}%")
-    monitor_task = asyncio.create_task(monitor_progresso())
-    try: await asyncio.gather(*tasks, return_exceptions=True)
-    except Exception as e: debug_log(f"fase6 gather: {str(e)}")
-    monitor_task.cancel()
-    try: await monitor_task
-    except asyncio.CancelledError: pass
-    ORCAMENTO.salvar()
-    RCPT_CTRL.salvar()
-    with GLOBAL["stats_lock"]:
-        aceitos = GLOBAL["smtp_aceites"]
-        tentativas = GLOBAL["smtp_tentativas"]
-    marcar_fase("FASE6_ENVIO", True, f"{aceitos} aceites / {tentativas} tentativas")
-    dizer(f"  🏆 FASE 6 concluida: {aceitos:,} aceites / {tentativas:,} tentativas")
-
-# === DASHBOARD 3D HTML ===
-def gerar_dashboard_3d_html(rt):
-    agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    campaign_id = GLOBAL.get("campaign_id", "N/A")
-    exec_id = GLOBAL.get("exec_id", "N/A")
-    campaign_started = GLOBAL.get("campaign_started_at", "N/A")
-    run_started = GLOBAL.get("run_started_at", 0)
-    if run_started:
-        try: run_started_str = datetime.fromtimestamp(run_started).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception: run_started_str = "N/A"
-    else: run_started_str = "N/A"
-    elapsed = time.time() - GLOBAL["start_time"]
-    h, m, s = int(elapsed // 3600), int((elapsed % 3600) // 60), int(elapsed % 60)
-    aceitos = rt.get("aceites", 0)
-    tentativas = rt.get("tentados", 0)
-    rejeitados = rt.get("rejeitados", 0)
-    erros = rt.get("erros", 0)
-    taxa = aceitos / max(1, tentativas) * 100
-    config = CHECKPOINT.obter_config()
-    total_runs = config.get("total_runs", 0)
-    status = config.get("status", "UNKNOWN")
-    pool_size = len(GLOBAL.get("pool", []))
-    mortos = GLOBAL.get("proxies_mortos_count", 0)
-    banidos = GLOBAL.get("proxies_banidos", 0)
-    dns_ok = GLOBAL.get("dns_updated", 0)
-    dns_total = GLOBAL.get("dns_total", 0)
-    run_history = config.get("run_history", [])
-    por_provedor = rt.get("por_provedor", {})
-    html = f"""<!DOCTYPE html>
-<html lang="pt">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>VERISCOPE V21.0.0 Dashboard</title>
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: 'Segoe UI', Tahoma, sans-serif; background: linear-gradient(135deg, #0f0c29, #302b63, #24243e); color: #fff; min-height: 100vh; padding: 20px; }}
-.container {{ max-width: 1400px; margin: 0 auto; }}
-h1 {{ text-align: center; font-size: 2.5em; margin-bottom: 10px; background: linear-gradient(45deg, #00d4ff, #7b2ff7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-shadow: 0 0 30px rgba(0, 212, 255, 0.3); }}
-.subtitle {{ text-align: center; color: #888; margin-bottom: 30px; }}
-.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 30px; }}
-.card {{ background: rgba(255, 255, 255, 0.05); border-radius: 15px; padding: 20px; backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); transition: transform 0.3s, box-shadow 0.3s; }}
-.card:hover {{ transform: translateY(-5px); box-shadow: 0 10px 40px rgba(0, 212, 255, 0.2); }}
-.card-title {{ font-size: 0.9em; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }}
-.card-value {{ font-size: 2.5em; font-weight: bold; margin-bottom: 5px; }}
-.card-subtitle {{ font-size: 0.85em; color: #aaa; }}
-.ok {{ color: #00ff88; }} .warn {{ color: #ffaa00; }} .error {{ color: #ff4466; }} .info {{ color: #00d4ff; }}
-.cube-container {{ perspective: 1000px; width: 200px; height: 200px; margin: 40px auto; }}
-.cube {{ width: 100%; height: 100%; position: relative; transform-style: preserve-3d; animation: rotate 20s infinite linear; }}
-@keyframes rotate {{ from {{ transform: rotateX(0) rotateY(0); }} to {{ transform: rotateX(360deg) rotateY(360deg); }} }}
-.face {{ position: absolute; width: 200px; height: 200px; background: rgba(0, 212, 255, 0.15); border: 2px solid rgba(0, 212, 255, 0.5); display: flex; flex-direction: column; justify-content: center; align-items: center; font-size: 14px; backdrop-filter: blur(5px); }}
-.face .label {{ font-size: 11px; color: #888; margin-bottom: 5px; }} .face .value {{ font-size: 24px; font-weight: bold; color: #00d4ff; }}
-.face.front  {{ transform: translateZ(100px); }} .face.back   {{ transform: rotateY(180deg) translateZ(100px); }}
-.face.right  {{ transform: rotateY(90deg) translateZ(100px); }} .face.left   {{ transform: rotateY(-90deg) translateZ(100px); }}
-.face.top    {{ transform: rotateX(90deg) translateZ(100px); }} .face.bottom {{ transform: rotateX(-90deg) translateZ(100px); }}
-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; background: rgba(255, 255, 255, 0.03); border-radius: 10px; overflow: hidden; }}
-th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid rgba(255, 255, 255, 0.1); }}
-th {{ background: rgba(0, 212, 255, 0.2); font-weight: 600; text-transform: uppercase; font-size: 0.85em; letter-spacing: 1px; }}
-tr:hover {{ background: rgba(255, 255, 255, 0.05); }}
-.section-title {{ font-size: 1.5em; margin: 30px 0 15px; color: #00d4ff; border-bottom: 2px solid rgba(0, 212, 255, 0.3); padding-bottom: 10px; }}
-.footer {{ text-align: center; color: #666; margin-top: 40px; font-size: 0.85em; }}
-.progress {{ background: rgba(255, 255, 255, 0.1); border-radius: 10px; height: 8px; overflow: hidden; margin-top: 10px; }}
-.progress-bar {{ height: 100%; background: linear-gradient(90deg, #00d4ff, #7b2ff7); transition: width 0.3s; }}
-</style>
-</head>
-<body>
-<div class="container">
-<h1>🚀 VERISCOPE V21.0.0</h1>
-<div class="subtitle">Dashboard Profissional | Gerado em {agora}</div>
-<div class="cube-container">
-<div class="cube">
-<div class="face front"><div class="label">ACEITES</div><div class="value">{aceitos:,}</div></div>
-<div class="face back"><div class="label">TENTATIVAS</div><div class="value">{tentativas:,}</div></div>
-<div class="face right"><div class="label">TAXA</div><div class="value">{taxa:.1f}%</div></div>
-<div class="face left"><div class="label">PROXIES</div><div class="value">{pool_size}</div></div>
-<div class="face top"><div class="label">STATUS</div><div class="value">{status}</div></div>
-<div class="face bottom"><div class="label">RUNS</div><div class="value">{total_runs}</div></div>
-</div>
-</div>
-<div class="grid">
-<div class="card"><div class="card-title">🎯 Taxa de Sucesso</div><div class="card-value {'ok' if taxa > 10 else 'warn' if taxa > 5 else 'error'}">{taxa:.2f}%</div><div class="card-subtitle">{aceitos:,} de {tentativas:,} tentativas</div><div class="progress"><div class="progress-bar" style="width: {min(taxa, 100):.1f}%"></div></div></div>
-<div class="card"><div class="card-title">⏱️ Tempo de Execucao</div><div class="card-value info">{h:02d}:{m:02d}:{s:02d}</div><div class="card-subtitle">Limite: 05:40:00</div></div>
-<div class="card"><div class="card-title">🔌 Pool de Proxies</div><div class="card-value {'ok' if pool_size >= 100 else 'warn' if pool_size >= 10 else 'error'}">{pool_size}</div><div class="card-subtitle">Mortos: {mortos:,} | Banidos: {banidos:,}</div></div>
-<div class="card"><div class="card-title">🔐 DNS Configurado</div><div class="card-value ok">{dns_ok:,}/{dns_total:,}</div><div class="card-subtitle">Bases confirmadas</div></div>
-<div class="card"><div class="card-title">📧 Rejeitados</div><div class="card-value error">{rejeitados:,}</div><div class="card-subtitle">5xx permanentes</div></div>
-<div class="card"><div class="card-title">⚠️ Erros</div><div class="card-value warn">{erros:,}</div><div class="card-subtitle">Conexoes falhadas</div></div>
-</div>
-<h2 class="section-title">📋 Informacao da Campanha</h2>
-<div class="grid">
-<div class="card"><div class="card-title">Campaign ID</div><div class="card-value" style="font-size: 1.2em;">{campaign_id}</div></div>
-<div class="card"><div class="card-title">Execution ID</div><div class="card-value" style="font-size: 1.2em;">{exec_id}</div></div>
-<div class="card"><div class="card-title">Inicio Campanha</div><div class="card-value" style="font-size: 1.2em;">{campaign_started}</div></div>
-<div class="card"><div class="card-title">Inicio Run Atual</div><div class="card-value" style="font-size: 1.2em;">{run_started_str}</div></div>
-<div class="card"><div class="card-title">Total de Runs</div><div class="card-value info">{total_runs}</div></div>
-<div class="card"><div class="card-title">Status</div><div class="card-value {'ok' if status == 'COMPLETED' else 'info'}">{status}</div></div>
-</div>
-<h2 class="section-title">📜 Historico de Execucoes</h2>
-<table>
-<tr><th>Run #</th><th>Exec ID</th><th>Inicio</th><th>Fim</th><th>Status</th><th>Motivo</th></tr>"""
-    for i, run in enumerate(run_history[-10:], 1):
-        html += f"""<tr><td>{i}</td><td>{run.get('exec_id', 'N/A')}</td><td>{run.get('run_started_at', 'N/A')}</td><td>{run.get('run_ended_at', 'N/A')}</td><td class="{'ok' if run.get('status') == 'COMPLETED' else 'warn'}">{run.get('status', 'N/A')}</td><td>{run.get('motivo', 'N/A')}</td></tr>"""
-    html += """</table>
-<h2 class="section-title">📊 Resultados por Provedor (Top 20)</h2>
-<table>
-<tr><th>Provedor</th><th>Aceites</th><th>Tentados</th><th>Rejeitados</th><th>Erros</th><th>Taxa</th></tr>"""
-    sorted_provs = sorted(por_provedor.items(), key=lambda x: x[1].get("aceites", 0), reverse=True)[:20]
-    for prov, r in sorted_provs:
-        taxa_prov = r.get("aceites", 0) / max(1, r.get("tentados", 0)) * 100
-        html += f"""<tr><td>{prov}</td><td class="ok">{r.get('aceites', 0):,}</td><td>{r.get('tentados', 0):,}</td><td class="error">{r.get('rejeitados', 0):,}</td><td class="warn">{r.get('erros', 0):,}</td><td class="{'ok' if taxa_prov > 10 else 'warn' if taxa_prov > 5 else 'error'}">{taxa_prov:.1f}%</td></tr>"""
-    html += f"""</table>
-<div class="footer">
-<p>VERISCOPE V21.0.0 | Arquitectura Asyncio | 501 Workers</p>
-<p>Checkpoints: {CP_DIR} | Repositorio: {HF_CHECKPOINT_REPO}</p>
-<p>Ultima atualizacao: {agora}</p>
-</div></div></body></html>"""
-    return html
+    marcar_fase("FASE6_ENVIO_INICIO", True, f"{len(tasks)} provedores em auditoria")
+    await asyncio.gather(*tasks)
+    marcar_fase("FASE6_ENVIO", True, f"Auditoria concluida para {len(tasks)} provedores")
+    dizer(f"  🏆 FASE 6 concluida: Auditoria de {len(tasks)} provedores finalizada.")
 
 # === MONITOR DE PROXIES ===
 async def monitor_proxies_continuo_async():
@@ -2888,12 +2656,14 @@ async def gerar_ficheiros_finais():
                 for email in aceites_set: writer.writerow([email, "", "", "", ts])
             dizer(f"  ✅ Ficheiro {SAIDA_ACEITES} criado com {len(aceites_set):,} aceites")
     except Exception as e: dizer(f"  ❌ ERRO ao gerar ficheiro de aceites: {str(e)}")
+    
     dizer("👻 A gerar ficheiro final de user_unknowns...")
     try:
         if os.path.exists(UNKNOWN_FILE_LOCAL): shutil.copy(UNKNOWN_FILE_LOCAL, SAIDA_UNKNOWN)
         with GLOBAL["user_unknowns_lock"]: n_unk = len(GLOBAL["user_unknowns"])
         dizer(f"  ✅ Ficheiro {SAIDA_UNKNOWN} criado com {n_unk:,} user_unknowns")
     except Exception as e: dizer(f"  ❌ ERRO ao copiar user_unknowns: {str(e)}")
+    
     dizer("☁️ A enviar ficheiros para HuggingFace...")
     try:
         api = HfApi(token=HF_TOKEN)
@@ -2928,6 +2698,74 @@ async def enviar_email_unico(dest, assunto, html, conta):
     except Exception as e:
         debug_log(f"enviar_email_unico: {traceback.format_exc()}")
         return False
+
+async def enviar_email_smtp_async(worker_id, proxy_info, conta, email, mx_host, html_base):
+    # Funcao simplificada para envio unico final
+    prov = email.split("@")[-1] if "@" in email else ""
+    timeout = SMTP_TIMEOUT_ASIATICO if prov in PROVEDORES_ASIATICOS else SMTP_TIMEOUT
+    try:
+        loop = asyncio.get_event_loop()
+        def _connect():
+            if proxy_info:
+                proto = proxy_info.get("proto", "socks5")
+                if proto in ('socks5', 'socks4'):
+                    s = socks.socksocket()
+                    if proto == 'socks5': s.set_proxy(socks.SOCKS5, proxy_info["ip"], proxy_info["port"])
+                    else: s.set_proxy(socks.SOCKS4, proxy_info["ip"], proxy_info["port"])
+                    s.settimeout(timeout)
+                    s.connect((mx_host, 25))
+                else:
+                    s = socket.socket()
+                    s.settimeout(timeout)
+                    s.connect((proxy_info["ip"], proxy_info["port"]))
+                    s.sendall(f"CONNECT {mx_host}:25 HTTP/1.1\r\nHost: {mx_host}\r\n\r\n".encode())
+                    r = s.recv(4096)
+                    if b"200" not in r:
+                        s.close()
+                        raise ConnectionError("CONNECT fail")
+                return s
+            else:
+                s = socket.socket()
+                s.settimeout(timeout)
+                s.connect((mx_host, 25))
+                return s
+                
+        sock = await asyncio.wait_for(loop.run_in_executor(None, _connect), timeout=timeout + 3)
+        banner = await smtp_send_recv(sock, None)
+        if not banner.startswith("220"):
+            sock.close()
+            return False, "BANNER_INVALIDO"
+            
+        resp = await smtp_send_recv(sock, f"EHLO {conta['identity_id']}\r\n")
+        resp = await smtp_send_recv(sock, f"MAIL FROM: <{conta['sender_email']}>\r\n")
+        if not resp.startswith("250"):
+            sock.close()
+            return False, "MAIL_FROM_REJEITADO"
+            
+        resp = await smtp_send_recv(sock, f"RCPT TO: <{email}>\r\n")
+        if not (resp.startswith("250") or resp.startswith("251")):
+            sock.close()
+            return False, "RCPT_REJEITADO"
+            
+        resp = await smtp_send_recv(sock, "DATA\r\n")
+        if not resp.startswith("354"):
+            sock.close()
+            return False, "DATA_REJEITADO"
+            
+        payload = aplicar_mutacao_abracadabra(html_base, conta, [email])
+        if not payload.endswith(b"\r\n"): payload += b"\r\n"
+        payload += b".\r\n"
+        
+        resp = await smtp_send_recv(sock, payload, timeout=30)
+        try:
+            await smtp_send_recv(sock, "QUIT\r\n")
+            sock.close()
+        except Exception: pass
+        
+        if resp.startswith("250"): return True, "OK"
+        else: return False, f"DATA_FINAL_{resp[:3]}"
+    except asyncio.TimeoutError: return False, "TIMEOUT"
+    except Exception as e: return False, f"ERRO_{str(e)[:50]}"
 
 async def salvar_logs_hf():
     if GLOBAL.get("logs_uploaded"): return
@@ -3009,12 +2847,14 @@ async def main():
     n_baixados = download_all_checkpoints_from_hf()
     CHECKPOINT._carregar_tudo()
     config = CHECKPOINT.obter_config()
+    
     if config.get("status") == "COMPLETED":
         print("=" * 70, flush=True)
         print("[FIM] 🏁 A campanha ja foi totalmente concluida em execucao anterior.", flush=True)
         print("[FIM] Status: COMPLETED. A sair sem enviar nada.", flush=True)
         print("=" * 70, flush=True)
         sys.exit(0)
+        
     tem_checkpoint = CHECKPOINT.existe_checkpoint()
     if tem_checkpoint:
         print("", flush=True)
@@ -3065,52 +2905,66 @@ async def main():
         GLOBAL["campaign_id"] = f"camp_{int(time.time())}"
         GLOBAL["campaign_started_at"] = datetime.now().isoformat()
         limpar_logs_antigos(preservar_checkpoints=False, preservar_saida=False)
+        
     LOG_FILE = os.path.join(LOG_DIR, f"log_{execution_id}.txt")
     SMTP_LOG = os.path.join(LOG_DIR, f"smtp_{execution_id}.txt")
     DEBUG_LOG = os.path.join(LOG_DIR, f"debug_{execution_id}.txt")
+    
     try:
         open(LOG_FILE, "w", encoding="utf-8").close()
         open(SMTP_LOG, "w", encoding="utf-8").close()
         open(DEBUG_LOG, "w", encoding="utf-8").close()
         open(DESEC_LOG, "w", encoding="utf-8").close()
     except Exception: pass
+    
     GLOBAL["user_unknowns_file"] = UNKNOWN_FILE_LOCAL
+    
     dashboard_task = asyncio.create_task(render_dashboard_live())
     checkpoint_task = asyncio.create_task(periodic_checkpoint_thread_async())
     timelimit_task = asyncio.create_task(time_limit_watcher_async())
+    
     await asyncio.sleep(1)
-    dizer(f"🚀 VERISCOPE V21.0.0 ASYNCIO [{execution_id}]")
+    dizer(f"🚀 VERISCOPE V21.1.0 ASYNCIO [{execution_id}]")
     dizer(f"🏷️ Campaign ID: {GLOBAL.get('campaign_id')}")
     dizer(f"🔄 Modo: {'RECUPERACAO' if tem_checkpoint else 'NOVO'}")
-    dizer(f"⚙️ Workers: {WORKERS_ENVIO_ASYNC} (500 proxies + 1 Colab)")
+    dizer(f"⚙️ Workers: {WORKERS_ENVIO_ASYNC} (Auditoria Hierarquica)")
     dizer(f"📥 Download: {WORKERS_DOWNLOAD_ASYNC} | 🔍 Validacao: {WORKERS_VALIDACAO_ASYNC}")
+    
     if tem_checkpoint:
         dizer(f"  🏆 Aceites recuperados: {GLOBAL['smtp_aceites']:,}")
         dizer(f"  📤 Tentativas recuperadas: {GLOBAL['smtp_tentativas']:,}")
         dizer(f"  🔌 Proxies no pool: {len(GLOBAL['pool'])}")
         dizer(f"  👻 User unknowns: {len(GLOBAL['user_unknowns']):,}")
+        
     await baixar_ficheiros_campanha()
     contas, html_base, mxs = [], "", {}
+    
     try:
         ip_colab = await obter_ip_colab()
         CHECKPOINT.salvar_config(execution_id, ip_colab, status="RUNNING", campaign_id=GLOBAL.get("campaign_id"))
         GLOBAL["status"] = "RUNNING"
         await verificar_blacklists(ip_colab)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
+        
         await testar_tokens_desec()
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
+        
         contas = await carregar_contas_inteligente()
         html_base = await carregar_template()
         await carregar_mail_from_variations()
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
+        
         provedores = await descobrir_provedores_reais()
         mxs = await resolver_mxs_paralelo(provedores)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
+        
         await baixar_todos_emails_paralelo(sorted(mxs.keys()))
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
+        
         definir_fase("🚫 FASE 2D - Blacklist persistente de USER_UNKNOWN")
         await baixar_unknowns_acumulado()
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
+        
         definir_fase("🕵️‍♂️ FASE 2.5 - Proxies: scraping + validacao massiva")
         pool_ok = False
         if len(GLOBAL["pool"]) >= MIN_PROXIES_REFILL:
@@ -3120,27 +2974,34 @@ async def main():
                 pool_ok = True
                 marcar_fase("FASE25_PROXIES", True, f"pool revalidado {vivos}")
             else: dizer(f"  💀 Pool morreu ({vivos} vivos) - scraping novo")
+                
         if not pool_ok:
             try: await carregar_e_scrapear_proxies_async(motivo="inicial")
             except Exception as e: dizer(f"  ⚠️ AVISO: scraping falhou ({str(e)[:140]})")
             try: await validar_proxies_ate_target_async(TARGET_VALID_PROXIES)
             except Exception as e: dizer(f"  ⚠️ AVISO: validacao falhou ({str(e)[:140]})")
+                
         with GLOBAL["pool_lock"]: n_pool = len(GLOBAL["pool"])
         with GLOBAL["raw_lock"]: n_raw = len(GLOBAL["raw_proxies"])
         proxy_ok = (n_pool > 0) or (n_raw > 0)
         marcar_fase("FASE25_PROXIES", proxy_ok, f"pool={n_pool} raw={n_raw:,}")
         if n_pool == 0:
             dizer("  ⚠️ AVISO: pool vazio. Sem proxies nao ha envio.")
+            
         GLOBAL["scraping_inicial_feito"] = True
         GLOBAL["ultimo_rescrape"] = time.time()
         monitor_task = asyncio.create_task(monitor_proxies_continuo_async())
+        
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
         await fase3_dns_completo_async(contas)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
+        
         await fase4_esperar_propagacao()
         await verificar_propagacao_amostra(contas, ip_colab)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        await fase6_envio_massivo_async(mxs, contas, html_base)
+        
+        await fase6_validacao_provedores(mxs, contas, html_base)
+        
     except KeyboardInterrupt:
         GLOBAL["emergency_stop"] = True
         dizer("🛑 Interrompido pelo utilizador")
@@ -3156,6 +3017,7 @@ async def main():
                 task.cancel()
                 try: await task
                 except asyncio.CancelledError: pass
+                
         try:
             dizer("[CHECKPOINT] 💾 Salvamento final...")
             salvar_checkpoint_smtp()
@@ -3172,15 +3034,24 @@ async def main():
             dizer(f"[CHECKPOINT] ✅ {ok_count} ficheiros salvos com manifesto")
             upload_all_checkpoints_to_hf()
             dizer("[CHECKPOINT] ☁️ Estado salvo e enviado para HF")
+            
+            # Copiar SMTP LOG para output local (Artefato)
+            if os.path.exists(SMTP_LOG):
+                shutil.copy(SMTP_LOG, "/content/smtp_log_audit.txt")
+                dizer("📥 Log SMTP copiado para /content/smtp_log_audit.txt (Pronto para Download)")
+                
         except Exception as e:
             dizer(f"❌ ERRO ao salvar checkpoint final: {str(e)}")
             debug_log(f"checkpoint final: {traceback.format_exc()}")
+            
         try: await gerar_ficheiros_finais()
         except Exception as e: dizer(f"❌ ERRO ao gerar ficheiros finais: {str(e)}")
+        
         rt = {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0, "via_proxy": 0, "via_colab": 0, "por_provedor": GLOBAL["por_provedor"]}
         for r in GLOBAL["por_provedor"].values():
             for k in ("aceites", "tentados", "rejeitados", "erros", "via_proxy", "via_colab"):
                 if k in r: rt[k] += r[k]
+                
         if rt["aceites"] == 0:
             rt["aceites"] = GLOBAL.get("smtp_aceites", 0)
             rt["tentados"] = GLOBAL.get("smtp_tentativas", 0)
@@ -3188,6 +3059,7 @@ async def main():
             rt["erros"] = GLOBAL.get("smtp_erros", 0)
             rt["via_proxy"] = GLOBAL.get("smtp_via_proxy", 0)
             rt["via_colab"] = GLOBAL.get("smtp_via_colab", 0)
+            
         if GLOBAL.get("emergency_stop"): dizer("🛑 Paragem de emergencia - estado guardado")
         else:
             dizer(f"📧 FASE 7 - Relatorio final para {FINAL_DESTINATARIO}")
@@ -3196,23 +3068,12 @@ async def main():
                 ok1 = await enviar_email_unico(FINAL_DESTINATARIO, CAMPAIGN["subject"], html_base, cf)
                 dizer(f"  📨 Email da campanha: {'✅ OK' if ok1 else '❌ FALHOU'}")
                 await asyncio.sleep(5)
-            try:
-                dashboard_html = gerar_dashboard_3d_html(rt)
-                dashboard_path = os.path.join(DIR_AUDIT, "dashboard.html")
-                with open(dashboard_path, "w", encoding="utf-8") as f: f.write(dashboard_html)
-                dizer(f"  📊 Dashboard salvo: {dashboard_path}")
-                try:
-                    api = HfApi(token=HF_TOKEN)
-                    criar_repo_hf_se_nao_existe(HF_CHECKPOINT_REPO, "dataset")
-                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    api.upload_file(path_or_fileobj=dashboard_path, path_in_repo=f"reports/dashboard_v21_{ts}.html", repo_id=HF_CHECKPOINT_REPO, repo_type="dataset", token=HF_TOKEN)
-                    dizer("  ☁️ Dashboard enviado para HuggingFace")
-                except Exception as e: dizer(f"  ⚠️ AVISO: upload dashboard falhou ({str(e)[:110]})")
-            except Exception as e: dizer(f"  ❌ ERRO ao gerar dashboard: {str(e)}")
+                
         try: await upload_unknowns_hf()
         except Exception: pass
         try: await salvar_logs_hf()
         except Exception: pass
+        
         taxa = rt['aceites'] / max(1, rt['tentados']) * 100
         print("", flush=True)
         print("=" * 70, flush=True)
@@ -3229,12 +3090,11 @@ async def main():
         print(f"  📦 Parquets        : {GLOBAL['pq_downloaded']}/{GLOBAL['pq_total']}", flush=True)
         print(f"  🧬 DNS confirmado  : {GLOBAL.get('dns_updated', 0)}/{GLOBAL.get('dns_total', 0)}", flush=True)
         print(f"  🌐 DESec Requests  : {GLOBAL.get('desec_requests', 0)} | OK: {GLOBAL.get('desec_success', 0)}", flush=True)
-        print(f"  📊 Dashboard       : {DIR_AUDIT}/dashboard.html", flush=True)
+        print(f"  📊 SMTP Log Local  : /content/smtp_log_audit.txt", flush=True)
         print(f"  🔄 MODO RECUPERACAO: {'♻️ SIM' if GLOBAL.get('modo_recuperacao') else '❌ NAO'}", flush=True)
         print(f"  🏁 STATUS FINAL    : {GLOBAL.get('status', 'UNKNOWN')}", flush=True)
         print("=" * 70, flush=True)
         anotacao("notice", f"Run terminou: {rt['aceites']:,} aceites · checkpoint enviado p/ HF")
 
-# Entry point
 if __name__ == "__main__":
     asyncio.run(main())
