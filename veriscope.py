@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V21.3.0 - HIERARCHICAL PARALLEL EDITION (GitHub Actions + Colab CLI)
-ARQUITETURA: Paralelismo Hierárquico Massivo (Provedores -> Contas -> RCPTs)
-AMBIENTE: Otimizado para 'colab exec' (Headless CLI, sem IPython.display)
+VERISCOPE V21.3.1 - CLI + HIERARQUIA + AUTO-PEM
+AMBIENTE: Otimizado para 'colab exec' (Headless CLI, GitHub Actions)
+ARQUITETURA: Paralelismo Hierárquico Massivo (Provedores -> Contas -> RCPTs 100)
 CORREÇÕES CRÍTICAS:
-1. AccountPool Global: Distribui 2.116 contas em Round-Robin seguro.
-2. TunnelSemaphore: Protege o servidor SSH Aracloud de sobrecarga (MaxStartups).
-3. Worker Provedor Independente: Cada provedor gere o seu próprio estado e retries.
-4. Logging Assíncrono: Fila de escrita para não bloquear o I/O.
-5. CLI Status Printer: Substitui clear_output para compatibilidade com GitHub Actions.
+1. Auto-Download do k.pem do HuggingFace.
+2. ThreadPoolExecutor de Parquets corrigido (limite de 50 threads + captura de exceções).
+3. RCPT_DEFAULT e limites globais aumentados para 100.
+4. Injeção forçada de HF_TOKEN nas threads de download.
 """
 import os
 import sys
@@ -122,9 +121,9 @@ HF_CHECKPOINT_REPO = "Valter3B/Veriscope_Checkpoints"
 
 META_ACEITES_POR_PROVEDOR = float('inf')
 MAX_EMAILS_POR_CONTA = float('inf')
-MAX_EMAILS_POR_PROVEDOR_DOWNLOAD = 100
+MAX_EMAILS_POR_PROVEDOR_DOWNLOAD = 100  # ALTERADO PARA 100
 EMAILS_JANELA_ENVIO = 999999999
-DNS_PROPAGACAO_SEGUNDOS = 120  # Reduzido para velocidade
+DNS_PROPAGACAO_SEGUNDOS = 120
 FINAL_DESTINATARIO = "bingo_192@naver.com"
 DIA_ATUAL = 1
 
@@ -132,13 +131,13 @@ DIA_ATUAL = 1
 WORKERS_DOWNLOAD_ASYNC = 99999
 WORKERS_MX_ASYNC = 99999
 WORKERS_VALIDACAO_ASYNC = 99999
-WORKERS_ENVIO_ASYNC = 99999  # Ilimitado a nível de provedor, o túnel é o funil
+WORKERS_ENVIO_ASYNC = 99999
 WORKERS_DNS_ASYNC = 99999
 
 SMTP_TIMEOUT = 15
 SMTP_TIMEOUT_ASIATICO = 30
 SMTP_RECV_TIMEOUT = 15
-DELAY_ENTRE_RCPT = 0.01  # Reduzido para velocidade
+DELAY_ENTRE_RCPT = 0.01
 MAX_RCPT_POR_CONEXAO = 100
 
 DESEC_TTL = 900
@@ -177,23 +176,24 @@ MIN_INTERVALO_IP_PROVEDOR = 5
 WORKER_HIBERNACAO_421 = 6000
 WORKER_TIMEOUTS_CONSECUTIVOS_MAX = 3000
 
+# RCPT LIMITS ALTERADOS PARA 100 (Exceto Yahoo/AOL que são restritos)
 RCPT_LIMITS = {
     "yahoo.com": 20, "ymail.com": 20, "aol.com": 20, "rocketmail.com": 20,
     "yahoo.co.uk": 20, "yahoo.fr": 20, "yahoo.de": 20, "yahoo.it": 20,
     "yahoo.es": 20, "yahoo.ca": 20, "yahoo.com.br": 20, "yahoo.com.mx": 20,
     "aim.com": 20, "netscape.net": 20, "mail.com": 20,
-    "outlook.com": 50, "hotmail.com": 50, "live.com": 50, "msn.com": 50,
-    "hotmail.co.uk": 50, "hotmail.fr": 50, "hotmail.de": 50,
-    "icloud.com": 50, "me.com": 50, "mac.com": 50,
-    "protonmail.com": 50, "protonmail.ch": 50,
+    "outlook.com": 100, "hotmail.com": 100, "live.com": 100, "msn.com": 100,
+    "hotmail.co.uk": 100, "hotmail.fr": 100, "hotmail.de": 100,
+    "icloud.com": 100, "me.com": 100, "mac.com": 100,
+    "protonmail.com": 100, "protonmail.ch": 100,
     "mail.ru": 100, "yandex.ru": 100, "ya.ru": 100,
     "bk.ru": 100, "list.ru": 100, "inbox.ru": 100,
-    "daum.net": 50, "naver.com": 100,
-    "gmail.com": 50, "googlemail.com": 50,
-    "qq.com": 50, "163.com": 50, "126.com": 50,
+    "daum.net": 100, "naver.com": 100,
+    "gmail.com": 100, "googlemail.com": 100,
+    "qq.com": 100, "163.com": 100, "126.com": 100,
 }
-RCPT_DEFAULT = 50
-RCPT_LIMITS_MAX = 200  # Limite máximo permitido por conexão
+RCPT_DEFAULT = 100  # ALTERADO PARA 100
+RCPT_LIMITS_MAX = 200
 
 PROVEDORES_ASIATICOS = {
     "naver.com", "hanmail.net", "daum.net", "korea.com", "lycos.co.kr",
@@ -351,11 +351,10 @@ def painel_completo_cli():
 
 def diagnostico_ambiente_hf():
     print("\n" + "=" * 80, flush=True)
-    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.3.0 (CLI + Hierarquia)", flush=True)
+    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.3.1 (CLI + Hierarquia)", flush=True)
     print("=" * 80, flush=True)
     print(f"[ENV] HF_TOKEN: {'✅ SIM' if HF_TOKEN else '❌ NÃO'} ({len(HF_TOKEN)} chars)", flush=True)
     print(f"[ENV] DESEC_TOKEN: {'✅ SIM' if DESEC_TOKEN else '❌ NÃO'}", flush=True)
-    print(f"[SSH] Chave Privada: {'✅ SIM' if os.path.exists(SSH_PKEY_PATH) else '❌ NÃO (Upload k.pem!)'}", flush=True)
     print(f"[REPOS] Checkpoints: {HF_CHECKPOINT_REPO}", flush=True)
     if HF_TOKEN:
         try:
@@ -377,7 +376,7 @@ def garantir_diretorio_para(caminho):
     except Exception: pass
 
 class CheckpointManager:
-    VERSION = "21.3.0"
+    VERSION = "21.3.1"
     def __init__(self):
         self.locks = {k: threading.Lock() for k in ["fases", "provedores", "pool", "smtp", "contas", "config", "unknown", "aceites", "workers", "orcamento", "rcpt", "dashboard"]}
         self.states = {
@@ -659,7 +658,6 @@ def reset_global_state():
     return execution_id
 
 def log_writer_thread_func():
-    """Thread dedicado para escrita assíncrona de logs - elimina gargalo de I/O"""
     buffers = {}
     last_flush = time.time()
     while not LOG_WRITER_STOP.is_set():
@@ -689,7 +687,6 @@ def log_writer_thread_func():
                     except Exception: pass
                     buffers[fname] = []
             last_flush = time.time()
-    # Flush final
     for fname, lines in buffers.items():
         if lines:
             try:
@@ -985,6 +982,28 @@ async def download_hf_com_retry(repo_id, filename, repo_type, max_retries=4):
             await asyncio.sleep(espera)
     raise ultima if ultima else RuntimeError("download_hf_com_retry falhou")
 
+async def baixar_chave_ssh():
+    dizer("🔑 A baixar chave SSH (k.pem) do HuggingFace...")
+    paths_tentativa = [
+        "campaign_data/templates/k.pem",
+        "campaign_data/k.pem",
+        "k.pem"
+    ]
+    for path_hf in paths_tentativa:
+        try:
+            local_pem = await download_hf_com_retry(HF_LOGS_REPO, path_hf, "dataset")
+            if local_pem and os.path.exists(local_pem):
+                shutil.copy(local_pem, SSH_PKEY_PATH)
+                os.chmod(SSH_PKEY_PATH, 0o600)
+                dizer(f"  ✅ k.pem descarregado de {path_hf} para {SSH_PKEY_PATH}")
+                return True
+        except Exception as e:
+            debug_log(f"k.pem nao encontrado em {path_hf}: {str(e)[:100]}")
+            continue
+            
+    dizer(f"  ❌ ERRO: k.pem nao encontrado no HuggingFace em nenhum dos paths testados.")
+    return False
+
 async def carregar_contas_inteligente():
     definir_fase("📧 FASE 2A - Contas DKIM (Carregar TODAS as contas válidas)")
     if fase_ja_completa("FASE2A_CONTAS"):
@@ -1116,6 +1135,10 @@ async def resolver_mxs_paralelo(provedores):
     return out
 
 def processar_provedor_emails_sync(args):
+    # Injeção forçada do Token para a thread
+    if HF_TOKEN:
+        os.environ["HF_TOKEN"] = HF_TOKEN
+        
     prov, itens = args
     if GLOBAL.get("emergency_stop"): return prov, 0
     if CHECKPOINT.provedor_ja_baixado(prov):
@@ -1171,14 +1194,15 @@ def processar_provedor_emails_sync(args):
                             seen.add(e)
                             buf.append(e)
                             total += 1
-                            if total >= 100: break
+                            if total >= MAX_EMAILS_POR_PROVEDOR_DOWNLOAD: break
                         if buf:
                             fout.write("\n".join(buf) + "\n")
                             buf = []
-                        if total >= 100: break
+                        if total >= MAX_EMAILS_POR_PROVEDOR_DOWNLOAD: break
                         ok_pq += 1
                 except Exception as e:
                     falha_pq += 1
+                    print(f"[ERRO PARQUET] {prov} - {rel}: {str(e)[:200]}", flush=True)
                     debug_log(f"parquet {rel} ({prov}): {str(e)[:200]}")
                 finally:
                     pf = None
@@ -1186,7 +1210,7 @@ def processar_provedor_emails_sync(args):
                         try:
                             if os.path.exists(origem): os.remove(origem)
                         except Exception: pass
-                if total >= 100: break
+                if total >= MAX_EMAILS_POR_PROVEDOR_DOWNLOAD: break
             fout.flush()
             try: os.fsync(fout.fileno())
             except Exception: pass
@@ -1218,7 +1242,7 @@ async def baixar_todos_emails_paralelo(provedores):
         if p in por_prov: 
             args.append((p, [por_prov[p][0]]))
     GLOBAL["pq_total"] = sum(len(v) for v in por_prov.values())
-    dizer(f"  🗂️ Parquets identificados: {GLOBAL['pq_total']} em {len(args)} provedores (A baixar so o 1o de cada)")
+    dizer(f"  🗂️ Parquets identificados: {GLOBAL['pq_total']} em {len(args)} provedores")
     emails_recuperados = 0
     for p in ja_baixados:
         path_p = os.path.join(DIR_EMAILS, p + ".txt")
@@ -1238,11 +1262,18 @@ async def baixar_todos_emails_paralelo(provedores):
     if GLOBAL.get("emergency_stop"):
         marcar_fase("FASE2C_DOWNLOAD", False, "paragem de emergencia")
         return
-    dizer(f"  ⚙️ A extrair emails (Limite 100/prov) para {DIR_EMAILS} ...")
+    dizer(f"  ⚙️ A extrair emails (Limite {MAX_EMAILS_POR_PROVEDOR_DOWNLOAD}/prov) para {DIR_EMAILS} ...")
     loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(99999, len(itens_args) or 1, 4000)) as ex:
+    
+    # CORREÇÃO CRÍTICA: Limitar threads a 50 para evitar crash silencioso do Colab
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(50, len(itens_args) or 1)) as ex:
         tasks = [loop.run_in_executor(ex, processar_provedor_emails_sync, a) for a in itens_args]
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                print(f"[ERRO GERAL PARQUET] {itens_args[i][0]}: {str(res)[:200]}", flush=True)
+                debug_log(f"Erro geral parquet {itens_args[i][0]}: {str(res)}")
+                
     dizer(f"  📧 Emails extraidos: {GLOBAL['emails_read']:,}")
     dizer(f"  📊 Parquets processados: {GLOBAL['pq_downloaded']}/{GLOBAL['pq_total']} | falhas: {GLOBAL['pq_falhados']}")
     completos = (GLOBAL['pq_downloaded'] + GLOBAL['pq_falhados']) >= len(itens_args)
@@ -2100,7 +2131,6 @@ async def enviar_batch_smtp(provedor, mx_host, emails_batch, html_base, worker_i
                     resultados["rejeitados"] += 1
                     interrompido_421 = True
                     resultados["retry_emails"].append(email)
-                    # Adicionar os restantes emails não tentados ao retry
                     idx = emails_batch.index(email)
                     resultados["retry_emails"].extend(emails_batch[idx+1:])
                     registrar_rejeicao(email, provedor, code, resp)
@@ -2155,8 +2185,6 @@ async def enviar_batch_smtp(provedor, mx_host, emails_batch, html_base, worker_i
             log(f"❌ ERRO FATAL BATCH: {str(e)}")
             resultados["erros"] += 1
             with GLOBAL["stats_lock"]: GLOBAL["smtp_erros"] += 1
-            # Em caso de erro de conexão, todos os emails não processados devem ser reenviados
-            # (A lógica de retry_emails já trata o caso do 421, mas aqui é genérico)
             if not resultados["retry_emails"]:
                 resultados["retry_emails"] = emails_batch
         finally:
@@ -2222,7 +2250,7 @@ async def worker_provedor_independente(provedor, mx_host, emails_iniciais, html_
             
         smtp_log(f"[W_PROV_{worker_id_base}] [{provedor}] 🔄 Retry #{retry_count} | Emails pendentes: {len(emails_para_reenviar)} | Novo RCPT limit: {rcpt_limit_atual}")
         emails_para_enviar = emails_para_reenviar
-        await asyncio.sleep(2 + retry_count)  # Backoff entre retries do provedor
+        await asyncio.sleep(2 + retry_count)
         
     with GLOBAL["stats_lock"]:
         GLOBAL["prov_processed"] += 1
@@ -2265,14 +2293,13 @@ async def fase6_paralelismo_hierarquico(mxs, contas, html_base):
             GLOBAL["prov_total_envio"] += 1
             
         tasks_provedores.append(worker_provedor_independente(provedor, mx_host, emails, html_base, worker_id_base))
-        worker_id_base += 1000  # Espaçamento para IDs de workers internos
+        worker_id_base += 1000
         
     GLOBAL["n_workers_ativos"] = len(tasks_provedores)
     marcar_fase("FASE6_ENVIO_INICIO", True, f"{len(tasks_provedores)} provedores em paralelo hierárquico")
     
     dizer(f"  🚀 A lançar {len(tasks_provedores)} rotinas independentes simultâneas...")
     
-    # Executar todos os provedores ao mesmo tempo
     await asyncio.gather(*tasks_provedores)
     
     marcar_fase("FASE6_ENVIO", True, f"Auditoria concluida para {len(tasks_provedores)} provedores")
@@ -2508,7 +2535,7 @@ async def main():
 
     execution_id = reset_global_state()
     garantir_diretorios()
-    iniciar_log_writer()  # Iniciar thread de escrita assíncrona
+    iniciar_log_writer()
     n_baixados = download_all_checkpoints_from_hf()
     CHECKPOINT._carregar_tudo()
     config = CHECKPOINT.obter_config()
@@ -2590,13 +2617,20 @@ async def main():
     timelimit_task = asyncio.create_task(time_limit_watcher_async())
 
     await asyncio.sleep(1)
-    dizer(f"🚀 VERISCOPE V21.3.0 ASYNCIO [{execution_id}] - HIERARQUIA PARALELA")
+    dizer(f"🚀 VERISCOPE V21.3.1 ASYNCIO [{execution_id}] - HIERARQUIA PARALELA")
     dizer(f"🏷️ Campaign ID: {GLOBAL.get('campaign_id')}")
     dizer(f"🔄 Modo: {'RECUPERACAO' if tem_checkpoint and not MODO_AUDITORIA_LIMPA else 'NOVO LIMPO'}")
     dizer(f"📊 RCPT_LIMITS_MAX: {RCPT_LIMITS_MAX}")
     dizer(f"🔌 Túnel Semaphore: {MAX_CONCURRENT_TUNNELS}")
 
     await baixar_ficheiros_campanha()
+    
+    # BAIXAR K.PEM ANTES DE QUALQUER COISA
+    pem_ok = await baixar_chave_ssh()
+    if not pem_ok:
+        dizer("❌ FATAL: Sem k.pem. A abortar.")
+        return
+        
     contas, html_base, mxs = [], "", {}
 
     try:
@@ -2709,9 +2743,8 @@ async def main():
         try: await salvar_logs_hf()
         except Exception: pass
 
-        # Parar log writer e fazer flush final
         parar_log_writer()
-        time.sleep(1)  # Aguardar flush final
+        time.sleep(1)
 
         taxa = rt['aceites'] / max(1, rt['tentados']) * 100
         print("", flush=True)
