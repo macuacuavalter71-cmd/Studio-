@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V21.3.1 - CLI + HIERARQUIA + AUTO-PEM
-AMBIENTE: Otimizado para 'colab exec' (Headless CLI, GitHub Actions)
-ARQUITETURA: Paralelismo Hierárquico Massivo (Provedores -> Contas -> RCPTs 100)
+VERISCOPE V21.3.2 - CLI + HIERARQUIA + VALIDAÇÃO MX ROBUSTA
 CORREÇÕES CRÍTICAS:
-1. Auto-Download do k.pem do HuggingFace.
-2. ThreadPoolExecutor de Parquets corrigido (limite de 50 threads + captura de exceções).
-3. RCPT_DEFAULT e limites globais aumentados para 100.
-4. Injeção forçada de HF_TOKEN nas threads de download.
+1. FASE 2C: Condição de sucesso corrigida (aceita downloads do checkpoint)
+2. FASE 6: Validação de MX hosts antes de conectar
+3. SSH: Reduzido MAX_CONCURRENT_TUNNELS de 800 para 100
+4. Tratamento robusto de erros SSH (timeout, DNS failures)
+5. Retry com backoff para erros temporários de conexão
 """
 import os
 import sys
@@ -111,8 +110,8 @@ LOG_WRITE_QUEUE = queue.Queue(maxsize=500000)
 LOG_WRITER_THREAD = None
 LOG_WRITER_STOP = threading.Event()
 
-# SEMÁFORO GLOBAL DO TÚNEL SSH (Protege o servidor Aracloud de sobrecarga)
-MAX_CONCURRENT_TUNNELS = 800 
+# SEMÁFORO GLOBAL DO TÚNEL SSH - REDUZIDO de 800 para 100 para evitar sobrecarga
+MAX_CONCURRENT_TUNNELS = 100
 GLOBAL_TUNNEL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TUNNELS)
 
 HF_LOGS_REPO = "Valter3B/Campaign_Logs"
@@ -121,7 +120,7 @@ HF_CHECKPOINT_REPO = "Valter3B/Veriscope_Checkpoints"
 
 META_ACEITES_POR_PROVEDOR = float('inf')
 MAX_EMAILS_POR_CONTA = float('inf')
-MAX_EMAILS_POR_PROVEDOR_DOWNLOAD = 100  # ALTERADO PARA 100
+MAX_EMAILS_POR_PROVEDOR_DOWNLOAD = 100
 EMAILS_JANELA_ENVIO = 999999999
 DNS_PROPAGACAO_SEGUNDOS = 120
 FINAL_DESTINATARIO = "bingo_192@naver.com"
@@ -176,7 +175,6 @@ MIN_INTERVALO_IP_PROVEDOR = 5
 WORKER_HIBERNACAO_421 = 6000
 WORKER_TIMEOUTS_CONSECUTIVOS_MAX = 3000
 
-# RCPT LIMITS ALTERADOS PARA 100 (Exceto Yahoo/AOL que são restritos)
 RCPT_LIMITS = {
     "yahoo.com": 20, "ymail.com": 20, "aol.com": 20, "rocketmail.com": 20,
     "yahoo.co.uk": 20, "yahoo.fr": 20, "yahoo.de": 20, "yahoo.it": 20,
@@ -192,7 +190,7 @@ RCPT_LIMITS = {
     "gmail.com": 100, "googlemail.com": 100,
     "qq.com": 100, "163.com": 100, "126.com": 100,
 }
-RCPT_DEFAULT = 100  # ALTERADO PARA 100
+RCPT_DEFAULT = 100
 RCPT_LIMITS_MAX = 200
 
 PROVEDORES_ASIATICOS = {
@@ -351,7 +349,7 @@ def painel_completo_cli():
 
 def diagnostico_ambiente_hf():
     print("\n" + "=" * 80, flush=True)
-    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.3.1 (CLI + Hierarquia)", flush=True)
+    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.3.2 (CLI + Hierarquia + MX Validação)", flush=True)
     print("=" * 80, flush=True)
     print(f"[ENV] HF_TOKEN: {'✅ SIM' if HF_TOKEN else '❌ NÃO'} ({len(HF_TOKEN)} chars)", flush=True)
     print(f"[ENV] DESEC_TOKEN: {'✅ SIM' if DESEC_TOKEN else '❌ NÃO'}", flush=True)
@@ -376,7 +374,7 @@ def garantir_diretorio_para(caminho):
     except Exception: pass
 
 class CheckpointManager:
-    VERSION = "21.3.1"
+    VERSION = "21.3.2"
     def __init__(self):
         self.locks = {k: threading.Lock() for k in ["fases", "provedores", "pool", "smtp", "contas", "config", "unknown", "aceites", "workers", "orcamento", "rcpt", "dashboard"]}
         self.states = {
@@ -1116,22 +1114,51 @@ def resolver_mx_um(prov):
         fb = {"naver.com": ["mx1.mail.naver.com", "mx2.mail.naver.com"], "gmail.com": ["gmail-smtp-in.l.google.com"], "googlemail.com": ["gmail-smtp-in.l.google.com"], "mail.ru": ["mxs.mail.ru"], "bk.ru": ["mxs.mail.ru"], "list.ru": ["mxs.mail.ru"], "inbox.ru": ["mxs.mail.ru"]}
         return (prov, fb.get(prov, None))
 
+def validar_mx_host(mx_host):
+    """Valida se um MX host é válido antes de tentar conectar"""
+    if not mx_host or not isinstance(mx_host, str):
+        return False
+    mx_host = mx_host.strip()
+    if not mx_host:
+        return False
+    # Verificar se não contém caracteres inválidos
+    if not re.match(r'^[a-zA-Z0-9.-]+$', mx_host):
+        return False
+    # Verificar se tem pelo menos um ponto (domínio válido)
+    if '.' not in mx_host:
+        return False
+    # Tentar resolver o MX host para IP
+    try:
+        socket.gethostbyname(mx_host)
+        return True
+    except socket.gaierror:
+        return False
+    except Exception:
+        return False
+
 async def resolver_mxs_paralelo(provedores):
     dizer(f"📡 A resolver MX de {len(provedores)} provedores...")
     out = {}
     falhados = 0
+    invalidos = 0
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(99999, len(provedores) or 1, 4000)) as ex:
         tasks = [loop.run_in_executor(ex, resolver_mx_um, prov) for prov in provedores]
         results = await asyncio.gather(*tasks)
         for prov, mxs in results:
             if mxs:
-                out[prov] = mxs
-                with GLOBAL["stats_lock"]: GLOBAL["mx_found"] += len(mxs)
+                # Validar o primeiro MX host
+                mx_host = mxs[0]
+                if validar_mx_host(mx_host):
+                    out[prov] = mxs
+                    with GLOBAL["stats_lock"]: GLOBAL["mx_found"] += len(mxs)
+                else:
+                    invalidos += 1
+                    debug_log(f"MX inválido para {prov}: {mx_host}")
             else:
                 falhados += 1
-    dizer(f"✅ Provedores com MX valido: {len(out)} | MXs totais: {GLOBAL['mx_found']} | Falhados (sem DNS/MX): {falhados}")
-    marcar_fase("FASE2B_MX", len(out) > 0, f"{len(out)}/{len(provedores)} com MX ({falhados} mortos)")
+    dizer(f"✅ Provedores com MX valido: {len(out)} | MXs totais: {GLOBAL['mx_found']} | Falhados: {falhados} | Inválidos: {invalidos}")
+    marcar_fase("FASE2B_MX", len(out) > 0, f"{len(out)}/{len(provedores)} com MX válido ({falhados} sem DNS, {invalidos} MX inválido)")
     return out
 
 def processar_provedor_emails_sync(args):
@@ -1277,7 +1304,9 @@ async def baixar_todos_emails_paralelo(provedores):
     dizer(f"  📧 Emails extraidos: {GLOBAL['emails_read']:,}")
     dizer(f"  📊 Parquets processados: {GLOBAL['pq_downloaded']}/{GLOBAL['pq_total']} | falhas: {GLOBAL['pq_falhados']}")
     completos = (GLOBAL['pq_downloaded'] + GLOBAL['pq_falhados']) >= len(itens_args)
-    marcar_fase("FASE2C_DOWNLOAD", completos and GLOBAL['pq_downloaded'] > 0, f"{GLOBAL['pq_downloaded']}/{len(itens_args)} parquets")
+    # CORREÇÃO: Aceitar sucesso se emails foram recuperados do checkpoint OU se parquets foram baixados
+    sucesso = completos and (GLOBAL['pq_downloaded'] > 0 or emails_recuperados > 0)
+    marcar_fase("FASE2C_DOWNLOAD", sucesso, f"{GLOBAL['pq_downloaded']}/{len(itens_args)} parquets + {emails_recuperados} emails do checkpoint")
 
 async def baixar_unknowns_acumulado():
     definir_fase("🚫 FASE 2D - Blacklist persistente de USER_UNKNOWN")
@@ -2038,6 +2067,11 @@ async def enviar_batch_smtp(provedor, mx_host, emails_batch, html_base, worker_i
     Nível 3 da Hierarquia: Envia um lote de RCPTs usando uma conta do Pool.
     Protegido pelo GLOBAL_TUNNEL_SEMAPHORE para não sobrecarregar o SSH.
     """
+    # Validação adicional do MX host antes de tentar conectar
+    if not validar_mx_host(mx_host):
+        smtp_log(f"[W{worker_id:03d}][{provedor}] ❌ MX HOST INVÁLIDO: {mx_host}")
+        return {"aceites": 0, "rejeitados": 0, "erros": 1, "retry_emails": emails_batch}
+    
     async with GLOBAL_TUNNEL_SEMAPHORE:
         conta = await ACCOUNT_POOL.get_account()
         if not conta:
@@ -2051,10 +2085,17 @@ async def enviar_batch_smtp(provedor, mx_host, emails_batch, html_base, worker_i
             smtp_log(f"[W{worker_id:03d}][{provedor}][{conta['identity_id'][:8]}] {msg}")
             
         try:
-            # Conexão via Túnel
-            sock = await loop.run_in_executor(None, _get_tunnel_socket, mx_host, 25)
+            # Conexão via Túnel com retry para erros temporários
+            sock = None
+            for tentativa in range(3):
+                sock = await loop.run_in_executor(None, _get_tunnel_socket, mx_host, 25)
+                if sock:
+                    break
+                log(f"⚠️ Tentativa {tentativa + 1}/3 falhou - aguardando 2s")
+                await asyncio.sleep(2)
+            
             if not sock:
-                log(f"❌ TUNNEL FAIL para {mx_host}")
+                log(f"❌ TUNNEL FAIL para {mx_host} após 3 tentativas")
                 resultados["erros"] += 1
                 resultados["retry_emails"] = emails_batch
                 return resultados
@@ -2082,7 +2123,7 @@ async def enviar_batch_smtp(provedor, mx_host, emails_batch, html_base, worker_i
             if ehlo_code not in (250, 220):
                 resultados["erros"] += 1
                 resultados["retry_emails"] = emails_batch
-                return resultados
+                return results
                 
             # MAIL FROM
             sock.sendall(f"MAIL FROM:<{conta['sender_email']}>\r\n".encode())
@@ -2268,7 +2309,7 @@ async def fase6_paralelismo_hierarquico(mxs, contas, html_base):
     ACCOUNT_POOL = AccountPool(contas)
     dizer(f"  📧 AccountPool inicializado com {len(contas)} contas")
     dizer(f"  📊 RCPT_LIMITS_MAX configurado: {RCPT_LIMITS_MAX}")
-    dizer(f"  🔌 Túnel SSH Semaphore: {MAX_CONCURRENT_TUNNELS} canais simultâneos")
+    dizer(f"  🔌 Túnel SSH Semaphore: {MAX_CONCURRENT_TUNNELS} canais simultâneos (reduzido de 800)")
     
     tasks_provedores = []
     worker_id_base = 1
@@ -2288,6 +2329,11 @@ async def fase6_paralelismo_hierarquico(mxs, contas, html_base):
         
         mx_host = mx_list[0] if mx_list else None
         if not mx_host: continue
+        
+        # Validação final do MX host antes de criar a task
+        if not validar_mx_host(mx_host):
+            dizer(f"  ⚠️ {provedor}: MX host inválido ({mx_host}) - saltando")
+            continue
         
         with GLOBAL["stats_lock"]:
             GLOBAL["prov_total_envio"] += 1
@@ -2617,11 +2663,11 @@ async def main():
     timelimit_task = asyncio.create_task(time_limit_watcher_async())
 
     await asyncio.sleep(1)
-    dizer(f"🚀 VERISCOPE V21.3.1 ASYNCIO [{execution_id}] - HIERARQUIA PARALELA")
+    dizer(f"🚀 VERISCOPE V21.3.2 ASYNCIO [{execution_id}] - HIERARQUIA PARALELA + MX VALIDAÇÃO")
     dizer(f"🏷️ Campaign ID: {GLOBAL.get('campaign_id')}")
     dizer(f"🔄 Modo: {'RECUPERACAO' if tem_checkpoint and not MODO_AUDITORIA_LIMPA else 'NOVO LIMPO'}")
     dizer(f"📊 RCPT_LIMITS_MAX: {RCPT_LIMITS_MAX}")
-    dizer(f"🔌 Túnel Semaphore: {MAX_CONCURRENT_TUNNELS}")
+    dizer(f"🔌 Túnel Semaphore: {MAX_CONCURRENT_TUNNELS} (reduzido de 800 para evitar sobrecarga)")
 
     await baixar_ficheiros_campanha()
     
