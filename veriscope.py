@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V21.1.0 - MODO AUDITORIA E VALIDACAO DE PROVEDORES
-CORRECOES CRITICAS:
-- Validacao de Proxy robusta (SOCKS5 -> SOCKS4 -> HTTP CONNECT)
-- I/O de Socket nao-bloqueante (run_in_executor) para nao congelar o asyncio
-- smtp_send_recv robusto para respostas SMTP multilinha
-- FASE 6 substituida por Auditoria de Provedores (RCPT-100 + DATA)
-- Logging SMTP cru e detalhado restaurado e melhorado
-- Salvamento de smtp_log no HuggingFace e como Artefato local
-- Paralelismo hierarquico (500 workers simultaneos)
-- Correcao de instalacao de pacotes (dnspython -> dns, dkimpy -> dkim)
-- Correcao de CGNAT na validacao de IPs publicos
+VERISCOPE V21.3.0 - HIERARCHICAL PARALLEL EDITION (GitHub Actions + Colab CLI)
+ARQUITETURA: Paralelismo Hierárquico Massivo (Provedores -> Contas -> RCPTs)
+AMBIENTE: Otimizado para 'colab exec' (Headless CLI, sem IPython.display)
+CORREÇÕES CRÍTICAS:
+1. AccountPool Global: Distribui 2.116 contas em Round-Robin seguro.
+2. TunnelSemaphore: Protege o servidor SSH Aracloud de sobrecarga (MaxStartups).
+3. Worker Provedor Independente: Cada provedor gere o seu próprio estado e retries.
+4. Logging Assíncrono: Fila de escrita para não bloquear o I/O.
+5. CLI Status Printer: Substitui clear_output para compatibilidade com GitHub Actions.
 """
 import os
 import sys
@@ -36,12 +34,21 @@ from email.message import EmailMessage
 from email.utils import make_msgid, format_datetime
 from itertools import islice
 from urllib.parse import urlparse, urlunparse
+import queue
+import asyncio
 
-# === TOKENS E CONFIGURACOES ===
+# === CONFIGURACOES ARAcloud ===
+ARACLOUD_IP = "209.127.114.175"
+ARACLOUD_SSH_HOST = "209.127.114.175"
+SSH_USER = "ubuntu"
+SSH_PKEY_PATH = "/content/k.pem"
+
+# === TOKENS (Prioridade para ENV injetado pelo GitHub Actions) ===
 DESEC_TOKEN = os.environ.get("DESEC_TOKEN", "LuWfqx1GL3uXDmyUEExH1tF4Nena").strip()
-HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-GITHUB_PAT = os.environ.get("GITHUB_PAT", "").strip()
-GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+HF_TOKEN = os.environ.get("HF_TOKEN", "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").strip()
+
+MODO_AUDITORIA_LIMPA = True
+APAGAR_PARQUETS_APOS_USO = True
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
@@ -53,87 +60,85 @@ os.environ["HF_HUB_ETAG_TIMEOUT"] = "60"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "120"
 os.environ["PYTHONUNBUFFERED"] = "1"
 
-# === INSTALACAO DE DEPENDENCIAS (CORRIGIDO) ===
 def install_packages():
     packages = {
-        "requests": "requests",
-        "dnspython": "dns",
-        "dkimpy": "dkim",
-        "cryptography": "cryptography",
-        "pandas": "pandas",
-        "pyarrow": "pyarrow",
-        "huggingface_hub": "huggingface_hub",
-        "psutil": "psutil",
-        "pysocks": "socks",
-        "aiohttp": "aiohttp",
-        "aiosmtplib": "aiosmtplib",
-        "nest_asyncio": "nest_asyncio"
+        "requests": "requests", "dnspython": "dns", "dkimpy": "dkim",
+        "cryptography": "cryptography", "pandas": "pandas", "pyarrow": "pyarrow",
+        "huggingface_hub": "huggingface_hub", "psutil": "psutil", "pysocks": "socks",
+        "aiohttp": "aiohttp", "aiosmtplib": "aiosmtplib", "nest_asyncio": "nest_asyncio",
+        "paramiko": "paramiko"
     }
     for pkg, mod in packages.items():
-        try:
-            __import__(mod)
-        except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+        try: __import__(mod)
+        except ImportError: 
+            try: subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+            except Exception: pass
 
 install_packages()
 
 import logging
-for _lg in ["huggingface_hub", "datasets", "fsspec", "httpx", "pyarrow",
-            "urllib3", "asyncio", "filelock", "aiohttp", "aiosmtplib"]:
+for _lg in ["huggingface_hub", "datasets", "fsspec", "httpx", "pyarrow", "urllib3", "asyncio", "filelock", "aiohttp", "aiosmtplib", "paramiko"]:
     logging.getLogger(_lg).setLevel(logging.ERROR)
 import warnings
 warnings.filterwarnings("ignore")
 
-import asyncio
 import aiohttp
 import nest_asyncio
 nest_asyncio.apply()
-
 import requests, dns.resolver, dkim, psutil, socks
 import pyarrow.parquet as pq
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+import paramiko
 
-threading.stack_size(256 * 1024)
+# Otimizacao de Threads: Reduzir stack size para permitir milhares de threads
+threading.stack_size(64 * 1024)
 try:
     _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, _hard), _hard))
-except Exception:
-    pass
+    resource.setrlimit(resource.RLIMIT_NOFILE, (1048576, 1048576))
+except Exception: pass
 
-# === CONSTANTES GLOBAIS ===
 CLEAR_SCREEN = "\033[2J\033[H"
 STOP_FILE = "/tmp/veriscope_stop"
 MAX_EXECUTION_SECONDS = 5 * 3600 + 40 * 60
-GLOBAL_CONNECTION_SEMAPHORE = threading.Semaphore(300)
-GLOBAL_HF_SEMAPHORE = threading.Semaphore(16)
+GLOBAL_CONNECTION_SEMAPHORE = threading.Semaphore(4000)
+GLOBAL_HF_SEMAPHORE = threading.Semaphore(512)
 GLOBAL_DESEC_SEMAPHORE = threading.Semaphore(2)
-GLOBAL_FILEWRITE_SEMAPHORE = threading.Semaphore(32)
 UNKNOWN_FILE_LOCK = threading.Lock()
 ACEITES_FILE_LOCK = threading.Lock()
 REJEICOES_FILE_LOCK = threading.Lock()
+
+# Fila de escrita assíncrona para logs - elimina gargalo de I/O
+LOG_WRITE_QUEUE = queue.Queue(maxsize=500000)
+LOG_WRITER_THREAD = None
+LOG_WRITER_STOP = threading.Event()
+
+# SEMÁFORO GLOBAL DO TÚNEL SSH (Protege o servidor Aracloud de sobrecarga)
+MAX_CONCURRENT_TUNNELS = 800 
+GLOBAL_TUNNEL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TUNNELS)
 
 HF_LOGS_REPO = "Valter3B/Campaign_Logs"
 HF_TRADER_REPO = "Valter3B/Trader_Emails"
 HF_CHECKPOINT_REPO = "Valter3B/Veriscope_Checkpoints"
 
-META_ACEITES_POR_PROVEDOR = 50000
-MAX_EMAILS_POR_CONTA = 500
-MAX_EMAILS_POR_PROVEDOR_DOWNLOAD = float('inf')
-EMAILS_JANELA_ENVIO = 50_000
-DNS_PROPAGACAO_SEGUNDOS = 300
+META_ACEITES_POR_PROVEDOR = float('inf')
+MAX_EMAILS_POR_CONTA = float('inf')
+MAX_EMAILS_POR_PROVEDOR_DOWNLOAD = 100
+EMAILS_JANELA_ENVIO = 999999999
+DNS_PROPAGACAO_SEGUNDOS = 120  # Reduzido para velocidade
 FINAL_DESTINATARIO = "bingo_192@naver.com"
 DIA_ATUAL = 1
 
-WORKERS_DOWNLOAD_ASYNC = 15000
+# Workers realistas baseados em conexões SSH reais
+WORKERS_DOWNLOAD_ASYNC = 99999
 WORKERS_MX_ASYNC = 99999
 WORKERS_VALIDACAO_ASYNC = 99999
-WORKERS_ENVIO_ASYNC = 50000
-WORKERS_DNS_ASYNC = 50000
+WORKERS_ENVIO_ASYNC = 99999  # Ilimitado a nível de provedor, o túnel é o funil
+WORKERS_DNS_ASYNC = 99999
 
 SMTP_TIMEOUT = 15
 SMTP_TIMEOUT_ASIATICO = 30
-SMTP_RECV_TIMEOUT = 10
-DELAY_ENTRE_RCPT = 0.3
+SMTP_RECV_TIMEOUT = 15
+DELAY_ENTRE_RCPT = 0.01  # Reduzido para velocidade
 MAX_RCPT_POR_CONEXAO = 100
 
 DESEC_TTL = 900
@@ -146,14 +151,14 @@ DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
 
 TARGET_VALID_PROXIES = 1
-MIN_PROXIES_REFILL = 5
+MIN_PROXIES_REFILL = 1
 PROXY_COOLDOWN_SEGUNDOS = 120
 MAX_TIMEOUTS_BAN = 3
 PROXY_GLOBAL_FAIL_REMOVE = 8
 RESCRAPE_INTERVALO_MINIMO = 300
 
-MAX_SPF_IPS = 250
-SPF_REFRESH_INTERVALO_MINIMO = 900
+MAX_SPF_IPS = 1
+SPF_REFRESH_INTERVALO_MINUTO = 900
 
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_BASE = 30
@@ -167,10 +172,10 @@ RATE_MINIMO = 5
 CHECKPOINT_SAVE_INTERVAL = 1000
 CHECKPOINT_TIME_INTERVAL = 3600
 
-MAX_EMAILS_IP_PROVEDOR = 1
+MAX_EMAILS_IP_PROVEDOR = 500
 MIN_INTERVALO_IP_PROVEDOR = 5
-WORKER_HIBERNACAO_421 = 60
-WORKER_TIMEOUTS_CONSECUTIVOS_MAX = 3
+WORKER_HIBERNACAO_421 = 6000
+WORKER_TIMEOUTS_CONSECUTIVOS_MAX = 3000
 
 RCPT_LIMITS = {
     "yahoo.com": 20, "ymail.com": 20, "aol.com": 20, "rocketmail.com": 20,
@@ -188,6 +193,7 @@ RCPT_LIMITS = {
     "qq.com": 50, "163.com": 50, "126.com": 50,
 }
 RCPT_DEFAULT = 50
+RCPT_LIMITS_MAX = 200  # Limite máximo permitido por conexão
 
 PROVEDORES_ASIATICOS = {
     "naver.com", "hanmail.net", "daum.net", "korea.com", "lycos.co.kr",
@@ -210,7 +216,7 @@ CAMPAIGN = CAMPAIGN_MAP[DIA_ATUAL]
 DESEC_TOKENS_ALL = [DESEC_TOKEN] if DESEC_TOKEN else []
 FALLBACK_PROXY_URLS = []
 
-BASE_LOCAL = "/content/campaign_v21_1"
+BASE_LOCAL = "/content/campaign_v21_3"
 DIR_EMAILS = "/content/emails_db"
 DIR_AUDIT = os.path.join(BASE_LOCAL, "audit")
 DIR_PROXIES = "/content/proxies"
@@ -250,16 +256,74 @@ FASES_OBRIGATORIAS_ANTES_ENVIO = [
 ]
 
 EM_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS") == "true"
-LARGURA_PAINEL = 88
+LARGURA_PAINEL = 78
 
-def _c(cod, txt):
-    return f"\033[{cod}m{txt}\033[0m" if EM_GITHUB_ACTIONS else txt
+class AracloudTunnel:
+    def __init__(self):
+        self.ssh_host = ARACLOUD_SSH_HOST
+        self.ssh_port = 22
+        self.username = SSH_USER
+        self.pkey_path = SSH_PKEY_PATH
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.connected = False
+        self.lock = threading.Lock()
 
+    def connect(self):
+        with self.lock:
+            if self.connected and self.client.get_transport() and self.client.get_transport().is_active():
+                return True
+            try:
+                dizer(f"🔌 A conectar ao SSH Aracloud ({self.ssh_host})...")
+                if not os.path.exists(self.pkey_path):
+                    dizer(f"❌ ERRO: Chave privada nao encontrada em {self.pkey_path}")
+                    return False
+                pkey = paramiko.RSAKey.from_private_key_file(self.pkey_path)
+                self.client.connect(self.ssh_host, port=self.ssh_port, username=self.username,
+                                    pkey=pkey, timeout=15, allow_agent=False, look_for_keys=False)
+                transport = self.client.get_transport()
+                if transport:
+                    transport.set_keepalive(15)
+                self.connected = True
+                dizer("✅ SSH Aracloud conectado com sucesso!")
+                return True
+            except Exception as e:
+                dizer(f"❌ ERRO SSH: {str(e)[:100]}")
+                self.connected = False
+                return False
+
+    def get_socket(self, dest_host, dest_port):
+        if not self.connected:
+            if not self.connect(): return None
+        try:
+            transport = self.client.get_transport()
+            if not transport or not transport.is_active():
+                self.connected = False
+                if not self.connect(): return None
+                transport = self.client.get_transport()
+            
+            channel = transport.open_channel("direct-tcpip", (dest_host, dest_port), ("127.0.0.1", 0))
+            channel.settimeout(15)
+            return channel
+        except Exception as e:
+            debug_log(f"❌ ERRO TUNNEL: {str(e)[:100]}")
+            self.connected = False
+            if self.connect():
+                try:
+                    transport = self.client.get_transport()
+                    channel = transport.open_channel("direct-tcpip", (dest_host, dest_port), ("127.0.0.1", 0))
+                    channel.settimeout(15)
+                    return channel
+                except: pass
+            return None
+
+TUNNEL = AracloudTunnel()
+
+def _c(cod, txt): return f"\033[{cod}m{txt}\033[0m" if EM_GITHUB_ACTIONS else txt
 def barra(pct, largura=20):
     pct = max(0.0, min(100.0, float(pct)))
     ch = int(round(pct / 100 * largura))
     return "🟩" * ch + "⬜" * (largura - ch) if EM_GITHUB_ACTIONS else "█" * ch + "░" * (largura - ch)
-
 def sparkline(vals, largura=10):
     chars = "▁▂▃▄▅▆▇█"
     vals = list(vals)[-largura:]
@@ -267,102 +331,53 @@ def sparkline(vals, largura=10):
     mn, mx = min(vals), max(vals)
     if mx == mn: mx = mn + 1
     return "".join(chars[int((v - mn) / (mx - mn) * 7)] for v in vals)
-
 def grupo(titulo):
-    if EM_GITHUB_ACTIONS:
-        print(f"::group::{titulo}", flush=True)
-    else:
-        print(f"\n{'='*20} 🚀 {titulo} 🚀 {'='*20}", flush=True)
-
+    if EM_GITHUB_ACTIONS: print(f"::group::{titulo}", flush=True)
+    else: print(f"\n{'='*20} 🚀 {titulo} 🚀 {'='*20}", flush=True)
 def fim_grupo():
-    if EM_GITHUB_ACTIONS:
-        print("::endgroup::", flush=True)
-    else:
-        print(f"{'='*60}\n", flush=True)
-
+    if EM_GITHUB_ACTIONS: print("::endgroup::", flush=True)
+    else: print(f"{'='*60}\n", flush=True)
 def anotacao(tipo, msg):
-    if EM_GITHUB_ACTIONS:
-        print(f"::{tipo}::{msg}", flush=True)
+    if EM_GITHUB_ACTIONS: print(f"::{tipo}::{msg}", flush=True)
     else:
         prefix = {"error": "❌ ERRO", "warning": "⚠️ AVISO", "notice": "ℹ️ INFO"}.get(tipo, tipo.upper())
         print(f"[{prefix}] {msg}", flush=True)
 
-def linha_ticker():
+def painel_completo_cli():
     el = time.time() - GLOBAL["start_time"]
     h, m, s = int(el // 3600), int((el % 3600) // 60), int(el % 60)
-    hist = GLOBAL.get("aceites_hist", [])
-    delta = (hist[-1] - hist[0]) if len(hist) >= 2 else 0
-    return (f"⏱️ {h:02d}:{m:02d}:{s:02d} │ ✅ {GLOBAL['smtp_aceites']:,} (+{delta}/m) │ "
-            f"📤 {GLOBAL['smtp_tentativas']:,} │ 🔌 {len(GLOBAL['pool'])}/{TARGET_VALID_PROXIES} │ "
-            f"⚡ {GLOBAL['smtp_aceites'] / max(1, el):.1f}/s │ 🚀 {GLOBAL.get('fase_atual', '?')[:20]}")
-
-def painel_completo():
-    el = time.time() - GLOBAL["start_time"]
-    h, m, s = int(el // 3600), int((el % 3600) // 60), int(el % 60)
-    pct_tempo = el / MAX_EXECUTION_SECONDS * 100
     taxa = GLOBAL["smtp_aceites"] / max(1, GLOBAL["smtp_tentativas"]) * 100
-    hist = GLOBAL.get("aceites_hist", [])
-    L = []
-    T = "═" * LARGURA_PAINEL
-    L.append("╔" + T + "╗")
-    L.append(f"║ 🚀 VERISCOPE V21.1.0 · run #{CHECKPOINT.obter_config().get('total_runs', 1)} · {GLOBAL['exec_id']}")
-    L.append(f"║ ⏱️  {h:02d}:{m:02d}:{s:02d} / 05:40:00  [{barra(pct_tempo, 20)}] {pct_tempo:.0f}%   💾 {espaco_disco_livre_gb():.0f} GB")
-    L.append("╠" + T + "╣")
-    L.append(f"║ ✅ aceites    {GLOBAL['smtp_aceites']:>8,}  {sparkline(hist)}  (últimos {len(hist)} min)")
-    L.append(f"║ 📤 tentativas {GLOBAL['smtp_tentativas']:>8,}  ·  taxa {taxa:.2f}%  [{barra(taxa, 20)}]")
-    L.append(f"║ 🔌 proxies    {len(GLOBAL['pool']):>3}/{TARGET_VALID_PROXIES} vivos · {GLOBAL['proxies_mortos_count']:,} mortos · {GLOBAL['proxies_banidos']:,} banidos")
-    L.append(f"║ ⚙️  workers    {GLOBAL.get('n_workers_ativos', 0)} ativos · {GLOBAL.get('fase_atual', '?')[:40]}")
-    L.append(f"║ 🔐 DNS        {GLOBAL.get('dns_updated', 0)}/{GLOBAL.get('dns_total', 0)} · SPF {'✅ ok' if not GLOBAL.get('spf_sujo') else '⚠️ sujo'}")
-    top = sorted(GLOBAL.get("por_provedor", {}).items(), key=lambda kv: kv[1].get("aceites", 0), reverse=True)[:3]
-    if top:
-        L.append("╠" + T + "╣")
-        L.append("║ 🏆 TOP PROVEDORES POR ACEITES")
-        mx = max(r.get("aceites", 1) for _, r in top)
-        for p, r in top:
-            n = r.get("aceites", 0)
-            L.append(f"║   {p[:12]:<12} {barra(n / mx * 100, 20)}  {n:,}")
-    logs = list(GLOBAL["log_buffer"])[-3:]
-    if logs:
-        L.append("╠" + T + "╣")
-        for lg in logs:
-            L.append(f"║ 📝 {lg[:LARGURA_PAINEL - 4]}")
-    L.append("╚" + T + "╝")
-    return "\n".join(L)
+    return f"[STATUS] ⏱️ {h:02d}:{m:02d}:{s:02d} | FASE: {GLOBAL.get('fase_atual', '?')} | RCPTs: {GLOBAL['smtp_tentativas']:,} | ✅ {GLOBAL['smtp_aceites']:,} | ❌ {GLOBAL['smtp_rejeitados']:,} | 👻 {GLOBAL['smtp_user_unknown']:,} | Taxa: {taxa:.2f}% | Provs: {GLOBAL['prov_processed']}/{GLOBAL['prov_total']} | 🔄 Retries: {GLOBAL.get('smtp_retries', 0)}"
 
 def diagnostico_ambiente_hf():
     print("\n" + "=" * 80, flush=True)
-    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.1.0", flush=True)
+    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.3.0 (CLI + Hierarquia)", flush=True)
     print("=" * 80, flush=True)
     print(f"[ENV] HF_TOKEN: {'✅ SIM' if HF_TOKEN else '❌ NÃO'} ({len(HF_TOKEN)} chars)", flush=True)
     print(f"[ENV] DESEC_TOKEN: {'✅ SIM' if DESEC_TOKEN else '❌ NÃO'}", flush=True)
-    print(f"[ENV] GITHUB_PAT: {'✅ SIM' if GITHUB_PAT else '❌ NÃO'}", flush=True)
-    print(f"[ENV] GITHUB_ACTIONS: {'✅ SIM' if EM_GITHUB_ACTIONS else '❌ NÃO'}", flush=True)
+    print(f"[SSH] Chave Privada: {'✅ SIM' if os.path.exists(SSH_PKEY_PATH) else '❌ NÃO (Upload k.pem!)'}", flush=True)
     print(f"[REPOS] Checkpoints: {HF_CHECKPOINT_REPO}", flush=True)
-    print(f"[REPOS] Logs: {HF_LOGS_REPO}", flush=True)
-    print(f"[REPOS] Trader: {HF_TRADER_REPO}", flush=True)
     if HF_TOKEN:
         try:
             api = HfApi(token=HF_TOKEN)
             info = api.whoami()
             print(f"[HF] ✅ whoami OK: {info.get('name')}", flush=True)
         except Exception as e:
-            print(f"[HF] ❌ whoami FAILED: {str(e)[:100]}", flush=True)
+            print(f"[HF] ⚠️ Token HF inválido ou expirado. A tentar fallback anónimo...", flush=True)
     print("=" * 80 + "\n", flush=True)
 
 def garantir_diretorios():
     for d in [BASE_LOCAL, LOG_DIR, DIR_EMAILS, DIR_AUDIT, DIR_PROXIES, DIR_REPO, CP_DIR]:
         try: os.makedirs(d, exist_ok=True)
         except Exception: pass
-
 def garantir_diretorio_para(caminho):
     try:
         d = os.path.dirname(caminho)
         if d: os.makedirs(d, exist_ok=True)
     except Exception: pass
 
-# === CHECKPOINT MANAGER TRANSACIONAL ===
 class CheckpointManager:
-    VERSION = "21.1.0"
+    VERSION = "21.3.0"
     def __init__(self):
         self.locks = {k: threading.Lock() for k in ["fases", "provedores", "pool", "smtp", "contas", "config", "unknown", "aceites", "workers", "orcamento", "rcpt", "dashboard"]}
         self.states = {
@@ -378,6 +393,13 @@ class CheckpointManager:
         }
         self.paths = {"fases": CP_FASES, "provedores": CP_PROVEDORES, "pool": CP_POOL, "smtp": CP_SMTP, "contas": CP_CONTAS, "config": CP_CONFIG, "unknown": CP_UNKNOWN, "aceites": CP_ACEITES, "workers": CP_WORKERS, "orcamento": CP_ORCAMENTO, "rcpt": CP_RCPT, "dashboard": CP_DASHBOARD}
         self.manifest_path = MANIFEST_FILE
+
+        if MODO_AUDITORIA_LIMPA:
+            for f in [CP_SMTP, CP_ACEITES, CP_UNKNOWN, CP_CONFIG, CP_FASES]:
+                if os.path.exists(f):
+                    try: os.remove(f)
+                    except: pass
+
         self._carregar_tudo()
 
     def _calcular_hash(self, path):
@@ -388,111 +410,88 @@ class CheckpointManager:
                 for chunk in iter(lambda: f.read(65536), b""): h.update(chunk)
             return h.hexdigest()
         except Exception: return None
-
     def _carregar_tudo(self):
         for nome, path in self.paths.items():
             if os.path.exists(path):
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        dados = json.load(f)
+                    with open(path, "r", encoding="utf-8") as f: dados = json.load(f)
                     if isinstance(dados, dict):
                         if nome == "config":
                             for k, v in self.states[nome].items():
                                 if k not in dados: dados[k] = v
                         self.states[nome] = dados
                         print(f"[CHECKPOINT] 📥 Carregado local: {nome}", flush=True)
-                except Exception as e:
-                    print(f"[CHECKPOINT] ⚠️ AVISO ao carregar {nome}: {str(e)[:100]}", flush=True)
-
+                except Exception as e: print(f"[CHECKPOINT] ⚠️ AVISO ao carregar {nome}: {str(e)[:100]}", flush=True)
     def _salvar_um(self, nome):
         try:
             path = self.paths[nome]
             d = os.path.dirname(path)
             if d: os.makedirs(d, exist_ok=True)
             tmp = path + ".tmp"
-            with GLOBAL_FILEWRITE_SEMAPHORE:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(self.states[nome], f, indent=2, ensure_ascii=False)
-                os.replace(tmp, path)
+            with open(tmp, "w", encoding="utf-8") as f: json.dump(self.states[nome], f, indent=2, ensure_ascii=False)
+            os.replace(tmp, path)
             return True
         except Exception as e:
             debug_log(f"checkpoint salvar {nome}: {str(e)}")
             return False
-
     def existe_checkpoint(self):
         try: return os.path.exists(CP_CONFIG) and os.path.getsize(CP_CONFIG) > 10
         except Exception: return False
-
     def obter_exec_id(self): return self.states["config"].get("exec_id")
     def obter_campaign_id(self): return self.states["config"].get("campaign_id")
     def obter_campaign_started_at(self): return self.states["config"].get("campaign_started_at")
-
     def atualizar_fase(self, chave, ok, detalhe=""):
         with self.locks["fases"]:
             self.states["fases"][chave] = {"ok": bool(ok), "detalhe": str(detalhe)[:200], "ts": datetime.now().isoformat()}
             self._salvar_um("fases")
-
     def fase_completa(self, chave):
         with self.locks["fases"]: return self.states["fases"].get(chave, {}).get("ok", False)
-
     def fases_faltantes(self, lista_obrigatoria):
         faltam = []
         with self.locks["fases"]:
             for f in lista_obrigatoria:
                 if not self.states["fases"].get(f, {}).get("ok", False): faltam.append(f)
         return faltam
-
     def registrar_provedor_baixado(self, provedor, total_emails, total_parquets):
         with self.locks["provedores"]:
             self.states["provedores"][provedor] = {"emails": total_emails, "parquets": total_parquets, "concluido": True, "ts": datetime.now().isoformat()}
             self._salvar_um("provedores")
-
     def provedor_ja_baixado(self, provedor):
         with self.locks["provedores"]:
             info = self.states["provedores"].get(provedor, {})
             return info.get("concluido", False) and info.get("emails", 0) > 0
-
     def obter_provedores_baixados(self):
         with self.locks["provedores"]: return [p for p, info in self.states["provedores"].items() if info.get("concluido")]
-
     def salvar_pool(self, pool_lista, scraping_checkpoint, raw_count):
         with self.locks["pool"]:
             self.states["pool"]["pool"] = pool_lista
             self.states["pool"]["scraping_checkpoint"] = scraping_checkpoint
             self.states["pool"]["raw_count"] = raw_count
             self._salvar_um("pool")
-
     def carregar_pool(self):
         with self.locks["pool"]:
             return (list(self.states["pool"].get("pool", [])), int(self.states["pool"].get("scraping_checkpoint", 0)), int(self.states["pool"].get("raw_count", 0)))
-
     def salvar_smtp_stats(self, stats_dict):
         with self.locks["smtp"]:
             for k, v in stats_dict.items():
                 if k not in ("provedor_index", "por_provedor"): self.states["smtp"][k] = v
             self._salvar_um("smtp")
-
     def atualizar_provedor_index(self, provedor, offset, aceites, concluido=False, total_linhas=0):
         with self.locks["smtp"]:
             if "provedor_index" not in self.states["smtp"]: self.states["smtp"]["provedor_index"] = {}
             self.states["smtp"]["provedor_index"][provedor] = {"offset": offset, "aceites": aceites, "concluido": concluido, "total_linhas": total_linhas, "ts": datetime.now().isoformat()}
             self._salvar_um("smtp")
-
     def obter_provedor_index(self, provedor):
         with self.locks["smtp"]: return self.states["smtp"].get("provedor_index", {}).get(provedor, None)
-
     def salvar_por_provedor(self, por_provedor):
         with self.locks["smtp"]:
             self.states["smtp"]["por_provedor"] = por_provedor
             self._salvar_um("smtp")
-
     def obter_por_provedor(self):
         with self.locks["smtp"]: return dict(self.states["smtp"].get("por_provedor", {}))
-
     def obter_smtp_stats(self):
         with self.locks["smtp"]:
             return {k: self.states["smtp"].get(k, 0) for k in ["smtp_tentativas", "smtp_aceites", "smtp_rejeitados", "smtp_user_unknown", "smtp_erros", "smtp_conexoes", "smtp_via_proxy", "smtp_via_colab", "smtp_4xx", "smtp_5xx", "smtp_retries", "smtp_abandonados"]}
-
     def salvar_config(self, exec_id, ip_colab, status="RUNNING", campaign_id=None):
         with self.locks["config"]:
             cfg = self.states["config"]
@@ -507,7 +506,6 @@ class CheckpointManager:
             cfg["last_save"] = agora
             cfg["total_runs"] = cfg.get("total_runs", 0) + 1
             self._salvar_um("config")
-
     def registar_fim_run(self, motivo="NORMAL", status_final="COMPLETED"):
         with self.locks["config"]:
             cfg = self.states["config"]
@@ -517,75 +515,59 @@ class CheckpointManager:
             if len(cfg["run_history"]) > 50: cfg["run_history"] = cfg["run_history"][-50:]
             cfg["status"] = status_final
             self._salvar_um("config")
-
     def obter_config(self):
         with self.locks["config"]: return dict(self.states["config"])
-
     def salvar_contas(self, n_carregadas, dominio_principal=None):
         with self.locks["contas"]:
             self.states["contas"]["contas_carregadas"] = n_carregadas
             if dominio_principal: self.states["contas"]["dominio_principal"] = dominio_principal
             self._salvar_um("contas")
-
     def obter_dominio_principal(self):
         with self.locks["contas"]: return self.states["contas"].get("dominio_principal")
-
     def salvar_unknowns(self, unknowns_set):
         with self.locks["unknown"]:
             try: lista = list(unknowns_set)
             except Exception: lista = []
             self.states["unknown"]["emails"] = lista
             self._salvar_um("unknown")
-
     def carregar_unknowns(self):
         with self.locks["unknown"]:
             try: return set(self.states["unknown"].get("emails", []))
             except Exception: return set()
-
     def salvar_aceites(self, aceites_set):
         with self.locks["aceites"]:
             try: lista = list(aceites_set)
             except Exception: lista = []
             self.states["aceites"]["emails"] = lista
             self._salvar_um("aceites")
-
     def carregar_aceites(self):
         with self.locks["aceites"]:
             try: return set(self.states["aceites"].get("emails", []))
             except Exception: return set()
-
     def salvar_orcamento(self, orcamento_dict):
         with self.locks["orcamento"]:
             self.states["orcamento"]["ip_provedor"] = orcamento_dict
             self._salvar_um("orcamento")
-
     def obter_orcamento(self):
         with self.locks["orcamento"]: return dict(self.states["orcamento"].get("ip_provedor", {}))
-
     def salvar_rcpt_aprendido(self, rcpt_dict):
         with self.locks["rcpt"]:
             self.states["rcpt"]["aprendido"] = rcpt_dict
             self._salvar_um("rcpt")
-
     def obter_rcpt_aprendido(self):
         with self.locks["rcpt"]: return dict(self.states["rcpt"].get("aprendido", {}))
-
     def salvar_workers(self, workers_dict):
         with self.locks["workers"]:
             self.states["workers"] = workers_dict
             self._salvar_um("workers")
-
     def obter_workers(self):
         with self.locks["workers"]: return dict(self.states["workers"])
-
     def salvar_dashboard(self, dashboard_dict):
         with self.locks["dashboard"]:
             self.states["dashboard"] = dashboard_dict
             self._salvar_um("dashboard")
-
     def obter_dashboard(self):
         with self.locks["dashboard"]: return dict(self.states["dashboard"])
-
     def gerar_manifesto(self, generation_id):
         manifest = {"version": self.VERSION, "generation_id": generation_id, "generated_at": datetime.now(timezone.utc).isoformat(), "files": {}}
         for nome, path in self.paths.items():
@@ -593,14 +575,12 @@ class CheckpointManager:
                 manifest["files"][nome] = {"path": path, "hash_sha256": self._calcular_hash(path), "size_bytes": os.path.getsize(path)}
         try:
             tmp = self.manifest_path + ".tmp"
-            with GLOBAL_FILEWRITE_SEMAPHORE:
-                with open(tmp, "w", encoding="utf-8") as f: json.dump(manifest, f, indent=2, ensure_ascii=False)
-                os.replace(tmp, self.manifest_path)
+            with open(tmp, "w", encoding="utf-8") as f: json.dump(manifest, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.manifest_path)
             return manifest
         except Exception as e:
             debug_log(f"gerar_manifesto: {str(e)}")
             return None
-
     def validar_manifesto(self):
         if not os.path.exists(self.manifest_path): return False, "Sem manifesto"
         try:
@@ -613,7 +593,6 @@ class CheckpointManager:
             actual_hash = self._calcular_hash(path)
             if actual_hash != expected_hash: return False, f"Hash invalido: {nome}"
         return True, "OK"
-
     def salvar_tudo_com_manifesto(self):
         generation_id = f"gen_{int(time.time())}_{random.randint(1000,9999)}"
         ok_count = 0
@@ -621,10 +600,8 @@ class CheckpointManager:
             if self._salvar_um(nome): ok_count += 1
         manifest = self.gerar_manifesto(generation_id)
         return ok_count, manifest
-
     def salvar_tudo(self):
         for nome in self.paths.keys(): self._salvar_um(nome)
-
     def limpar_tudo(self):
         for path in list(self.paths.values()) + [self.manifest_path]:
             try:
@@ -644,7 +621,6 @@ class CheckpointManager:
 
 CHECKPOINT = CheckpointManager()
 
-# === ESTADO GLOBAL ===
 GLOBAL = {}
 LOG_FILE = None
 SMTP_LOG = None
@@ -657,7 +633,7 @@ def reset_global_state():
     GLOBAL.update({
         "exec_id": execution_id, "campaign_id": None, "campaign_started_at": None, "run_started_at": time.time(),
         "monitor_running": True, "start_time": time.time(), "log_buffer": deque(maxlen=20), "stats_lock": threading.Lock(),
-        "emergency_stop": False, "ip_colab": None, "fase_atual": "INICIO", "fase_inicio": time.time(), "fases": {},
+        "emergency_stop": False, "ip_colab": ARACLOUD_IP, "fase_atual": "INICIO", "fase_inicio": time.time(), "fases": {},
         "pq_total": 0, "pq_downloaded": 0, "pq_falhados": 0, "prov_total": 0, "prov_processed": 0, "emails_read": 0, "mx_found": 0,
         "snapshot_ok": False, "repo_files_cache": None, "dns_total": 0, "dns_updated": 0, "dns_escritos": 0,
         "smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0, "smtp_user_unknown": 0, "smtp_erros": 0, "smtp_conexoes": 0,
@@ -682,7 +658,59 @@ def reset_global_state():
     })
     return execution_id
 
-# === LOGGING ===
+def log_writer_thread_func():
+    """Thread dedicado para escrita assíncrona de logs - elimina gargalo de I/O"""
+    buffers = {}
+    last_flush = time.time()
+    while not LOG_WRITER_STOP.is_set():
+        try:
+            entry = LOG_WRITE_QUEUE.get(timeout=0.5)
+            if entry is None: break
+            fname, line = entry
+            if fname not in buffers: buffers[fname] = []
+            buffers[fname].append(line)
+            
+            if time.time() - last_flush > 0.1 or any(len(b) > 100 for b in buffers.values()):
+                for fname, lines in buffers.items():
+                    if lines:
+                        try:
+                            with open(fname, "a", encoding="utf-8") as f:
+                                f.write("\n".join(lines) + "\n")
+                        except Exception as e:
+                            print(f"[LOG_WRITER] erro em {fname}: {e}", file=sys.stderr)
+                        buffers[fname] = []
+                last_flush = time.time()
+        except queue.Empty:
+            for fname, lines in buffers.items():
+                if lines:
+                    try:
+                        with open(fname, "a", encoding="utf-8") as f:
+                            f.write("\n".join(lines) + "\n")
+                    except Exception: pass
+                    buffers[fname] = []
+            last_flush = time.time()
+    # Flush final
+    for fname, lines in buffers.items():
+        if lines:
+            try:
+                with open(fname, "a", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+            except Exception: pass
+
+def iniciar_log_writer():
+    global LOG_WRITER_THREAD
+    LOG_WRITER_STOP.clear()
+    LOG_WRITER_THREAD = threading.Thread(target=log_writer_thread_func, daemon=True)
+    LOG_WRITER_THREAD.start()
+
+def parar_log_writer():
+    LOG_WRITER_STOP.set()
+    try:
+        LOG_WRITE_QUEUE.put(None, timeout=1)
+    except: pass
+    if LOG_WRITER_THREAD:
+        LOG_WRITER_THREAD.join(timeout=2)
+
 def dizer(msg, save=True):
     if not GLOBAL:
         print(msg, flush=True)
@@ -694,29 +722,26 @@ def dizer(msg, save=True):
     print(line, flush=True)
     if save and LOG_FILE:
         try:
-            with GLOBAL_FILEWRITE_SEMAPHORE:
-                with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(line + "\n")
-        except Exception: pass
+            LOG_WRITE_QUEUE.put((LOG_FILE, line), timeout=0.1)
+        except: pass
 
 def smtp_log(msg):
     if not SMTP_LOG: return
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     try:
-        with GLOBAL_FILEWRITE_SEMAPHORE:
-            with open(SMTP_LOG, "a", encoding="utf-8") as f: f.write("[" + ts + "] " + str(msg) + "\n")
-    except Exception: pass
+        LOG_WRITE_QUEUE.put((SMTP_LOG, "[" + ts + "] " + str(msg)), timeout=0.1)
+    except: pass
 
 def debug_log(msg):
     if not DEBUG_LOG: return
     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     try:
-        with GLOBAL_FILEWRITE_SEMAPHORE:
-            with open(DEBUG_LOG, "a", encoding="utf-8") as f: f.write("[" + ts + "] " + str(msg) + "\n")
-    except Exception: pass
+        LOG_WRITE_QUEUE.put((DEBUG_LOG, "[" + ts + "] " + str(msg)), timeout=0.1)
+    except: pass
 
 def registar_resposta_smtp(message_id, smtp_code, smtp_message, provider, recipient_domain, sending_account, sending_ip, domain, subdomain, attempt_number, response_time):
     try:
-        registo = {"timestamp": datetime.now(timezone.utc).isoformat(), "message_id": str(message_id or ""), "smtp_code": int(smtp_code) if smtp_code else 0, "smtp_message": str(smtp_message or "")[:500], "provider": str(provider or ""), "recipient_domain": str(recipient_domain or ""), "sending_account": str(sending_account or ""), "sending_ip": str(sending_ip or ""), "domain": str(domain or ""), "subdomain": str(subdomain or ""), "attempt_number": int(attempt_number or 1), "response_time": float(response_time or 0)}
+        registo = {"timestamp": datetime.now(timezone.utc).isoformat(), "message_id": str(message_id or ""), "smtp_code": int(smtp_code) if smtp_code else 0, "smtp_message": str(smtp_message or ""), "provider": str(provider or ""), "recipient_domain": str(recipient_domain or ""), "sending_account": str(sending_account or ""), "sending_ip": str(sending_ip or ""), "domain": str(domain or ""), "subdomain": str(subdomain or ""), "attempt_number": int(attempt_number or 1), "response_time": float(response_time or 0)}
         with GLOBAL["smtp_responses_lock"]:
             GLOBAL["smtp_responses"].append(registo)
             if len(GLOBAL["smtp_responses"]) > 10000: GLOBAL["smtp_responses"] = GLOBAL["smtp_responses"][-10000:]
@@ -726,12 +751,11 @@ def log_desec_request(domain, url, method, status_code, response_body, headers, 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     try:
         garantir_diretorio_para(DESEC_LOG)
-        with GLOBAL_FILEWRITE_SEMAPHORE:
-            with open(DESEC_LOG, "a", encoding="utf-8") as f:
-                f.write("=" * 80 + "\n")
-                f.write(f"[{ts}] DESec Request #{GLOBAL.get('desec_requests', 0)}\nDomain: {domain}\nURL: {url}\nMethod: {method}\nAttempt: {attempt}\nDuration: {duration_ms:.0f}ms\nStatus: {status_code}\nHeaders: {headers}\n")
-                if payload_preview: f.write(f"Payload Preview: {str(payload_preview)[:2000]}\n")
-                f.write(f"Response Body: {str(response_body)[:1000]}\n" + "=" * 80 + "\n")
+        with open(DESEC_LOG, "a", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"[{ts}] DESec Request #{GLOBAL.get('desec_requests', 0)}\nDomain: {domain}\nURL: {url}\nMethod: {method}\nAttempt: {attempt}\nDuration: {duration_ms:.0f}ms\nStatus: {status_code}\nHeaders: {headers}\n")
+            if payload_preview: f.write(f"Payload Preview: {str(payload_preview)[:2000]}\n")
+            f.write(f"Response Body: {str(response_body)[:1000]}\n" + "=" * 80 + "\n")
         with GLOBAL["stats_lock"]:
             GLOBAL["desec_requests"] = GLOBAL.get("desec_requests", 0) + 1
             if status_code is not None and 200 <= int(status_code) < 300: GLOBAL["desec_success"] = GLOBAL.get("desec_success", 0) + 1
@@ -740,7 +764,6 @@ def log_desec_request(domain, url, method, status_code, response_body, headers, 
         try: print(f"[log_desec_request] erro: {str(e)[:100]}", flush=True)
         except Exception: pass
 
-# === HUGGING FACE SYNC ===
 def criar_repo_hf_se_nao_existe(repo_id, repo_type="dataset"):
     if not HF_TOKEN: return False
     try:
@@ -781,14 +804,11 @@ def upload_all_checkpoints_to_hf():
                     api.upload_file(path_or_fileobj=fpath, path_in_repo=f"results/{os.path.basename(fpath)}", repo_id=HF_CHECKPOINT_REPO, repo_type="dataset", token=HF_TOKEN)
                     enviados += 1
                 except Exception as e: dizer(f"  [HF SYNC] ⚠️ AVISO upload {os.path.basename(fpath)}: {str(e)[:120]}")
-                
-        # Upload SMTP LOG
         if os.path.exists(SMTP_LOG):
             try:
                 api.upload_file(path_or_fileobj=SMTP_LOG, path_in_repo=f"logs/smtp_audit_{GLOBAL['exec_id']}.txt", repo_id=HF_CHECKPOINT_REPO, repo_type="dataset", token=HF_TOKEN)
                 enviados += 1
             except Exception as e: dizer(f"  [HF SYNC] ⚠️ AVISO upload smtp_log: {str(e)[:120]}")
-            
         dizer(f"[HF SYNC] ✅ Upload concluido: {enviados} ficheiros enviados.")
     except Exception as e: dizer(f"[HF SYNC] ❌ ERRO geral: {str(e)[:100]}")
 
@@ -802,9 +822,11 @@ def download_all_checkpoints_from_hf():
         shutil.copy(manifest_local, MANIFEST_FILE)
         dizer("[HF SYNC] 📜 Manifesto baixado")
     except Exception as e:
+        if "401" in str(e):
+            dizer("[HF SYNC] ⚠️ Token HF inválido. A ignorar download de checkpoints.")
+            return 0
         if "404" in str(e) or "EntryNotFound" in str(e): dizer("[HF SYNC] ℹ️ Sem manifesto na HF (normal na 1a execucao)")
         else: dizer(f"[HF SYNC] ⚠️ Falha manifesto: {str(e)[:100]}")
-        
     for nome, path in CHECKPOINT.paths.items():
         try:
             local = hf_hub_download(repo_id=HF_CHECKPOINT_REPO, filename=f"checkpoints/{nome}.json", repo_type="dataset", token=HF_TOKEN, force_download=True)
@@ -820,7 +842,6 @@ def download_all_checkpoints_from_hf():
             else:
                 falhados += 1
                 dizer(f"  [HF SYNC] ❌ FALHA ao baixar {nome}.json: {texto[:140]}")
-                
     map_files = {"user_unknowns_acumulado.csv": UNKNOWN_FILE_LOCAL, "aceites_finais.csv": SAIDA_ACEITES, "rejeicoes_finais.csv": SAIDA_REJEICAOES}
     for fname, dest in map_files.items():
         try:
@@ -832,8 +853,7 @@ def download_all_checkpoints_from_hf():
         except Exception as e:
             texto = str(e)
             if "404" in texto or "EntryNotFound" in texto: pass
-            else:
-                falhados += 1
+            else: falhados += 1
     dizer(f"[HF SYNC] ❌ Downloads: {baixados} ok | {ausentes} ausentes | {falhados} falhados")
     if os.path.exists(MANIFEST_FILE):
         ok, msg = CHECKPOINT.validar_manifesto()
@@ -841,28 +861,13 @@ def download_all_checkpoints_from_hf():
         else: dizer(f"[HF SYNC] ⚠️ Manifesto invalido: {msg}")
     return baixados
 
-def trigger_next_run():
-    pat = os.environ.get("GITHUB_PAT")
-    repo = os.environ.get("GITHUB_REPOSITORY")
-    if not pat or not repo:
-        dizer("[AUTO-RESTART] ⚠️ Sem GITHUB_PAT ou GITHUB_REPOSITORY. Skip.")
-        return
-    workflow_file = "colab_run.yml"
-    url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches"
-    headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3+json"}
-    data = {"ref": "main"}
-    try:
-        r = requests.post(url, headers=headers, json=data, timeout=30)
-        if r.status_code in (200, 204): dizer("[AUTO-RESTART] 🚀 Próxima run disparada com sucesso!")
-        else: dizer(f"[AUTO-RESTART] ❌ Falha HTTP {r.status_code}: {r.text[:100]}")
-    except Exception as e: dizer(f"[AUTO-RESTART] ❌ Exceção: {str(e)[:100]}")
+def trigger_next_run(): pass
 
-# === FUNCOES DE FASE ===
 def definir_fase(nome):
     GLOBAL["fase_atual"] = nome
     GLOBAL["fase_inicio"] = time.time()
     grupo(f"🧭 FASE: {nome}")
-    print(painel_completo(), flush=True)
+    print(painel_completo_cli(), flush=True)
     fim_grupo()
 
 def marcar_fase(chave, ok, detalhe=""):
@@ -878,13 +883,11 @@ def marcar_fase(chave, ok, detalhe=""):
 
 def fases_faltantes_para_envio(): return CHECKPOINT.fases_faltantes(FASES_OBRIGATORIAS_ANTES_ENVIO)
 def fase_ja_completa(chave): return CHECKPOINT.fase_completa(chave)
-
 def espaco_disco_livre_gb(path="/content"):
     try:
         st = os.statvfs(path)
         return (st.f_bavail * st.f_frsize) / float(1024 ** 3)
     except Exception: return -1.0
-
 def check_stop_file():
     if os.path.exists(STOP_FILE):
         dizer(f"[STOP FILE] 🛑 Detectado {STOP_FILE}. Parando...")
@@ -892,39 +895,11 @@ def check_stop_file():
         return True
     return False
 
-# === IP COLAB ===
 async def obter_ip_colab():
-    definir_fase("🌐 FASE 0 - IP do Colab + verificacao de blacklists")
-    config = CHECKPOINT.obter_config()
-    if config.get("ip_colab"):
-        ip = config["ip_colab"]
-        try:
-            socket.inet_aton(ip)
-            GLOBAL["ip_colab"] = ip
-            dizer(f"  📍 IP recuperado do checkpoint: {ip}")
-            marcar_fase("FASE0_IP", True, f"IP recuperado {ip}")
-            return ip
-        except Exception: pass
-        
-    servicos = ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com", "https://ipinfo.io/ip", "https://checkip.amazonaws.com"]
-    ips = []
-    async with aiohttp.ClientSession() as session:
-        for url in servicos:
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    if r.status == 200:
-                        ip = (await r.text()).strip()
-                        socket.inet_aton(ip)
-                        ips.append(ip)
-            except Exception: pass
-            
-    if not ips:
-        marcar_fase("FASE0_IP", False, "nenhum servico respondeu")
-        raise RuntimeError("Nao foi possivel obter IP do Colab")
-    ip = max(set(ips), key=ips.count)
-    GLOBAL["ip_colab"] = ip
-    marcar_fase("FASE0_IP", True, f"IP {ip}")
-    return ip
+    definir_fase("🌐 FASE 0 - IP Aracloud + SSH Tunnel")
+    GLOBAL["ip_colab"] = ARACLOUD_IP
+    marcar_fase("FASE0_IP", True, f"IP Fixo Aracloud {ARACLOUD_IP}")
+    return ARACLOUD_IP
 
 async def verificar_blacklists(ip):
     dizer(f"🔍 A verificar blacklists do IP {ip}")
@@ -938,12 +913,11 @@ async def verificar_blacklists(ip):
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers): limpo.append(nome)
         except Exception: pass
     if listado:
-        dizer(f"⚠️ AVISO: IP Colab listado em: {', '.join(listado)}")
-        anotacao("warning", f"IP Colab {ip} listado em: {', '.join(listado)}")
-    else: dizer(f"✅ IP Colab limpo em {len(limpo)} listas")
+        dizer(f"⚠️ AVISO: IP Aracloud listado em: {', '.join(listado)}")
+        anotacao("warning", f"IP Aracloud {ip} listado em: {', '.join(listado)}")
+    else: dizer(f"✅ IP Aracloud limpo em {len(limpo)} listas")
     return listado
 
-# === DESEC TOKENS ===
 DESEC_TOKENS_VALIDOS = []
 DOM_TOKEN = {}
 DOM_MIN_TTL = {}
@@ -971,7 +945,6 @@ async def testar_tokens_desec():
                         return tok, doms
         except Exception as e: debug_log(f"token test {tok[:6]}...: {str(e)[:120]}")
         return tok, None
-
     validos, mapa_feito = [], 0
     try:
         tasks = [_testar_um(tok) for tok in DESEC_TOKENS_ALL]
@@ -985,20 +958,15 @@ async def testar_tokens_desec():
                     DOM_MIN_TTL[nome_dom] = min_ttl
                     mapa_feito += 1
     except Exception as e: debug_log(f"testar_tokens_desec: {str(e)}")
-    
     DESEC_TOKENS_VALIDOS.clear()
     DESEC_TOKENS_VALIDOS.extend(validos)
     dizer(f"🔐 Tokens validos: {len(validos)}/{len(DESEC_TOKENS_ALL)} | dominios mapeados: {mapa_feito}")
-    if mapa_feito > 0:
-        amostra = sorted(DOM_TOKEN.keys())[:5]
-        dizer(f"  🌐 Amostra de dominios: {', '.join(amostra)}" + (" ..." if mapa_feito > 5 else ""))
     if not validos:
         marcar_fase("FASE1_TOKENS", False, "nenhum token valido")
         raise RuntimeError("Nenhum token deSEC valido")
     marcar_fase("FASE1_TOKENS", True, f"{len(validos)} tokens, {mapa_feito} dominios")
     return validos
 
-# === DESCARGA HF COM RETRY ===
 async def download_hf_com_retry(repo_id, filename, repo_type, max_retries=4):
     ultima = None
     for tentativa in range(max_retries):
@@ -1009,19 +977,20 @@ async def download_hf_com_retry(repo_id, filename, repo_type, max_retries=4):
         except Exception as e:
             ultima = e
             texto = str(e).lower()
+            if "401" in texto:
+                dizer(f"  ❌ ERRO 401 HF: Token inválido. A abortar download.")
+                raise e
             espera = 30 if ("429" in texto or "rate" in texto or "too many" in texto) else (2 ** tentativa)
             debug_log(f"hf_retry {tentativa + 1} {filename}: {str(e)[:180]}")
             await asyncio.sleep(espera)
     raise ultima if ultima else RuntimeError("download_hf_com_retry falhou")
 
-# === CARREGAR CONTAS INTELIGENTE ===
 async def carregar_contas_inteligente():
-    definir_fase("📧 FASE 2A - Contas DKIM + descoberta dominio principal")
+    definir_fase("📧 FASE 2A - Contas DKIM (Carregar TODAS as contas válidas)")
     if fase_ja_completa("FASE2A_CONTAS"):
         dizer("  ♻️ Fase 2A ja concluida - a recarregar")
         dominio_salvo = CHECKPOINT.obter_dominio_principal()
         if dominio_salvo: GLOBAL["dominio_principal"] = dominio_salvo
-        
     p = await download_hf_com_retry(HF_LOGS_REPO, "campaign_data/phase1_accounts_keys.csv", "dataset")
     with open(p, "r", encoding="utf-8") as f: rows = list(csv.DictReader(f))
     todas_contas = []
@@ -1029,33 +998,16 @@ async def carregar_contas_inteligente():
         priv = (r.get("dkim_private_key_pem") or "").strip()
         if not priv.startswith("-----BEGIN "): continue
         todas_contas.append({"identity_id": (r.get("identity_id") or "").strip(), "sender_email": (r.get("sender_email") or "").strip(), "domain": (r.get("domain") or "").strip(), "base": (r.get("base") or "").strip(), "selector": (r.get("dkim_selector") or "default").strip(), "private_key_pem": priv, "public_key_txt": (r.get("dkim_public_txt") or "").strip()})
-        
     if not todas_contas:
         marcar_fase("FASE2A_CONTAS", False, "0 contas com chave DKIM")
         raise RuntimeError("Nenhuma conta valida carregada")
-        
-    por_dominio = defaultdict(list)
-    for conta in todas_contas: por_dominio[conta["domain"]].append(conta)
-    dominio_principal = None
-    for domain, contas in por_dominio.items():
-        if len(contas) >= 501:
-            dominio_principal = domain
-            break
-    if not dominio_principal:
-        dominio_principal = max(por_dominio.keys(), key=lambda d: len(por_dominio[d]))
-        dizer(f"⚠️ AVISO: Nenhum dominio com 501+ contas. Usando {dominio_principal} com {len(por_dominio[dominio_principal])} contas")
-    else: dizer(f"✅ Dominio principal encontrado: {dominio_principal} com {len(por_dominio[dominio_principal])} contas")
-    
-    contas_selecionadas = por_dominio[dominio_principal][:501]
-    GLOBAL["contas"] = contas_selecionadas
-    GLOBAL["dominio_principal"] = dominio_principal
-    CHECKPOINT.salvar_contas(len(contas_selecionadas), dominio_principal)
-    dizer(f"  👥 {len(contas_selecionadas)} contas ativas do dominio {dominio_principal}")
-    dizer(f"  🗂️ Total de dominios no CSV: {len(por_dominio)}")
-    for d, cs in sorted(por_dominio.items(), key=lambda x: -len(x[1]))[:5]:
-        dizer(f"    - {d}: {len(cs)} contas")
-    marcar_fase("FASE2A_CONTAS", True, f"{len(contas_selecionadas)} contas @ {dominio_principal}")
-    return contas_selecionadas
+
+    GLOBAL["contas"] = todas_contas
+    GLOBAL["dominio_principal"] = todas_contas[0]["domain"]
+    CHECKPOINT.salvar_contas(len(todas_contas), todas_contas[0]["domain"])
+    dizer(f"  👥 {len(todas_contas)} CONTAS CARREGADAS para o AccountPool")
+    marcar_fase("FASE2A_CONTAS", True, f"{len(todas_contas)} contas @ {todas_contas[0]['domain']}")
+    return todas_contas
 
 async def carregar_template():
     p = await download_hf_com_retry(HF_LOGS_REPO, f"campaign_data/templates/{CAMPAIGN['template']}", "dataset")
@@ -1063,7 +1015,6 @@ async def carregar_template():
     dizer(f"🎨 Template carregado: {CAMPAIGN['template']} ({len(html)} bytes)")
     return html
 
-# === MAIL FROM VARIATIONS ===
 async def carregar_mail_from_variations():
     dizer("✉️ A carregar variacoes de Mail From...")
     variations = []
@@ -1092,7 +1043,6 @@ async def carregar_mail_from_variations():
                     if linha and not linha.startswith("#"): variations.append(linha)
             dizer(f"  ☁️ Carregadas {len(variations)} variacoes do HuggingFace")
         except Exception as e2: dizer(f"  ⚠️ AVISO: Falha no download HF: {str(e2)[:120]}")
-        
     GLOBAL["mail_from_variations"] = variations
     GLOBAL["mail_from_idx_counter"] = 0
     return variations
@@ -1106,7 +1056,6 @@ def obter_display_name(conta, idx_conta):
     idx_var = idx_conta % len(variations)
     return variations[idx_var]
 
-# === PROVEDORES E MX ===
 async def listar_ficheiros_repo():
     if GLOBAL.get("repo_files_cache"): return GLOBAL["repo_files_cache"]
     api = HfApi(token=HF_TOKEN)
@@ -1151,71 +1100,20 @@ def resolver_mx_um(prov):
 async def resolver_mxs_paralelo(provedores):
     dizer(f"📡 A resolver MX de {len(provedores)} provedores...")
     out = {}
+    falhados = 0
     loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS_MX_ASYNC, len(provedores) or 1, 300)) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(99999, len(provedores) or 1, 4000)) as ex:
         tasks = [loop.run_in_executor(ex, resolver_mx_um, prov) for prov in provedores]
         results = await asyncio.gather(*tasks)
         for prov, mxs in results:
             if mxs:
                 out[prov] = mxs
                 with GLOBAL["stats_lock"]: GLOBAL["mx_found"] += len(mxs)
-    dizer(f"✅ Provedores com MX valido: {len(out)} | MXs totais: {GLOBAL['mx_found']}")
-    marcar_fase("FASE2B_MX", len(out) > 0, f"{len(out)}/{len(provedores)} com MX")
+            else:
+                falhados += 1
+    dizer(f"✅ Provedores com MX valido: {len(out)} | MXs totais: {GLOBAL['mx_found']} | Falhados (sem DNS/MX): {falhados}")
+    marcar_fase("FASE2B_MX", len(out) > 0, f"{len(out)}/{len(provedores)} com MX ({falhados} mortos)")
     return out
-
-# === DOWNLOAD PARQUETS ===
-async def _heartbeat_snapshot(evento_parar):
-    ultimo = -1
-    while not evento_parar.is_set():
-        try:
-            n = 0
-            if os.path.isdir(DIR_REPO):
-                for _r, _d, fs in os.walk(DIR_REPO):
-                    for f in fs:
-                        if f.endswith(".parquet"): n += 1
-            if n != ultimo:
-                dizer(f"  ... 📦 snapshot em curso: {n} parquets | livre {espaco_disco_livre_gb():.1f}GB")
-                ultimo = n
-        except Exception: pass
-        try: await asyncio.sleep(30)
-        except asyncio.CancelledError: break
-
-async def baixar_snapshot_repo():
-    padroes = ["Trader_Emails/", "Trader_Emails/*/", "Trader_Emails/*/*/", "Trader_Emails/*.parquet", "Trader_Emails/**/*.parquet"]
-    os.makedirs(DIR_REPO, exist_ok=True)
-    evento = asyncio.Event()
-    hb_task = asyncio.create_task(_heartbeat_snapshot(evento))
-    resultado, ultima = None, None
-    try:
-        for tentativa in range(3):
-            if GLOBAL.get("emergency_stop"): break
-            try:
-                dizer(f"  ☁️ snapshot_download tentativa {tentativa + 1}/3 ...")
-                inicio = time.time()
-                local = snapshot_download(repo_id=HF_TRADER_REPO, repo_type="dataset", token=HF_TOKEN, allow_patterns=padroes, local_dir=DIR_REPO, max_workers=max(8, min(WORKERS_DOWNLOAD_ASYNC, 64)), etag_timeout=60)
-                decorrido = time.time() - inicio
-                contar = 0
-                for r, _d, fs in os.walk(local or DIR_REPO):
-                    for f in fs:
-                        if f.endswith(".parquet"): contar += 1
-                dizer(f"  ✅ Snapshot OK em {decorrido:.0f}s -> {local} ({contar} parquets)")
-                resultado = local or DIR_REPO
-                GLOBAL["snapshot_ok"] = True
-                break
-            except Exception as e:
-                ultima = e
-                dizer(f"  ❌ snapshot_download falhou: {str(e)[:200]}")
-                debug_log(f"snapshot tentativa {tentativa + 1}:\n{traceback.format_exc()}")
-                await asyncio.sleep(20 * (tentativa + 1))
-    except Exception as e: debug_log(f"baixar_snapshot_repo outer: {str(e)}")
-    finally:
-        evento.set()
-        hb_task.cancel()
-        try: await hb_task
-        except asyncio.CancelledError: pass
-    if resultado is None and ultima is not None:
-        dizer("  ⚠️ AVISO: snapshot impossivel - recurso a downloads individuais")
-    return resultado
 
 def processar_provedor_emails_sync(args):
     prov, itens = args
@@ -1231,7 +1129,6 @@ def processar_provedor_emails_sync(args):
                     GLOBAL["emails_read"] += n
                 return prov, n
             except Exception: pass
-            
     path = os.path.join(DIR_EMAILS, prov + ".txt")
     seen, total, ok_pq, falha_pq = set(), 0, 0, 0
     try:
@@ -1262,7 +1159,7 @@ def processar_provedor_emails_sync(args):
                         falha_pq += 1
                         continue
                     buf = []
-                    for batch in pf.iter_batches(batch_size=50000, columns=[col]):
+                    for batch in pf.iter_batches(batch_size=10000, columns=[col]):
                         if GLOBAL.get("emergency_stop"): break
                         try: valores = batch.column(0).to_pylist()
                         except Exception: continue
@@ -1274,20 +1171,22 @@ def processar_provedor_emails_sync(args):
                             seen.add(e)
                             buf.append(e)
                             total += 1
+                            if total >= 100: break
                         if buf:
                             fout.write("\n".join(buf) + "\n")
                             buf = []
+                        if total >= 100: break
                         ok_pq += 1
                 except Exception as e:
                     falha_pq += 1
                     debug_log(f"parquet {rel} ({prov}): {str(e)[:200]}")
                 finally:
                     pf = None
-                    if origem and veio_do_snapshot:
+                    if APAGAR_PARQUETS_APOS_USO and veio_do_snapshot and origem:
                         try:
                             if os.path.exists(origem): os.remove(origem)
                         except Exception: pass
-                if total >= MAX_EMAILS_POR_PROVEDOR_DOWNLOAD: break
+                if total >= 100: break
             fout.flush()
             try: os.fsync(fout.fileno())
             except Exception: pass
@@ -1303,7 +1202,7 @@ def processar_provedor_emails_sync(args):
     return prov, total
 
 async def baixar_todos_emails_paralelo(provedores):
-    definir_fase("📦 FASE 2C - Download HuggingFace (snapshot) + extraccao de emails")
+    definir_fase("📦 FASE 2C - Download HuggingFace (Direct) + extraccao de emails")
     livres = espaco_disco_livre_gb()
     dizer(f"  💾 Espaco livre em /content: {livres:.1f} GB")
     ja_baixados = CHECKPOINT.obter_provedores_baixados()
@@ -1316,10 +1215,10 @@ async def baixar_todos_emails_paralelo(provedores):
             if len(parts) >= 2 and parts[1] in provedores: por_prov[parts[1]].append(f)
     args = []
     for p in provedores:
-        if p in por_prov: args.append((p, por_prov[p]))
+        if p in por_prov: 
+            args.append((p, [por_prov[p][0]]))
     GLOBAL["pq_total"] = sum(len(v) for v in por_prov.values())
-    dizer(f"  🗂️ Parquets identificados: {GLOBAL['pq_total']} em {len(args)} provedores")
-    
+    dizer(f"  🗂️ Parquets identificados: {GLOBAL['pq_total']} em {len(args)} provedores (A baixar so o 1o de cada)")
     emails_recuperados = 0
     for p in ja_baixados:
         path_p = os.path.join(DIR_EMAILS, p + ".txt")
@@ -1334,33 +1233,21 @@ async def baixar_todos_emails_paralelo(provedores):
             except Exception: pass
     if emails_recuperados > 0: dizer(f"  📥 Emails recuperados do checkpoint: {emails_recuperados:,}")
     
-    raiz_local = await baixar_snapshot_repo()
-    if raiz_local:
-        itens_args = []
-        for p, rels in args:
-            pares = []
-            for rel in rels:
-                cand = os.path.join(raiz_local, rel)
-                pares.append((rel, cand if os.path.exists(cand) else None))
-            itens_args.append((p, pares))
-    else: itens_args = [(p, [(rel, None) for rel in rels]) for p, rels in args]
+    itens_args = [(p, [(rel, None) for rel in rels]) for p, rels in args]
     
     if GLOBAL.get("emergency_stop"):
         marcar_fase("FASE2C_DOWNLOAD", False, "paragem de emergencia")
         return
-        
-    dizer(f"  ⚙️ A extrair emails para {DIR_EMAILS} ...")
+    dizer(f"  ⚙️ A extrair emails (Limite 100/prov) para {DIR_EMAILS} ...")
     loop = asyncio.get_event_loop()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS_DOWNLOAD_ASYNC, len(itens_args) or 1, 200)) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(99999, len(itens_args) or 1, 4000)) as ex:
         tasks = [loop.run_in_executor(ex, processar_provedor_emails_sync, a) for a in itens_args]
         await asyncio.gather(*tasks)
-        
     dizer(f"  📧 Emails extraidos: {GLOBAL['emails_read']:,}")
     dizer(f"  📊 Parquets processados: {GLOBAL['pq_downloaded']}/{GLOBAL['pq_total']} | falhas: {GLOBAL['pq_falhados']}")
-    completos = (GLOBAL['pq_downloaded'] + GLOBAL['pq_falhados']) >= GLOBAL['pq_total']
-    marcar_fase("FASE2C_DOWNLOAD", completos and GLOBAL['pq_downloaded'] > 0, f"{GLOBAL['pq_downloaded']}/{GLOBAL['pq_total']} parquets")
+    completos = (GLOBAL['pq_downloaded'] + GLOBAL['pq_falhados']) >= len(itens_args)
+    marcar_fase("FASE2C_DOWNLOAD", completos and GLOBAL['pq_downloaded'] > 0, f"{GLOBAL['pq_downloaded']}/{len(itens_args)} parquets")
 
-# === USER UNKNOWN ===
 async def baixar_unknowns_acumulado():
     definir_fase("🚫 FASE 2D - Blacklist persistente de USER_UNKNOWN")
     dizer("👻 A carregar blacklist de USER_UNKNOWN...")
@@ -1373,7 +1260,6 @@ async def baixar_unknowns_acumulado():
             baixou = True
             dizer("  ☁️ Ficheiro de blacklist descarregado do HuggingFace")
     except Exception as e: dizer("  ℹ️ Ficheiro ainda nao existe no HuggingFace (normal na 1a execucao)")
-    
     unknowns = set()
     if os.path.exists(UNKNOWN_FILE_LOCAL):
         try:
@@ -1384,7 +1270,6 @@ async def baixar_unknowns_acumulado():
         except Exception as e:
             dizer(f"  ⚠️ AVISO: blacklist local ilegivel ({str(e)[:80]})")
             unknowns = set()
-            
     try: cp_unk = CHECKPOINT.carregar_unknowns()
     except Exception: cp_unk = set()
     atual = GLOBAL.get("user_unknowns") or set()
@@ -1437,10 +1322,14 @@ def registrar_rejeicao(email, provedor, smtp_code, smtp_message):
                 writer.writerow([email.lower(), provedor, smtp_code, str(smtp_message)[:200], datetime.now().isoformat()])
     except Exception as e: debug_log(f"registrar_rejeicao: {str(e)}")
 
-# === PROXIES ===
-REGEX_PROXY = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})["\'\s)\]][:|\t,;/]["\'\s(\[](\d{2,5})')
-REGEX_PROXY_JSON_IP = re.compile(r'"(?:ip|host|address|ip_address)"\s*:\s*"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"\s*,\s*"(?:port|p)"\s*:\s*"?(\d{2,5})"?', re.I)
-REGEX_PROXY_JSON_PORT = re.compile(r'"(?:port|p)"\s*:\s*"?(\d{2,5})"?\s*,\s*"(?:ip|host|address|ip_address)"\s*:\s*"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})"', re.I)
+async def carregar_urls_proxies(): return [], []
+async def carregar_e_scrapear_proxies_async(motivo="inicial"):
+    definir_fase("🕵️‍♂️ FASE 2.5 - Proxies (Aracloud Tunnel Only)")
+    dizer("  ℹ️ Scraping desativado. Usando apenas Aracloud SSH Tunnel.")
+    with GLOBAL["pool_lock"]:
+        GLOBAL["pool"] = [{"ip": ARACLOUD_IP, "port": 22, "proto": "ssh", "exit_ip": ARACLOUD_IP, "added_at": time.time()}]
+    GLOBAL["scraping_inicial_feito"] = True
+    return []
 
 def ip_publico_valido(ip):
     if not ip: return False
@@ -1458,395 +1347,9 @@ def ip_publico_valido(ip):
     if a == 192 and b == 168: return False
     if a == 169 and b == 254: return False
     if a >= 224: return False
-    # CGNAT permitido para proxies moveis
     if a == 198 and b in (18, 19): return False
     return True
 
-def inferir_protocolo_url(u):
-    baixo = u.lower()
-    if "socks5" in baixo: return "socks5"
-    if "socks4" in baixo: return "socks4"
-    if "socks" in baixo: return "socks5"
-    if "http" in baixo: return "http"
-    return "socks5"
-
-def descobrir_ficheiros_proxy():
-    candidatos, dirs_vistos = [], set()
-    bloqueados = {"emails_db", "logs", "audit", ".git", ".cache", ".ipynb_checkpoints", "campaign_v19_0", "campaign_v21_0", "campaign_v21_1", "sample_data", "trainer_repo", "__pycache__"}
-    for base in PROXY_SEARCH_DIRS:
-        if not base or not os.path.isdir(base): continue
-        real = os.path.realpath(base)
-        if real in dirs_vistos: continue
-        dirs_vistos.add(real)
-        dir_principal = (real == os.path.realpath(DIR_PROXIES)) or (real == os.path.realpath("./"))
-        for raiz, dirs, ficheiros in os.walk(real):
-            try: sufixo = raiz[len(real):]
-            except Exception: sufixo = ""
-            profundidade = sufixo.count(os.sep) if sufixo else 0
-            if profundidade >= 2:
-                dirs[:] = []
-                continue
-            dirs[:] = [d for d in dirs if d not in bloqueados and not d.startswith(".")]
-            for fn in ficheiros:
-                baixo = fn.lower()
-                if not baixo.endswith((".txt", ".list", ".csv", ".json", ".lst")): continue
-                if dir_principal:
-                    candidatos.append(os.path.join(raiz, fn))
-                    continue
-                if any(k in baixo for k in ("proxy", "proxies", "socks", "prx", "proxylist")): candidatos.append(os.path.join(raiz, fn))
-    unicos, vistos = [], set()
-    for c in candidatos:
-        try: r = os.path.realpath(c)
-        except Exception: continue
-        if r in vistos: continue
-        vistos.add(r)
-        unicos.append(c)
-    return unicos
-
-async def carregar_urls_proxies():
-    urls, diretos, urls_vistos, ips_vistos = [], [], set(), set()
-    try: os.makedirs(DIR_PROXIES, exist_ok=True)
-    except Exception: pass
-    ficheiros = descobrir_ficheiros_proxy()
-    GLOBAL["ficheiros_proxy"] = len(ficheiros)
-    if not ficheiros:
-        dizer("  ⚠️ AVISO: nenhum ficheiro de proxies encontrado no disco.")
-        if FALLBACK_PROXY_URLS:
-            for u in FALLBACK_PROXY_URLS:
-                if u not in urls_vistos:
-                    urls_vistos.add(u)
-                    urls.append(u)
-    if ficheiros:
-        dizer(f"  📂 Ficheiros de proxies encontrados: {len(ficheiros)}")
-        for fp in ficheiros[:25]:
-            try: tam = os.path.getsize(fp)
-            except Exception: tam = 0
-            dizer(f"     - {fp} ({tam:,} bytes)")
-        linhas_lidas = 0
-        for fp in ficheiros:
-            try:
-                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                    for ln in f:
-                        linhas_lidas += 1
-                        ln = ln.strip().strip('"').strip("'").strip()
-                        if not ln or ln.startswith("#"): continue
-                        if ln.startswith("http://") or ln.startswith("https://"):
-                            if ln not in urls_vistos:
-                                urls_vistos.add(ln)
-                                urls.append(ln)
-                            continue
-                        encontrados = extrair_proxies_do_texto(ln, "socks5")
-                        for item, _p in encontrados:
-                            if item not in ips_vistos:
-                                ips_vistos.add(item)
-                                diretos.append(item)
-            except Exception as e: debug_log(f"ler {fp}: {str(e)}")
-        dizer(f"  📖 Linhas lidas: {linhas_lidas:,}")
-        dizer(f"  🔗 URLs para scraping: {len(urls)}")
-        dizer(f"  📍 IPs diretos no ficheiro: {len(diretos)}")
-        if diretos:
-            adicionados = 0
-            with GLOBAL["raw_lock"]:
-                vistos = GLOBAL["ips_vistos"]
-                for item in diretos:
-                    if item in vistos: continue
-                    vistos.add(item)
-                    GLOBAL["raw_proxies"].append((item, "socks5"))
-                    adicionados += 1
-            GLOBAL["proxies_extracted"] = len(GLOBAL["raw_proxies"])
-            dizer(f"  ✅ IPs diretos adicionados: {adicionados}")
-    return urls, diretos
-
-def extrair_proxies_do_texto(texto, proto_sugerido="socks5"):
-    resultados = []
-    if not texto: return resultados
-    vistos_locais = set()
-    for regex, ordem in ((REGEX_PROXY, (1, 2)), (REGEX_PROXY_JSON_IP, (1, 2)), (REGEX_PROXY_JSON_PORT, (2, 1))):
-        try:
-            for match in regex.finditer(texto):
-                g_ip = match.group(ordem[0])
-                g_port = match.group(ordem[1])
-                try: porta = int(g_port)
-                except Exception: continue
-                if not (1 <= porta <= 65535): continue
-                if not ip_publico_valido(g_ip): continue
-                chave = (g_ip, porta)
-                if chave in vistos_locais: continue
-                vistos_locais.add(chave)
-                resultados.append((chave, proto_sugerido))
-        except Exception: continue
-    return resultados
-
-async def scrape_url_async(session, url, proto):
-    if GLOBAL.get("emergency_stop"): return "", proto, url
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "*/*"}, allow_redirects=True) as r:
-            texto = await r.text()
-            if r.status == 200 or len(texto) > 60:
-                with GLOBAL["stats_lock"]: GLOBAL["urls_scraped"] += 1
-                return texto, proto, url
-            with GLOBAL["stats_lock"]: GLOBAL["urls_failed"] += 1
-            return "", proto, url
-    except Exception:
-        with GLOBAL["stats_lock"]: GLOBAL["urls_failed"] += 1
-        return "", proto, url
-
-async def carregar_e_scrapear_proxies_async(motivo="inicial"):
-    dizer(f"🕵️‍♂️ FASE 2.5 - Scraping de proxies ({motivo})")
-    urls, diretos = await carregar_urls_proxies()
-    with GLOBAL["stats_lock"]:
-        GLOBAL["urls_total"] = len(urls)
-        GLOBAL["urls_scraped"] = 0
-        GLOBAL["urls_failed"] = 0
-    if not urls:
-        dizer("  ℹ️ Sem URLs para scraping - a usar apenas IPs diretos")
-        with GLOBAL["raw_lock"]: GLOBAL["proxies_extracted"] = len(GLOBAL["raw_proxies"])
-        return GLOBAL["raw_proxies"]
-        
-    dizer(f"  🕸️ A descarregar {len(urls)} listas em paralelo asyncio...")
-    pares = [(u, inferir_protocolo_url(u)) for u in urls]
-    connector = aiohttp.TCPConnector(limit=min(WORKERS_VALIDACAO_ASYNC, 500), limit_per_host=20)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        sem = asyncio.Semaphore(WORKERS_VALIDACAO_ASYNC)
-        async def scrape_one(u, proto):
-            async with sem: return await scrape_url_async(session, u, proto)
-        tasks = [scrape_one(u, p) for u, p in pares]
-        novos, inicio = 0, time.time()
-        for coro in asyncio.as_completed(tasks):
-            if GLOBAL.get("emergency_stop"): break
-            texto, proto, url = await coro
-            if not texto: continue
-            extraidos = extrair_proxies_do_texto(texto, proto)
-            if not extraidos: continue
-            with GLOBAL["raw_lock"]:
-                vistos = GLOBAL["ips_vistos"]
-                lista = GLOBAL["raw_proxies"]
-                for item, p in extraidos:
-                    if item in vistos: continue
-                    vistos.add(item)
-                    lista.append((item, p))
-                    novos += 1
-        with GLOBAL["raw_lock"]: total_raw = len(GLOBAL["raw_proxies"])
-        with GLOBAL["stats_lock"]: GLOBAL["proxies_extracted"] = total_raw
-        dizer(f"  ✅ Scraping concluido em {time.time() - inicio:.0f}s")
-        dizer(f"  📊 Listas OK: {GLOBAL['urls_scraped']}/{GLOBAL['urls_total']} | falharam: {GLOBAL['urls_failed']}")
-        dizer(f"  🆕 Novos proxies desta ronda: {novos:,}")
-        dizer(f"  📦 Candidatos acumulados: {total_raw:,}")
-    return GLOBAL["raw_proxies"]
-
-# === VALIDACAO DE PROXIES (CORRIGIDO E ROBUSTO) ===
-async def _obter_exit_ip_async(proxy_ip, proxy_port, proto):
-    servicos = [("api.ipify.org", 80, b"GET /?format=json HTTP/1.0\r\nHost: api.ipify.org\r\n\r\n", "ip"), ("ifconfig.me", 80, b"GET /ip HTTP/1.0\r\nHost: ifconfig.me\r\n\r\n", None), ("icanhazip.com", 80, b"GET / HTTP/1.0\r\nHost: icanhazip.com\r\n\r\n", None)]
-    loop = asyncio.get_event_loop()
-    for host, port, request, json_key in servicos:
-        try:
-            def _connect():
-                if proto in ('socks5', 'socks4'):
-                    s = socks.socksocket()
-                    if proto == 'socks5': s.set_proxy(socks.SOCKS5, proxy_ip, proxy_port)
-                    else: s.set_proxy(socks.SOCKS4, proxy_ip, proxy_port)
-                    s.settimeout(5)
-                    s.connect((host, port))
-                else:
-                    s = socket.socket()
-                    s.settimeout(5)
-                    s.connect((proxy_ip, proxy_port))
-                    s.sendall(f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
-                    r = s.recv(4096)
-                    if b"200" not in r:
-                        s.close()
-                        return None
-                s.sendall(request)
-                data = s.recv(8192)
-                try: s.close()
-                except Exception: pass
-                return data
-            data = await loop.run_in_executor(None, _connect)
-            if not data: continue
-            body = data.split(b"\r\n\r\n", 1)[-1].strip()
-            if json_key:
-                try:
-                    result = json.loads(body)
-                    if isinstance(result, dict) and json_key in result:
-                        val = str(result[json_key]).strip()
-                        if ip_publico_valido(val): return val
-                except Exception: pass
-            text = body.decode(errors="ignore").strip()
-            mm = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', text)
-            if mm:
-                ip_encontrado = mm.group(1)
-                if ip_publico_valido(ip_encontrado): return ip_encontrado
-            if text and ip_publico_valido(text): return text
-        except Exception: continue
-    return proxy_ip
-
-async def validar_proxy_rapido_async(item, proto_sugerido):
-    ip, port = item
-    MX_TESTE, PORT25_TIMEOUT = "mxs.mail.ru", 10
-    loop = asyncio.get_event_loop()
-    
-    def _test_socks5():
-        try:
-            s = socks.socksocket()
-            s.set_proxy(socks.SOCKS5, ip, port)
-            s.settimeout(PORT25_TIMEOUT)
-            s.connect((MX_TESTE, 25))
-            banner = s.recv(4096).decode(errors="ignore").strip()
-            s.close()
-            return banner
-        except Exception: return None
-
-    def _test_socks4():
-        try:
-            s = socks.socksocket()
-            s.set_proxy(socks.SOCKS4, ip, port)
-            s.settimeout(PORT25_TIMEOUT)
-            s.connect((MX_TESTE, 25))
-            banner = s.recv(4096).decode(errors="ignore").strip()
-            s.close()
-            return banner
-        except Exception: return None
-
-    def _test_http():
-        try:
-            s = socket.socket()
-            s.settimeout(PORT25_TIMEOUT)
-            s.connect((ip, port))
-            s.sendall(f"CONNECT {MX_TESTE}:25 HTTP/1.1\r\nHost: {MX_TESTE}\r\n\r\n".encode())
-            r = s.recv(4096)
-            if b"200" not in r:
-                s.close()
-                return None
-            banner = s.recv(4096).decode(errors="ignore").strip()
-            s.close()
-            return banner
-        except Exception: return None
-
-    proto_funcional = None
-    
-    try:
-        banner = await asyncio.wait_for(loop.run_in_executor(None, _test_socks5), timeout=PORT25_TIMEOUT + 2)
-        if banner and banner.startswith("220"): proto_funcional = 'socks5'
-    except asyncio.TimeoutError: pass
-    
-    if not proto_funcional:
-        try:
-            banner = await asyncio.wait_for(loop.run_in_executor(None, _test_socks4), timeout=PORT25_TIMEOUT + 2)
-            if banner and banner.startswith("220"): proto_funcional = 'socks4'
-        except asyncio.TimeoutError: pass
-        
-    if not proto_funcional:
-        try:
-            banner = await asyncio.wait_for(loop.run_in_executor(None, _test_http), timeout=PORT25_TIMEOUT + 2)
-            if banner and banner.startswith("220"): proto_funcional = 'http'
-        except asyncio.TimeoutError: pass
-
-    if proto_funcional is None:
-        with GLOBAL["stats_lock"]: GLOBAL["proxies_mortos_count"] += 1
-        return None
-        
-    exit_ip = await _obter_exit_ip_async(ip, port, proto_funcional)
-    if not ip_publico_valido(exit_ip): exit_ip = ip
-    
-    info = {"ip": ip, "port": port, "proto": proto_funcional, "exit_ip": exit_ip, "added_at": time.time()}
-    with GLOBAL["pool_lock"]:
-        ja = any(e["ip"] == ip and e["port"] == port for e in GLOBAL["pool"])
-        if not ja: GLOBAL["pool"].append(info)
-        else: return None
-    GLOBAL["spf_sujo"] = True
-    CHECKPOINT.salvar_pool(GLOBAL["pool"], GLOBAL["scraping_checkpoint"], len(GLOBAL["raw_proxies"]))
-    return info
-
-async def validar_proxies_ate_target_async(target_count):
-    start_idx = GLOBAL["scraping_checkpoint"]
-    with GLOBAL["raw_lock"]: raw = list(GLOBAL["raw_proxies"])
-    total = len(raw)
-    if total == 0:
-        dizer("  ⚠️ AVISO: fila de validacao vazia")
-        return 0
-    if start_idx >= total:
-        dizer(f"  ✅ Todos os {total:,} candidatos ja foram testados")
-        return 0
-    validos_iniciais = len(GLOBAL["pool"])
-    if validos_iniciais >= target_count:
-        dizer(f"  ✅ Pool ja tem {validos_iniciais} >= alvo {target_count}")
-        return 0
-        
-    dizer(f"  🔍 A validar: {total - start_idx:,} candidatos a partir do indice {start_idx} (pool {validos_iniciais}/{target_count})")
-    sem = asyncio.Semaphore(WORKERS_VALIDACAO_ASYNC)
-    validos_novos, next_i = 0, start_idx
-    
-    async def validar_one(item, proto):
-        async with sem: return await validar_proxy_rapido_async(item, proto)
-        
-    while next_i < total and not GLOBAL.get("emergency_stop"):
-        batch_end = min(next_i + 500, total)
-        batch = raw[next_i:batch_end]
-        tasks = [validar_one(item, proto) for item, proto in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, dict) and result: validos_novos += 1
-        next_i = batch_end
-        GLOBAL["scraping_checkpoint"] = next_i
-        dizer(f"  📈 Progresso: {next_i}/{total} testados | {validos_novos} novos | pool {len(GLOBAL['pool'])}/{target_count}")
-        if validos_iniciais + validos_novos >= target_count: break
-        
-    com_pool = len(GLOBAL["pool"])
-    CHECKPOINT.salvar_pool(GLOBAL["pool"], GLOBAL["scraping_checkpoint"], len(GLOBAL["raw_proxies"]))
-    dizer(f"  🏁 Validacao terminada: +{validos_novos} | pool agora {com_pool}/{target_count}")
-    if com_pool > 0: GLOBAL["spf_sujo"] = True
-    return validos_novos
-
-async def revalidar_pool_recuperado():
-    with GLOBAL["pool_lock"]: pool = list(GLOBAL["pool"])
-    if not pool: return 0
-    dizer(f"  🔄 Revalidando {len(pool)} proxies recuperados...")
-    sem = asyncio.Semaphore(64)
-    MX_TESTE, PORT25_TIMEOUT = "mxs.mail.ru", 10
-    loop = asyncio.get_event_loop()
-    
-    async def _testar(p):
-        async with sem:
-            def _connect():
-                try:
-                    proto = p.get("proto", "socks5")
-                    if proto in ('socks5', 'socks4'):
-                        s = socks.socksocket()
-                        if proto == 'socks5': s.set_proxy(socks.SOCKS5, p["ip"], p["port"])
-                        else: s.set_proxy(socks.SOCKS4, p["ip"], p["port"])
-                        s.settimeout(PORT25_TIMEOUT)
-                        s.connect((MX_TESTE, 25))
-                    else:
-                        s = socket.socket()
-                        s.settimeout(PORT25_TIMEOUT)
-                        s.connect((p["ip"], p["port"]))
-                        s.sendall(f"CONNECT {MX_TESTE}:25 HTTP/1.1\r\nHost: {MX_TESTE}\r\n\r\n".encode())
-                        r = s.recv(4096)
-                        if b"200" not in r:
-                            s.close()
-                            return False
-                    banner = s.recv(4096).decode(errors="ignore").strip()
-                    try: s.close()
-                    except Exception: pass
-                    return banner.startswith("220")
-                except Exception: return False
-            try: return await asyncio.wait_for(loop.run_in_executor(None, _connect), timeout=PORT25_TIMEOUT + 2)
-            except asyncio.TimeoutError: return False
-            
-    tasks = [_testar(p) for p in pool]
-    resultados = await asyncio.gather(*tasks, return_exceptions=True)
-    vivos = []
-    for p, vivo in zip(pool, resultados):
-        if vivo is True: vivos.append(p)
-    mortos = len(pool) - len(vivos)
-    with GLOBAL["pool_lock"]: GLOBAL["pool"] = vivos
-    if mortos > 0: GLOBAL["spf_sujo"] = True
-    with GLOBAL["stats_lock"]: GLOBAL["proxies_mortos_count"] += mortos
-    dizer(f"  ✅ Pool recuperado: {len(vivos)} vivos, {mortos} mortos removidos")
-    CHECKPOINT.salvar_pool(GLOBAL["pool"], GLOBAL["scraping_checkpoint"], len(GLOBAL["raw_proxies"]))
-    return len(vivos)
-
-# === DESEC DNS ===
 def token_para_dominio(domain):
     with DOM_TOKEN_LOCK:
         if domain in DOM_TOKEN: return DOM_TOKEN[domain]
@@ -1982,7 +1485,6 @@ async def desec_put_com_retry_async(url, headers, payload, domain, max_retries=5
             payload_preview = json.dumps(payload[0], indent=2)[:2000]
             payload_preview = f"(bulk com {len(payload)} rrsets; amostra) " + payload_preview
     except Exception as e: payload_preview = f"erro: {str(e)}"
-    
     for tentativa in range(max_retries):
         if GLOBAL.get("emergency_stop"): return False, "STOP"
         inicio_req = time.time()
@@ -2071,22 +1573,13 @@ def montar_spf_record(ips):
     return _dividir_em_chunks_com_aspas(full_spf, 255)
 
 def obter_ips_para_spf():
-    ips = set()
-    if GLOBAL.get("ip_colab"): ips.add(GLOBAL["ip_colab"])
-    with GLOBAL["pool_lock"]:
-        for p in GLOBAL["pool"]:
-            try:
-                exit_ip = p.get("exit_ip")
-                if exit_ip and ip_publico_valido(exit_ip): ips.add(exit_ip)
-            except Exception: continue
-    lista = [i for i in ips if i and ip_publico_valido(i)]
-    return lista[:MAX_SPF_IPS]
+    return [ARACLOUD_IP]
 
 def construir_rrsets_completos(contas_do_dominio, spf_record, ttl=None):
     if ttl is None: ttl = DESEC_TTL
     rrsets, vistos = [], set()
     dmarc_record = '"v=DMARC1; p=none; sp=none;"'
-    ip_colab = GLOBAL.get("ip_colab") or "127.0.0.1"
+    ip_colab = ARACLOUD_IP
     for c in contas_do_dominio:
         base = c["base"]
         domain = c["domain"]
@@ -2146,47 +1639,45 @@ async def atualizar_dominio_completo_async(domain, contas_dom, spf_record):
     return domain, escritos_total, confirmados_final, bases, status
 
 async def fase3_dns_completo_async(contas):
-    definir_fase("🧬 FASE 3 - DNS bulk por dominio com diff (SPF+DKIM+DMARC+A+MX)")
-    ips_spf = obter_ips_para_spf()
+    definir_fase("🧬 FASE 3 - DNS ARAcloud (1 Conta)")
+    ips_spf = [ARACLOUD_IP]
     spf_record = montar_spf_record(ips_spf)
-    dizer(f"  🛡️ SPF com {len(ips_spf)} IPs (proxies + Colab)")
-    por_dom = defaultdict(list)
-    for c in contas: por_dom[c["domain"]].append(c)
-    total_bases = sum(len(v) for v in por_dom.values())
-    GLOBAL["dns_total"] = total_bases
-    with GLOBAL["stats_lock"]: GLOBAL["dominios_rate_limited"] = []
-    dizer(f"  🌐 Dominios: {len(por_dom)} | bases: {total_bases}")
-    dizer(f"  ⏱️ Throttling: global {DESEC_MIN_DELAY}s | por dominio {DESEC_PER_DOMAIN_WRITE_INTERVAL}s")
-    ok_bases, escritos_total, falhados, sem_mudancas = 0, 0, 0, 0
-    dominios_lista = sorted(por_dom.keys())
-    for idx, domain in enumerate(dominios_lista, 1):
-        if GLOBAL.get("emergency_stop"): break
-        contas_dom = por_dom[domain]
-        dizer(f"  🚀 [{idx}/{len(dominios_lista)}] {domain} ({len(contas_dom)} bases)...")
-        try: dom, escritos, confirmados, bases, status = await atualizar_dominio_completo_async(domain, contas_dom, spf_record)
-        except Exception as e:
-            debug_log(f"atualizar_dominio_completo {domain}: {traceback.format_exc()}")
-            falhados += 1
-            continue
-        escritos_total += escritos
-        with GLOBAL["stats_lock"]: GLOBAL["dns_escritos"] = GLOBAL.get("dns_escritos", 0) + escritos
-        if status in ("SEM_MUDANCAS", "OK", "PARCIAL"):
-            ok_bases += confirmados // 6
-            if status == "SEM_MUDANCAS": sem_mudancas += 1
-        dizer(f"    🏁 {status} ({confirmados} confirmados, {escritos} escritos)")
-        if status not in ("SEM_MUDANCAS", "OK", "PARCIAL"): falhados += 1
+    dizer(f"  🛡️ SPF com IP Aracloud: {ARACLOUD_IP}")
+
+    domain = contas[0]["domain"]
+    tok = token_para_dominio(domain)
+    if not tok:
+        dizer(f"❌ Token nao encontrado para {domain}")
+        marcar_fase("FASE3_DNS", False, "sem token")
+        return False
+
+    dizer(f"  🚀 Atualizando DNS de {domain}...")
+    try: dom, escritos, confirmados, bases, status = await atualizar_dominio_completo_async(domain, contas[:1], spf_record)
+    except Exception as e:
+        debug_log(f"atualizar_dominio_completo {domain}: {traceback.format_exc()}")
+        marcar_fase("FASE3_DNS", False, str(e)[:100])
+        return False
+
+    escritos_total = escritos
+    with GLOBAL["stats_lock"]: GLOBAL["dns_escritos"] = GLOBAL.get("dns_escritos", 0) + escritos
+    if status in ("SEM_MUDANCAS", "OK", "PARCIAL"):
+        ok_bases = confirmados // 6
+    else: ok_bases = 0
+    dizer(f"    🏁 {status} ({confirmados} confirmados, {escritos} escritos)")
+
+    GLOBAL["dns_total"] = bases
     GLOBAL["dns_updated"] = ok_bases
     GLOBAL["ultimo_refresh_spf"] = time.time()
     GLOBAL["spf_sujo"] = False
     GLOBAL["spf_record_escrito"] = spf_record
     GLOBAL["spf_ips_escritos"] = list(ips_spf)
     GLOBAL["colab_spf_atualizado"] = True
-    dizer(f"  🏆 DNS: {ok_bases}/{total_bases} bases | {escritos_total} escritos | {sem_mudancas} sem mudancas | {falhados} falhados")
-    marcar_fase("FASE3_DNS", ok_bases > 0, f"{ok_bases}/{total_bases} bases, {falhados} falhados")
+    dizer(f"  🏆 DNS: {ok_bases}/{bases} bases | {escritos_total} escritos")
+    marcar_fase("FASE3_DNS", ok_bases > 0, f"{ok_bases}/{bases} bases")
     return ok_bases > 0
 
 async def refresh_spf_bulk_async(motivo=""):
-    ips_spf = obter_ips_para_spf()
+    ips_spf = [ARACLOUD_IP]
     if not ips_spf: return
     spf_record = montar_spf_record(ips_spf)
     if spf_record == GLOBAL.get("spf_record_escrito"):
@@ -2194,9 +1685,9 @@ async def refresh_spf_bulk_async(motivo=""):
         GLOBAL["ultimo_refresh_spf"] = time.time()
         dizer(f"  🔄 Refresh SPF ({motivo}): inalterado - 0 writes")
         return
-    dizer(f"  🔄 Refresh SPF ({motivo}) com {len(ips_spf)} IPs")
+    dizer(f"  🔄 Refresh SPF ({motivo}) com IP Aracloud")
     por_dom = defaultdict(list)
-    for c in GLOBAL["contas"]: por_dom[c["domain"]].append(c)
+    for c in GLOBAL["contas"][:1]: por_dom[c["domain"]].append(c)
     escritos_total, doms_ok = 0, 0
     for domain in sorted(por_dom.keys()):
         if GLOBAL.get("emergency_stop"): break
@@ -2237,16 +1728,16 @@ async def fase4_esperar_propagacao():
         passo = min(10, restante)
         await asyncio.sleep(passo)
         restante -= passo
-        if restante % 60 == 0 and restante > 0: dizer(f"  ... ⏳ faltam {restante}s")
+        if restante % 30 == 0 and restante > 0: dizer(f"  ... ⏳ faltam {restante}s")
     dizer("  ✅ Propagacao concluida")
 
 async def verificar_propagacao_amostra(contas, ip_colab):
     dizer("  🔍 Verificacao de propagacao (amostra de 5)")
-    ips_spf = obter_ips_para_spf()
+    ips_spf = [ARACLOUD_IP]
     if not contas:
         marcar_fase("FASE4_PROPAGACAO", True, "sem contas")
         return True
-    amostra = random.sample(contas, min(5, len(contas)))
+    amostra = random.sample(contas[:10], min(5, len(contas[:10])))
     ok = 0
     res = dns.resolver.Resolver()
     res.nameservers = ["8.8.8.8", "1.1.1.1"]
@@ -2269,7 +1760,6 @@ async def verificar_propagacao_amostra(contas, ip_colab):
     marcar_fase("FASE4_PROPAGACAO", True, f"{ok}/{len(amostra)} propagados")
     return ok >= max(1, len(amostra) // 2)
 
-# === MUTACAO ABRACADABRA ===
 def mutar_url(url, email_recipient, identity_id):
     try:
         if not url or not url.startswith("http"): return url
@@ -2335,7 +1825,6 @@ def aplicar_mutacao_abracadabra(html_base, conta, target_emails, subject=None):
     except Exception as e: smtp_log(f"DKIM falhou em {conta.get('identity_id')}: {str(e)}")
     return b
 
-# === ORCAMENTO IP E RCPT DINAMICO ===
 class OrcamentoIP:
     def __init__(self):
         self.lock = threading.Lock()
@@ -2375,15 +1864,18 @@ class RCPTDinamico:
         self.sucessos_consecutivos = {}
     def obter(self, provedor):
         with self.lock:
-            if provedor in self.data: return self.data[provedor]
-            return RCPT_LIMITS.get(provedor, RCPT_DEFAULT)
+            if provedor in self.data: 
+                val = self.data[provedor]
+                return min(int(val), RCPT_LIMITS_MAX)
+            default_val = RCPT_LIMITS.get(provedor, RCPT_DEFAULT)
+            return min(default_val, RCPT_LIMITS_MAX)
     def registar_sucesso(self, provedor):
         with self.lock:
             rcpt_atual = self.data.get(provedor, RCPT_LIMITS.get(provedor, RCPT_DEFAULT))
             rcpt_inicial = RCPT_LIMITS.get(provedor, RCPT_DEFAULT)
             self.sucessos_consecutivos[provedor] = self.sucessos_consecutivos.get(provedor, 0) + 1
             if self.sucessos_consecutivos[provedor] >= 3:
-                novo = min(rcpt_atual + 5, rcpt_inicial * 2)
+                novo = min(rcpt_atual + 5, rcpt_inicial * 2, RCPT_LIMITS_MAX)
                 if novo != rcpt_atual:
                     self.data[provedor] = novo
                     self.sucessos_consecutivos[provedor] = 0
@@ -2399,166 +1891,394 @@ class RCPTDinamico:
 
 RCPT_CTRL = RCPTDinamico()
 
-# === FASE 6: AUDITORIA E VALIDACAO DE PROVEDORES (NOVO MODO) ===
-async def smtp_send_recv(sock, cmd, timeout=15):
-    loop = asyncio.get_event_loop()
-    def _io():
-        try:
-            sock.settimeout(timeout)
-            if cmd:
-                if isinstance(cmd, str): sock.sendall(cmd.encode('utf-8'))
-                else: sock.sendall(cmd)
-            data = b""
-            while True:
-                try:
-                    chunk = sock.recv(8192)
-                    if not chunk: break
-                    data += chunk
-                    lines = data.split(b'\r\n')
-                    if len(lines) >= 2:
-                        last_line = lines[-2] if lines[-1] == b'' else lines[-1]
-                        if len(last_line) >= 3 and last_line[:3].isdigit() and last_line[3:4] == b' ':
-                            break
-                except socket.timeout: break
-                except Exception: break
-            return data.decode('utf-8', errors='ignore').strip()
-        except Exception as e: return f"ERRO_IO: {str(e)}"
-    return await loop.run_in_executor(None, _io)
-
-async def validar_provedor_smtp(worker_id, proxy_info, conta, provedor, emails, mx_host, html_base, sem):
-    async with sem:
-        smtp_log(f"\n{'='*70}")
-        smtp_log(f"[WORKER {worker_id:03d}] INICIO AUDITORIA: {provedor} | MX: {mx_host}")
-        smtp_log(f"{'='*70}")
+class AccountPool:
+    """Distribui contas em Round-Robin seguro para o paralelismo hierárquico"""
+    def __init__(self, contas):
+        self.contas = contas
+        self.idx = 0
+        self.lock = asyncio.Lock()
         
-        loop = asyncio.get_event_loop()
-        sock = None
-        try:
-            def _connect():
-                if proxy_info:
-                    proto = proxy_info.get("proto", "socks5")
-                    if proto in ('socks5', 'socks4'):
-                        s = socks.socksocket()
-                        if proto == 'socks5': s.set_proxy(socks.SOCKS5, proxy_info["ip"], proxy_info["port"])
-                        else: s.set_proxy(socks.SOCKS4, proxy_info["ip"], proxy_info["port"])
-                        s.settimeout(15)
-                        s.connect((mx_host, 25))
-                        return s
+    async def get_account(self):
+        async with self.lock:
+            if not self.contas: return None
+            acc = self.contas[self.idx % len(self.contas)]
+            self.idx += 1
+            return acc
+
+ACCOUNT_POOL = None
+
+def _get_tunnel_socket(dest_host, dest_port):
+    return TUNNEL.get_socket(dest_host, dest_port)
+
+def _recv_smtp_raw(sock, timeout=15):
+    """Versão corrigida: regista todas as exceções completas, bytes recebidos, motivo"""
+    try: sock.settimeout(timeout)
+    except: pass
+    data = b""
+    bytes_recebidos_total = 0
+    inicio_leitura = time.time()
+    try:
+        while True:
+            try:
+                chunk = sock.recv(8192)
+                if not chunk: 
+                    duracao = time.time() - inicio_leitura
+                    return f"[CONNECTION_CLOSED] bytes_recebidos={bytes_recebidos_total} duracao={duracao:.2f}s data_parcial={data[:500]}"
+                data += chunk
+                bytes_recebidos_total += len(chunk)
+                lines = data.split(b'\r\n')
+                if len(lines) >= 2:
+                    last_line = lines[-2] if lines[-1] == b'' else lines[-1]
+                    if len(last_line) >= 3 and last_line[:3].isdigit() and last_line[3:4] == b' ':
+                        break
+            except socket.timeout as te:
+                duracao = time.time() - inicio_leitura
+                return f"[TIMEOUT] tipo=socket.timeout bytes_recebidos={bytes_recebidos_total} duracao={duracao:.2f}s erro={str(te)} data_parcial={data[:500]}"
+            except ConnectionResetError as cre:
+                duracao = time.time() - inicio_leitura
+                return f"[RESET] tipo=ConnectionResetError bytes_recebidos={bytes_recebidos_total} duracao={duracao:.2f}s erro={str(cre)} data_parcial={data[:500]}"
+            except ConnectionAbortedError as cae:
+                duracao = time.time() - inicio_leitura
+                return f"[ABORTED] tipo=ConnectionAbortedError bytes_recebidos={bytes_recebidos_total} duracao={duracao:.2f}s erro={str(cae)} data_parcial={data[:500]}"
+            except BrokenPipeError as bpe:
+                duracao = time.time() - inicio_leitura
+                return f"[BROKEN_PIPE] tipo=BrokenPipeError bytes_recebidos={bytes_recebidos_total} duracao={duracao:.2f}s erro={str(bpe)} data_parcial={data[:500]}"
+            except OSError as ose:
+                duracao = time.time() - inicio_leitura
+                return f"[OS_ERROR] tipo=OSError errno={getattr(ose, 'errno', '?')} bytes_recebidos={bytes_recebidos_total} duracao={duracao:.2f}s erro={str(ose)} data_parcial={data[:500]}"
+            except Exception as e:
+                duracao = time.time() - inicio_leitura
+                return f"[EXCEPTION] tipo={type(e).__name__} bytes_recebidos={bytes_recebidos_total} duracao={duracao:.2f}s erro={str(e)} data_parcial={data[:500]}"
+    except Exception as outer_e:
+        return f"[OUTER_EXCEPTION] tipo={type(outer_e).__name__} erro={str(outer_e)}"
+    text = data.decode('utf-8', errors='ignore').strip()
+    return text
+
+def _parse_smtp_code(response):
+    """Extrai código SMTP e mensagem da resposta"""
+    if not response:
+        return 0, ""
+    if response.startswith("[") and "]" in response:
+        return 0, response
+    lines = response.split("\n")
+    for line in reversed(lines):
+        line = line.strip()
+        if len(line) >= 3 and line[:3].isdigit():
+            try:
+                code = int(line[:3])
+                msg = line[4:] if len(line) > 4 else ""
+                return code, msg
+            except: pass
+    return 0, response
+
+def _parse_ehlo_extensions(response):
+    """Extrai extensões EHLO (SIZE, PIPELINING, etc)"""
+    extensions = {}
+    if not response:
+        return extensions
+    lines = response.split("\n")
+    for line in lines[1:]:  # Pular banner
+        line = line.strip()
+        if line.startswith("250") or line.startswith("220"):
+            if len(line) > 4:
+                ext_part = line[4:].strip()
+                if ext_part:
+                    if ext_part.startswith("SIZE"):
+                        try:
+                            size = int(ext_part.split()[1]) if " " in ext_part else 0
+                            extensions["SIZE"] = size
+                        except: extensions["SIZE"] = 0
+                    elif ext_part.startswith("CHUNKING"):
+                        extensions["CHUNKING"] = True
+                    elif ext_part.startswith("PIPELINING"):
+                        extensions["PIPELINING"] = True
+                    elif ext_part.startswith("SMTPUTF8"):
+                        extensions["SMTPUTF8"] = True
+                    elif ext_part.startswith("8BITMIME"):
+                        extensions["8BITMIME"] = True
+                    elif ext_part.startswith("AUTH"):
+                        extensions["AUTH"] = ext_part
                     else:
-                        s = socket.socket()
-                        s.settimeout(15)
-                        s.connect((proxy_info["ip"], proxy_info["port"]))
-                        s.sendall(f"CONNECT {mx_host}:25 HTTP/1.1\r\nHost: {mx_host}\r\n\r\n".encode())
-                        r = s.recv(4096)
-                        if b"200" not in r:
-                            s.close()
-                            raise ConnectionError("HTTP CONNECT fail")
-                        return s
-                else:
-                    s = socket.socket()
-                    s.settimeout(15)
-                    s.connect((mx_host, 25))
-                    return s
+                        extensions[ext_part.split()[0]] = ext_part
+    return extensions
+
+async def enviar_batch_smtp(provedor, mx_host, emails_batch, html_base, worker_id):
+    """
+    Nível 3 da Hierarquia: Envia um lote de RCPTs usando uma conta do Pool.
+    Protegido pelo GLOBAL_TUNNEL_SEMAPHORE para não sobrecarregar o SSH.
+    """
+    async with GLOBAL_TUNNEL_SEMAPHORE:
+        conta = await ACCOUNT_POOL.get_account()
+        if not conta:
+            return {"aceites": 0, "rejeitados": 0, "erros": 1, "retry_emails": []}
+            
+        sock = None
+        loop = asyncio.get_event_loop()
+        resultados = {"aceites": 0, "rejeitados": 0, "erros": 0, "retry_emails": []}
+        
+        def log(msg):
+            smtp_log(f"[W{worker_id:03d}][{provedor}][{conta['identity_id'][:8]}] {msg}")
+            
+        try:
+            # Conexão via Túnel
+            sock = await loop.run_in_executor(None, _get_tunnel_socket, mx_host, 25)
+            if not sock:
+                log(f"❌ TUNNEL FAIL para {mx_host}")
+                resultados["erros"] += 1
+                resultados["retry_emails"] = emails_batch
+                return resultados
+                
+            with GLOBAL["stats_lock"]:
+                GLOBAL["smtp_conexoes"] += 1
+                GLOBAL["smtp_via_proxy"] += 1
+                
+            # Banner
+            banner = await loop.run_in_executor(None, _recv_smtp_raw, sock)
+            log(f"<- BANNER: {banner}")
+            banner_code, _ = _parse_smtp_code(banner)
+            if banner_code != 220:
+                resultados["erros"] += 1
+                resultados["retry_emails"] = emails_batch
+                return resultados
+                
+            # EHLO
+            sock.sendall(f"EHLO {conta['identity_id']}\r\n".encode())
+            log(f"-> EHLO {conta['identity_id']}")
+            ehlo_response = await loop.run_in_executor(None, _recv_smtp_raw, sock)
+            log(f"<- EHLO RESPONSE: {ehlo_response}")
+            
+            ehlo_code, _ = _parse_smtp_code(ehlo_response)
+            if ehlo_code not in (250, 220):
+                resultados["erros"] += 1
+                resultados["retry_emails"] = emails_batch
+                return resultados
+                
+            # MAIL FROM
+            sock.sendall(f"MAIL FROM:<{conta['sender_email']}>\r\n".encode())
+            log(f"-> MAIL FROM:<{conta['sender_email']}>")
+            resp = await loop.run_in_executor(None, _recv_smtp_raw, sock)
+            log(f"<- MAIL FROM RESPONSE: {resp}")
+            mail_code, _ = _parse_smtp_code(resp)
+            if mail_code != 250:
+                resultados["erros"] += 1
+                resultados["retry_emails"] = emails_batch
+                return resultados
+                
+            # RCPT TO Loop
+            interrompido_421 = False
+            for email in emails_batch:
+                if interrompido_421:
+                    resultados["retry_emails"].append(email)
+                    continue
                     
-            sock = await asyncio.wait_for(loop.run_in_executor(None, _connect), timeout=20)
-            
-            banner = await smtp_send_recv(sock, None)
-            smtp_log(f"[W{worker_id:03d}] <- BANNER: {banner}")
-            if not banner.startswith("220"):
-                smtp_log(f"[W{worker_id:03d}] ❌ BANNER INVALIDO")
-                return
+                sock.sendall(f"RCPT TO:<{email}>\r\n".encode())
+                log(f"-> RCPT TO:<{email}>")
                 
-            resp = await smtp_send_recv(sock, f"EHLO {conta['identity_id']}\r\n")
-            smtp_log(f"[W{worker_id:03d}] -> EHLO {conta['identity_id']}")
-            smtp_log(f"[W{worker_id:03d}] <- {resp}")
-            
-            resp = await smtp_send_recv(sock, f"MAIL FROM:<{conta['sender_email']}>\r\n")
-            smtp_log(f"[W{worker_id:03d}] -> MAIL FROM:<{conta['sender_email']}>")
-            smtp_log(f"[W{worker_id:03d}] <- {resp}")
-            if not resp.startswith("250"):
-                smtp_log(f"[W{worker_id:03d}] ❌ MAIL FROM REJEITADO")
-                return
+                with GLOBAL["stats_lock"]:
+                    GLOBAL["smtp_tentativas"] += 1
+                    
+                resp = await loop.run_in_executor(None, _recv_smtp_raw, sock)
+                log(f"<- RCPT TO RESPONSE [{email}]: {resp}")
+                code, msg = _parse_smtp_code(resp)
                 
-            aceites = 0
-            rejeitados = 0
-            for email in emails[:100]:
-                resp = await smtp_send_recv(sock, f"RCPT TO:<{email}>\r\n")
-                smtp_log(f"[W{worker_id:03d}] -> RCPT TO:<{email}>")
-                smtp_log(f"[W{worker_id:03d}] <- {resp}")
-                if resp.startswith("250") or resp.startswith("251"):
-                    aceites += 1
-                    with GLOBAL["stats_lock"]: GLOBAL["smtp_aceites"] += 1
+                if code in (250, 251):
+                    resultados["aceites"] += 1
+                    with GLOBAL["stats_lock"]: 
+                        GLOBAL["smtp_aceites"] += 1
+                        if provedor not in GLOBAL["por_provedor"]:
+                            GLOBAL["por_provedor"][provedor] = {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0}
+                        GLOBAL["por_provedor"][provedor]["aceites"] += 1
+                        GLOBAL["por_provedor"][provedor]["tentados"] += 1
+                    registrar_aceite(email, provedor, conta['identity_id'], mx_host)
+                    RCPT_CTRL.registar_sucesso(provedor)
+                elif code == 421 or code == 452:
+                    log(f"⚠️ 421/452 DETECTADO para {email}: {resp}")
+                    with GLOBAL["stats_lock"]: 
+                        GLOBAL["smtp_4xx"] = GLOBAL.get("smtp_4xx", 0) + 1
+                        GLOBAL["por_provedor"].setdefault(provedor, {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0})["rejeitados"] += 1
+                    RCPT_CTRL.registar_erro(provedor, tipo="too_many")
+                    resultados["rejeitados"] += 1
+                    interrompido_421 = True
+                    resultados["retry_emails"].append(email)
+                    # Adicionar os restantes emails não tentados ao retry
+                    idx = emails_batch.index(email)
+                    resultados["retry_emails"].extend(emails_batch[idx+1:])
+                    registrar_rejeicao(email, provedor, code, resp)
+                    break
+                elif code >= 400 and code < 500:
+                    with GLOBAL["stats_lock"]: 
+                        GLOBAL["smtp_4xx"] = GLOBAL.get("smtp_4xx", 0) + 1
+                        GLOBAL["por_provedor"].setdefault(provedor, {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0})["rejeitados"] += 1
+                    resultados["rejeitados"] += 1
+                    registrar_rejeicao(email, provedor, code, resp)
+                elif code >= 500:
+                    with GLOBAL["stats_lock"]: 
+                        GLOBAL["smtp_5xx"] = GLOBAL.get("smtp_5xx", 0) + 1
+                        GLOBAL["por_provedor"].setdefault(provedor, {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0})["rejeitados"] += 1
+                    resultados["rejeitados"] += 1
+                    if code == 550 or "unknown" in msg.lower() or "user" in msg.lower():
+                        salvar_unknown(email, provedor)
+                        with GLOBAL["stats_lock"]: GLOBAL["smtp_user_unknown"] += 1
+                    registrar_rejeicao(email, provedor, code, resp)
                 else:
-                    rejeitados += 1
-                    with GLOBAL["stats_lock"]: GLOBAL["smtp_rejeitados"] += 1
+                    resultados["erros"] += 1
+                    with GLOBAL["stats_lock"]: 
+                        GLOBAL["smtp_erros"] += 1
+                        GLOBAL["por_provedor"].setdefault(provedor, {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0})["erros"] += 1
+                    registrar_rejeicao(email, provedor, code, resp)
+                    
                 await asyncio.sleep(DELAY_ENTRE_RCPT)
                 
-            resp = await smtp_send_recv(sock, "DATA\r\n")
-            smtp_log(f"[W{worker_id:03d}] -> DATA")
-            smtp_log(f"[W{worker_id:03d}] <- {resp}")
-            
-            if resp.startswith("354"):
-                payload = aplicar_mutacao_abracadabra(html_base, conta, emails[:1])
-                if not payload.endswith(b"\r\n.\r\n"):
-                    if not payload.endswith(b"\r\n"): payload += b"\r\n"
-                    payload += b".\r\n"
-                resp = await smtp_send_recv(sock, payload, timeout=30)
-                smtp_log(f"[W{worker_id:03d}] -> [PAYLOAD ENVIADO - {len(payload)} bytes]")
-                smtp_log(f"[W{worker_id:03d}] <- {resp}")
+            # DATA (Apenas se houve aceites e não houve 421)
+            if not interrompido_421 and resultados["aceites"] > 0:
+                sock.sendall(b"DATA\r\n")
+                log("-> DATA")
+                resp = await loop.run_in_executor(None, _recv_smtp_raw, sock)
+                log(f"<- DATA RESPONSE: {resp}")
+                data_code, _ = _parse_smtp_code(resp)
                 
-            await smtp_send_recv(sock, "QUIT\r\n")
-            smtp_log(f"[W{worker_id:03d}] 🏁 FIM AUDITORIA {provedor} | RCPT Aceites: {aceites} | Rejeitados: {rejeitados}")
-            
+                if data_code == 354:
+                    payload = aplicar_mutacao_abracadabra(html_base, conta, [emails_batch[0]])
+                    if not payload.endswith(b"\r\n.\r\n"):
+                        if not payload.endswith(b"\r\n"): payload += b"\r\n"
+                        payload += b".\r\n"
+                    sock.sendall(payload)
+                    log(f"-> [PAYLOAD {len(payload)} bytes transmitted]")
+                    final_response = await loop.run_in_executor(None, _recv_smtp_raw, sock, 30)
+                    log(f"<- FINAL DATA RESPONSE: {final_response}")
+                    
+            if not interrompido_421:
+                sock.sendall(b"QUIT\r\n")
+                log(f"-> QUIT")
+                
         except Exception as e:
-            smtp_log(f"[W{worker_id:03d}] ❌ ERRO FATAL: {str(e)}")
+            log(f"❌ ERRO FATAL BATCH: {str(e)}")
+            resultados["erros"] += 1
+            with GLOBAL["stats_lock"]: GLOBAL["smtp_erros"] += 1
+            # Em caso de erro de conexão, todos os emails não processados devem ser reenviados
+            # (A lógica de retry_emails já trata o caso do 421, mas aqui é genérico)
+            if not resultados["retry_emails"]:
+                resultados["retry_emails"] = emails_batch
         finally:
             if sock:
                 try: sock.close()
                 except: pass
+                
+        return resultados
 
-async def fase6_validacao_provedores(mxs, contas, html_base):
-    definir_fase("🔍 FASE 6 - AUDITORIA E VALIDACAO DE PROVEDORES (RCPT+DATA)")
+async def worker_provedor_independente(provedor, mx_host, emails_iniciais, html_base, worker_id_base):
+    """
+    Nível 1 da Hierarquia: Rotina independente do provedor.
+    Gere o seu próprio estado, filas e retries sem bloquear outros provedores.
+    """
+    smtp_log(f"[W_PROV_{worker_id_base}] 🚀 INICIO ROTINA INDEPENDENTE: {provedor} | MX: {mx_host} | Emails: {len(emails_iniciais)}")
+    
+    emails_para_enviar = list(emails_iniciais)
+    retry_count = 0
+    max_retries = 3
+    
+    while emails_para_enviar and retry_count < max_retries:
+        if GLOBAL.get("emergency_stop"): break
+        
+        rcpt_limit_atual = RCPT_CTRL.obter(provedor)
+        
+        # Criar batches baseado no limite dinâmico
+        batches = [emails_para_enviar[i:i+rcpt_limit_atual] for i in range(0, len(emails_para_enviar), rcpt_limit_atual)]
+        
+        smtp_log(f"[W_PROV_{worker_id_base}] [{provedor}] 📦 Lotes a enviar: {len(batches)} (RCPT limit: {rcpt_limit_atual})")
+        
+        # Nível 2: Lançar tasks para os batches concorrentemente
+        tasks = []
+        for i, batch in enumerate(batches):
+            tasks.append(enviar_batch_smtp(provedor, mx_host, batch, html_base, worker_id_base + i))
+            
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Processar resultados e preparar o próximo retry se necessário
+        emails_para_reenviar = []
+        houve_421 = False
+        
+        for res in results:
+            if isinstance(res, Exception):
+                smtp_log(f"[W_PROV_{worker_id_base}] [{provedor}] ❌ Task Exception: {res}")
+                continue
+            if isinstance(res, dict):
+                if res.get("retry_emails"):
+                    emails_para_reenviar.extend(res["retry_emails"])
+                    houve_421 = True
+                    
+        if not emails_para_reenviar:
+            smtp_log(f"[W_PROV_{worker_id_base}] [{provedor}] ✅ Rotina concluída sem retries pendentes.")
+            break
+            
+        # Ajustar limite se houve 421 e preparar retry
+        if houve_421:
+            RCPT_CTRL.registar_erro(provedor, tipo="too_many")
+            rcpt_limit_atual = RCPT_CTRL.obter(provedor)
+            
+        retry_count += 1
+        with GLOBAL["stats_lock"]:
+            GLOBAL["smtp_retries"] = GLOBAL.get("smtp_retries", 0) + 1
+            
+        smtp_log(f"[W_PROV_{worker_id_base}] [{provedor}] 🔄 Retry #{retry_count} | Emails pendentes: {len(emails_para_reenviar)} | Novo RCPT limit: {rcpt_limit_atual}")
+        emails_para_enviar = emails_para_reenviar
+        await asyncio.sleep(2 + retry_count)  # Backoff entre retries do provedor
+        
+    with GLOBAL["stats_lock"]:
+        GLOBAL["prov_processed"] += 1
+        
+    smtp_log(f"[W_PROV_{worker_id_base}] 🏁 FIM ROTINA INDEPENDENTE: {provedor}")
+
+async def fase6_paralelismo_hierarquico(mxs, contas, html_base):
+    definir_fase("🔍 FASE 6 - PARALELISMO HIERÁRQUICO MASSIVO (CLI)")
     if not contas:
         dizer("  ⛔ FASE 6 BLOQUEADA - sem contas")
         marcar_fase("FASE6_ENVIO", False, "sem contas")
         return
         
-    conta = contas[0]
-    dizer(f"  📧 Conta selecionada para auditoria: {conta['sender_email']}")
+    global ACCOUNT_POOL
+    ACCOUNT_POOL = AccountPool(contas)
+    dizer(f"  📧 AccountPool inicializado com {len(contas)} contas")
+    dizer(f"  📊 RCPT_LIMITS_MAX configurado: {RCPT_LIMITS_MAX}")
+    dizer(f"  🔌 Túnel SSH Semaphore: {MAX_CONCURRENT_TUNNELS} canais simultâneos")
     
-    sem = asyncio.Semaphore(min(500, len(GLOBAL["pool"]) if GLOBAL["pool"] else 1, len(mxs)))
-    tasks = []
-    worker_id = 1
+    tasks_provedores = []
+    worker_id_base = 1
     
+    # Nível 0: Criar uma task independente para cada provedor
     for provedor, mx_list in mxs.items():
         path = os.path.join(DIR_EMAILS, provedor + ".txt")
         emails = []
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 for i, line in enumerate(f):
-                    if i >= 100: break
+                    if i >= MAX_EMAILS_POR_PROVEDOR_DOWNLOAD: break
                     e = line.strip()
-                    if e and "@" in e: emails.append(e)
+                    if e and "@" in e and e not in GLOBAL.get("user_unknowns", set()):
+                        emails.append(e)
         if not emails: continue
         
-        proxy_info = None
-        with GLOBAL["pool_lock"]:
-            if GLOBAL["pool"]:
-                proxy_info = GLOBAL["pool"][(worker_id - 1) % len(GLOBAL["pool"])]
-                
         mx_host = mx_list[0] if mx_list else None
         if not mx_host: continue
         
-        tasks.append(validar_provedor_smtp(worker_id, proxy_info, conta, provedor, emails, mx_host, html_base, sem))
-        worker_id += 1
+        with GLOBAL["stats_lock"]:
+            GLOBAL["prov_total_envio"] += 1
+            
+        tasks_provedores.append(worker_provedor_independente(provedor, mx_host, emails, html_base, worker_id_base))
+        worker_id_base += 1000  # Espaçamento para IDs de workers internos
         
-    GLOBAL["n_workers_ativos"] = len(tasks)
-    marcar_fase("FASE6_ENVIO_INICIO", True, f"{len(tasks)} provedores em auditoria")
-    await asyncio.gather(*tasks)
-    marcar_fase("FASE6_ENVIO", True, f"Auditoria concluida para {len(tasks)} provedores")
-    dizer(f"  🏆 FASE 6 concluida: Auditoria de {len(tasks)} provedores finalizada.")
+    GLOBAL["n_workers_ativos"] = len(tasks_provedores)
+    marcar_fase("FASE6_ENVIO_INICIO", True, f"{len(tasks_provedores)} provedores em paralelo hierárquico")
+    
+    dizer(f"  🚀 A lançar {len(tasks_provedores)} rotinas independentes simultâneas...")
+    
+    # Executar todos os provedores ao mesmo tempo
+    await asyncio.gather(*tasks_provedores)
+    
+    marcar_fase("FASE6_ENVIO", True, f"Auditoria concluida para {len(tasks_provedores)} provedores")
+    dizer(f"  🏆 FASE 6 concluida: Paralelismo hierárquico finalizado.")
+    RCPT_CTRL.salvar()
 
-# === MONITOR DE PROXIES ===
 async def monitor_proxies_continuo_async():
     dizer("[MONITOR] 🕵️‍♂️ Thread de monitoramento de proxies iniciada")
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
@@ -2568,18 +2288,10 @@ async def monitor_proxies_continuo_async():
         await asyncio.sleep(60)
         with GLOBAL["pool_lock"]: pool_atual = len(GLOBAL["pool"])
         decorrido_refresh = time.time() - GLOBAL.get("ultimo_refresh_spf", 0)
-        if (GLOBAL.get("spf_sujo") and decorrido_refresh >= SPF_REFRESH_INTERVALO_MINIMO and fase_ja_completa("FASE3_DNS")):
+        if (GLOBAL.get("spf_sujo") and decorrido_refresh >= SPF_REFRESH_INTERVALO_MINUTO and fase_ja_completa("FASE3_DNS")):
             try: await refresh_spf_bulk_async("agendado")
             except Exception as e: debug_log(f"refresh SPF agendado: {str(e)}")
-        if pool_atual < MIN_PROXIES_REFILL:
-            dizer(f"[MONITOR] ⚠️ Pool baixo ({pool_atual}/{TARGET_VALID_PROXIES}) - refill")
-            try:
-                with GLOBAL["raw_lock"]: n_raw = len(GLOBAL["raw_proxies"])
-                if GLOBAL["scraping_checkpoint"] >= n_raw: await carregar_e_scrapear_proxies_async(motivo="refill-monitor")
-                await validar_proxies_ate_target_async(TARGET_VALID_PROXIES)
-            except Exception as e: debug_log(f"refill monitor: {str(e)}")
 
-# === CHECKPOINTS ===
 def salvar_checkpoint_smtp():
     try:
         stats = {"smtp_tentativas": GLOBAL["smtp_tentativas"], "smtp_aceites": GLOBAL["smtp_aceites"], "smtp_rejeitados": GLOBAL["smtp_rejeitados"], "smtp_user_unknown": GLOBAL["smtp_user_unknown"], "smtp_erros": GLOBAL["smtp_erros"], "smtp_conexoes": GLOBAL["smtp_conexoes"], "smtp_via_proxy": GLOBAL["smtp_via_proxy"], "smtp_via_colab": GLOBAL["smtp_via_colab"], "smtp_4xx": GLOBAL.get("smtp_4xx", 0), "smtp_5xx": GLOBAL.get("smtp_5xx", 0), "smtp_retries": GLOBAL.get("smtp_retries", 0), "smtp_abandonados": GLOBAL.get("smtp_abandonados", 0)}
@@ -2630,7 +2342,6 @@ async def time_limit_watcher_async():
             os._exit(0)
         await asyncio.sleep(30)
 
-# === FUNCOES FINAIS ===
 async def upload_unknowns_hf():
     if not os.path.exists(UNKNOWN_FILE_LOCAL): return
     try:
@@ -2656,14 +2367,19 @@ async def gerar_ficheiros_finais():
                 for email in aceites_set: writer.writerow([email, "", "", "", ts])
             dizer(f"  ✅ Ficheiro {SAIDA_ACEITES} criado com {len(aceites_set):,} aceites")
     except Exception as e: dizer(f"  ❌ ERRO ao gerar ficheiro de aceites: {str(e)}")
-    
+
     dizer("👻 A gerar ficheiro final de user_unknowns...")
     try:
         if os.path.exists(UNKNOWN_FILE_LOCAL): shutil.copy(UNKNOWN_FILE_LOCAL, SAIDA_UNKNOWN)
         with GLOBAL["user_unknowns_lock"]: n_unk = len(GLOBAL["user_unknowns"])
         dizer(f"  ✅ Ficheiro {SAIDA_UNKNOWN} criado com {n_unk:,} user_unknowns")
     except Exception as e: dizer(f"  ❌ ERRO ao copiar user_unknowns: {str(e)}")
-    
+
+    dizer("📥 A copiar SMTP LOG para output local...")
+    if os.path.exists(SMTP_LOG):
+        shutil.copy(SMTP_LOG, "/content/smtp_log_audit.txt")
+        dizer("  ✅ smtp_log_audit.txt pronto para download")
+
     dizer("☁️ A enviar ficheiros para HuggingFace...")
     try:
         api = HfApi(token=HF_TOKEN)
@@ -2675,6 +2391,11 @@ async def gerar_ficheiros_finais():
                     api.upload_file(path_or_fileobj=fpath, path_in_repo=f"results/{prefix}_{ts_upload}.csv", repo_id=HF_CHECKPOINT_REPO, repo_type="dataset", token=HF_TOKEN)
                     dizer(f"  ✅ {prefix} enviado para HuggingFace")
                 except Exception as e: dizer(f"  ❌ ERRO upload {prefix}: {str(e)[:120]}")
+        if os.path.exists(SMTP_LOG):
+            try:
+                api.upload_file(path_or_fileobj=SMTP_LOG, path_in_repo=f"logs/smtp_audit_{GLOBAL['exec_id']}.txt", repo_id=HF_CHECKPOINT_REPO, repo_type="dataset", token=HF_TOKEN)
+                dizer("  ✅ smtp_log enviado para HuggingFace")
+            except Exception as e: dizer(f"  ❌ ERRO upload smtp_log: {str(e)[:120]}")
     except Exception as e: dizer(f"  ❌ ERRO geral no upload: {str(e)}")
 
 async def enviar_email_unico(dest, assunto, html, conta):
@@ -2687,85 +2408,36 @@ async def enviar_email_unico(dest, assunto, html, conta):
         except Exception: return False
         if not mx_list: return False
         for mx_host in mx_list[:3]:
-            with GLOBAL["pool_lock"]:
-                pool = list(GLOBAL["pool"])
-                for proxy_info in pool[:5]:
-                    ok, motivo = await enviar_email_smtp_async(999, proxy_info, conta, dest, mx_host, html)
-                    if ok: return True
-            ok, motivo = await enviar_email_smtp_async(999, None, conta, dest, mx_host, html)
-            if ok: return True
+            sock = _get_tunnel_socket(mx_host, 25)
+            if sock:
+                try:
+                    banner = _recv_smtp_raw(sock)
+                    if banner.startswith("220"):
+                        sock.sendall(f"EHLO {conta['identity_id']}\r\n".encode())
+                        _recv_smtp_raw(sock)
+                        sock.sendall(f"MAIL FROM:<{conta['sender_email']}>\r\n".encode())
+                        if _recv_smtp_raw(sock).startswith("250"):
+                            sock.sendall(f"RCPT TO:<{dest}>\r\n".encode())
+                            if _recv_smtp_raw(sock).startswith("250"):
+                                sock.sendall(b"DATA\r\n")
+                                if _recv_smtp_raw(sock).startswith("354"):
+                                    payload = aplicar_mutacao_abracadabra(html, conta, [dest])
+                                    if not payload.endswith(b"\r\n.\r\n"):
+                                        if not payload.endswith(b"\r\n"): payload += b"\r\n"
+                                        payload += b".\r\n"
+                                    sock.sendall(payload)
+                                    fr = _recv_smtp_raw(sock, timeout=30)
+                                    sock.sendall(b"QUIT\r\n")
+                                    sock.close()
+                                    if fr.startswith("250"): return True
+                except Exception: pass
+                finally:
+                    try: sock.close()
+                    except: pass
         return False
     except Exception as e:
         debug_log(f"enviar_email_unico: {traceback.format_exc()}")
         return False
-
-async def enviar_email_smtp_async(worker_id, proxy_info, conta, email, mx_host, html_base):
-    # Funcao simplificada para envio unico final
-    prov = email.split("@")[-1] if "@" in email else ""
-    timeout = SMTP_TIMEOUT_ASIATICO if prov in PROVEDORES_ASIATICOS else SMTP_TIMEOUT
-    try:
-        loop = asyncio.get_event_loop()
-        def _connect():
-            if proxy_info:
-                proto = proxy_info.get("proto", "socks5")
-                if proto in ('socks5', 'socks4'):
-                    s = socks.socksocket()
-                    if proto == 'socks5': s.set_proxy(socks.SOCKS5, proxy_info["ip"], proxy_info["port"])
-                    else: s.set_proxy(socks.SOCKS4, proxy_info["ip"], proxy_info["port"])
-                    s.settimeout(timeout)
-                    s.connect((mx_host, 25))
-                else:
-                    s = socket.socket()
-                    s.settimeout(timeout)
-                    s.connect((proxy_info["ip"], proxy_info["port"]))
-                    s.sendall(f"CONNECT {mx_host}:25 HTTP/1.1\r\nHost: {mx_host}\r\n\r\n".encode())
-                    r = s.recv(4096)
-                    if b"200" not in r:
-                        s.close()
-                        raise ConnectionError("CONNECT fail")
-                return s
-            else:
-                s = socket.socket()
-                s.settimeout(timeout)
-                s.connect((mx_host, 25))
-                return s
-                
-        sock = await asyncio.wait_for(loop.run_in_executor(None, _connect), timeout=timeout + 3)
-        banner = await smtp_send_recv(sock, None)
-        if not banner.startswith("220"):
-            sock.close()
-            return False, "BANNER_INVALIDO"
-            
-        resp = await smtp_send_recv(sock, f"EHLO {conta['identity_id']}\r\n")
-        resp = await smtp_send_recv(sock, f"MAIL FROM: <{conta['sender_email']}>\r\n")
-        if not resp.startswith("250"):
-            sock.close()
-            return False, "MAIL_FROM_REJEITADO"
-            
-        resp = await smtp_send_recv(sock, f"RCPT TO: <{email}>\r\n")
-        if not (resp.startswith("250") or resp.startswith("251")):
-            sock.close()
-            return False, "RCPT_REJEITADO"
-            
-        resp = await smtp_send_recv(sock, "DATA\r\n")
-        if not resp.startswith("354"):
-            sock.close()
-            return False, "DATA_REJEITADO"
-            
-        payload = aplicar_mutacao_abracadabra(html_base, conta, [email])
-        if not payload.endswith(b"\r\n"): payload += b"\r\n"
-        payload += b".\r\n"
-        
-        resp = await smtp_send_recv(sock, payload, timeout=30)
-        try:
-            await smtp_send_recv(sock, "QUIT\r\n")
-            sock.close()
-        except Exception: pass
-        
-        if resp.startswith("250"): return True, "OK"
-        else: return False, f"DATA_FINAL_{resp[:3]}"
-    except asyncio.TimeoutError: return False, "TIMEOUT"
-    except Exception as e: return False, f"ERRO_{str(e)[:50]}"
 
 async def salvar_logs_hf():
     if GLOBAL.get("logs_uploaded"): return
@@ -2816,47 +2488,41 @@ def limpar_logs_antigos(preservar_checkpoints=True, preservar_saida=False):
                 if os.path.exists(f): os.remove(f)
             except Exception: pass
 
-# === DASHBOARD LIVE ===
-async def render_dashboard_live():
-    ultimo_ticker, ultimo_painel = 0.0, 0.0
-    GLOBAL["aceites_hist"] = deque(maxlen=10)
+async def cli_status_printer():
+    """Substitui clear_output para compatibilidade com GitHub Actions CLI"""
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
-        agora = time.time()
-        if EM_GITHUB_ACTIONS:
-            if agora - ultimo_ticker >= 60:
-                GLOBAL["aceites_hist"].append(GLOBAL["smtp_aceites"])
-                print(linha_ticker(), flush=True)
-                ultimo_ticker = agora
-            if agora - ultimo_painel >= 900:
-                grupo(f"📊 PAINEL {datetime.now():%H:%M:%S} · {GLOBAL.get('fase_atual', '')[:30]}")
-                print(painel_completo(), flush=True)
-                fim_grupo()
-                ultimo_painel = agora
-            await asyncio.sleep(5)
-        else:
-            print(CLEAR_SCREEN, end="", flush=True)
-            print(painel_completo(), flush=True)
-            await asyncio.sleep(10)
+        print(painel_completo_cli(), flush=True)
+        await asyncio.sleep(30)
 
-# === MAIN ===
 async def main():
-    global LOG_FILE, SMTP_LOG, DEBUG_LOG
+    global LOG_FILE, SMTP_LOG, DEBUG_LOG, HF_TOKEN
     diagnostico_ambiente_hf()
+
+    if HF_TOKEN:
+        try:
+            api = HfApi(token=HF_TOKEN)
+            api.whoami()
+        except Exception:
+            print("⚠️ AVISO: Token HF inválido. A tentar acesso anónimo (repositórios públicos)...", flush=True)
+            HF_TOKEN = None
+
     execution_id = reset_global_state()
     garantir_diretorios()
+    iniciar_log_writer()  # Iniciar thread de escrita assíncrona
     n_baixados = download_all_checkpoints_from_hf()
     CHECKPOINT._carregar_tudo()
     config = CHECKPOINT.obter_config()
-    
+
     if config.get("status") == "COMPLETED":
         print("=" * 70, flush=True)
         print("[FIM] 🏁 A campanha ja foi totalmente concluida em execucao anterior.", flush=True)
         print("[FIM] Status: COMPLETED. A sair sem enviar nada.", flush=True)
         print("=" * 70, flush=True)
+        parar_log_writer()
         sys.exit(0)
-        
+
     tem_checkpoint = CHECKPOINT.existe_checkpoint()
-    if tem_checkpoint:
+    if tem_checkpoint and not MODO_AUDITORIA_LIMPA:
         print("", flush=True)
         print("=" * 70, flush=True)
         print("[RECUPERACAO] ♻️ Checkpoint detectado - a retomar execucao anterior", flush=True)
@@ -2901,107 +2567,82 @@ async def main():
         CHECKPOINT.salvar_config(execution_id, GLOBAL.get("ip_colab"), status="RUNNING", campaign_id=GLOBAL.get("campaign_id"))
         limpar_logs_antigos(preservar_checkpoints=True, preservar_saida=True)
     else:
-        dizer(f"[CHECKPOINT] ℹ️ Nenhum checkpoint (baixados da HF: {n_baixados}) - execucao NOVA")
+        dizer(f"[CHECKPOINT] ℹ️ Execucao NOVA (Modo Auditoria Limpa)")
         GLOBAL["campaign_id"] = f"camp_{int(time.time())}"
         GLOBAL["campaign_started_at"] = datetime.now().isoformat()
         limpar_logs_antigos(preservar_checkpoints=False, preservar_saida=False)
-        
+
     LOG_FILE = os.path.join(LOG_DIR, f"log_{execution_id}.txt")
     SMTP_LOG = os.path.join(LOG_DIR, f"smtp_{execution_id}.txt")
     DEBUG_LOG = os.path.join(LOG_DIR, f"debug_{execution_id}.txt")
-    
+
     try:
         open(LOG_FILE, "w", encoding="utf-8").close()
         open(SMTP_LOG, "w", encoding="utf-8").close()
         open(DEBUG_LOG, "w", encoding="utf-8").close()
         open(DESEC_LOG, "w", encoding="utf-8").close()
     except Exception: pass
-    
+
     GLOBAL["user_unknowns_file"] = UNKNOWN_FILE_LOCAL
-    
-    dashboard_task = asyncio.create_task(render_dashboard_live())
+
+    dashboard_task = asyncio.create_task(cli_status_printer())
     checkpoint_task = asyncio.create_task(periodic_checkpoint_thread_async())
     timelimit_task = asyncio.create_task(time_limit_watcher_async())
-    
+
     await asyncio.sleep(1)
-    dizer(f"🚀 VERISCOPE V21.1.0 ASYNCIO [{execution_id}]")
+    dizer(f"🚀 VERISCOPE V21.3.0 ASYNCIO [{execution_id}] - HIERARQUIA PARALELA")
     dizer(f"🏷️ Campaign ID: {GLOBAL.get('campaign_id')}")
-    dizer(f"🔄 Modo: {'RECUPERACAO' if tem_checkpoint else 'NOVO'}")
-    dizer(f"⚙️ Workers: {WORKERS_ENVIO_ASYNC} (Auditoria Hierarquica)")
-    dizer(f"📥 Download: {WORKERS_DOWNLOAD_ASYNC} | 🔍 Validacao: {WORKERS_VALIDACAO_ASYNC}")
-    
-    if tem_checkpoint:
-        dizer(f"  🏆 Aceites recuperados: {GLOBAL['smtp_aceites']:,}")
-        dizer(f"  📤 Tentativas recuperadas: {GLOBAL['smtp_tentativas']:,}")
-        dizer(f"  🔌 Proxies no pool: {len(GLOBAL['pool'])}")
-        dizer(f"  👻 User unknowns: {len(GLOBAL['user_unknowns']):,}")
-        
+    dizer(f"🔄 Modo: {'RECUPERACAO' if tem_checkpoint and not MODO_AUDITORIA_LIMPA else 'NOVO LIMPO'}")
+    dizer(f"📊 RCPT_LIMITS_MAX: {RCPT_LIMITS_MAX}")
+    dizer(f"🔌 Túnel Semaphore: {MAX_CONCURRENT_TUNNELS}")
+
     await baixar_ficheiros_campanha()
     contas, html_base, mxs = [], "", {}
-    
+
     try:
         ip_colab = await obter_ip_colab()
         CHECKPOINT.salvar_config(execution_id, ip_colab, status="RUNNING", campaign_id=GLOBAL.get("campaign_id"))
         GLOBAL["status"] = "RUNNING"
         await verificar_blacklists(ip_colab)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
+
         await testar_tokens_desec()
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
+
         contas = await carregar_contas_inteligente()
         html_base = await carregar_template()
         await carregar_mail_from_variations()
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
+
         provedores = await descobrir_provedores_reais()
         mxs = await resolver_mxs_paralelo(provedores)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
+
         await baixar_todos_emails_paralelo(sorted(mxs.keys()))
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
+
         definir_fase("🚫 FASE 2D - Blacklist persistente de USER_UNKNOWN")
         await baixar_unknowns_acumulado()
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
-        definir_fase("🕵️‍♂️ FASE 2.5 - Proxies: scraping + validacao massiva")
-        pool_ok = False
-        if len(GLOBAL["pool"]) >= MIN_PROXIES_REFILL:
-            dizer(f"  ♻️ Pool recuperado: {len(GLOBAL['pool'])} proxies")
-            vivos = await revalidar_pool_recuperado()
-            if vivos >= MIN_PROXIES_REFILL:
-                pool_ok = True
-                marcar_fase("FASE25_PROXIES", True, f"pool revalidado {vivos}")
-            else: dizer(f"  💀 Pool morreu ({vivos} vivos) - scraping novo")
-                
-        if not pool_ok:
-            try: await carregar_e_scrapear_proxies_async(motivo="inicial")
-            except Exception as e: dizer(f"  ⚠️ AVISO: scraping falhou ({str(e)[:140]})")
-            try: await validar_proxies_ate_target_async(TARGET_VALID_PROXIES)
-            except Exception as e: dizer(f"  ⚠️ AVISO: validacao falhou ({str(e)[:140]})")
-                
-        with GLOBAL["pool_lock"]: n_pool = len(GLOBAL["pool"])
-        with GLOBAL["raw_lock"]: n_raw = len(GLOBAL["raw_proxies"])
-        proxy_ok = (n_pool > 0) or (n_raw > 0)
-        marcar_fase("FASE25_PROXIES", proxy_ok, f"pool={n_pool} raw={n_raw:,}")
-        if n_pool == 0:
-            dizer("  ⚠️ AVISO: pool vazio. Sem proxies nao ha envio.")
-            
+
+        definir_fase("🕵️‍♂️ FASE 2.5 - Proxies: Aracloud Tunnel Only")
+        await carregar_e_scrapear_proxies_async(motivo="inicial")
+        marcar_fase("FASE25_PROXIES", True, f"Tunnel Aracloud Ativo")
+
         GLOBAL["scraping_inicial_feito"] = True
         GLOBAL["ultimo_rescrape"] = time.time()
         monitor_task = asyncio.create_task(monitor_proxies_continuo_async())
-        
+
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
         await fase3_dns_completo_async(contas)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
+
         await fase4_esperar_propagacao()
         await verificar_propagacao_amostra(contas, ip_colab)
         if GLOBAL.get("emergency_stop"): raise KeyboardInterrupt()
-        
-        await fase6_validacao_provedores(mxs, contas, html_base)
-        
+
+        await fase6_paralelismo_hierarquico(mxs, contas, html_base)
+
     except KeyboardInterrupt:
         GLOBAL["emergency_stop"] = True
         dizer("🛑 Interrompido pelo utilizador")
@@ -3017,7 +2658,7 @@ async def main():
                 task.cancel()
                 try: await task
                 except asyncio.CancelledError: pass
-                
+
         try:
             dizer("[CHECKPOINT] 💾 Salvamento final...")
             salvar_checkpoint_smtp()
@@ -3034,24 +2675,18 @@ async def main():
             dizer(f"[CHECKPOINT] ✅ {ok_count} ficheiros salvos com manifesto")
             upload_all_checkpoints_to_hf()
             dizer("[CHECKPOINT] ☁️ Estado salvo e enviado para HF")
-            
-            # Copiar SMTP LOG para output local (Artefato)
-            if os.path.exists(SMTP_LOG):
-                shutil.copy(SMTP_LOG, "/content/smtp_log_audit.txt")
-                dizer("📥 Log SMTP copiado para /content/smtp_log_audit.txt (Pronto para Download)")
-                
         except Exception as e:
             dizer(f"❌ ERRO ao salvar checkpoint final: {str(e)}")
             debug_log(f"checkpoint final: {traceback.format_exc()}")
-            
+
         try: await gerar_ficheiros_finais()
         except Exception as e: dizer(f"❌ ERRO ao gerar ficheiros finais: {str(e)}")
-        
+
         rt = {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0, "via_proxy": 0, "via_colab": 0, "por_provedor": GLOBAL["por_provedor"]}
         for r in GLOBAL["por_provedor"].values():
             for k in ("aceites", "tentados", "rejeitados", "erros", "via_proxy", "via_colab"):
                 if k in r: rt[k] += r[k]
-                
+
         if rt["aceites"] == 0:
             rt["aceites"] = GLOBAL.get("smtp_aceites", 0)
             rt["tentados"] = GLOBAL.get("smtp_tentativas", 0)
@@ -3059,7 +2694,7 @@ async def main():
             rt["erros"] = GLOBAL.get("smtp_erros", 0)
             rt["via_proxy"] = GLOBAL.get("smtp_via_proxy", 0)
             rt["via_colab"] = GLOBAL.get("smtp_via_colab", 0)
-            
+
         if GLOBAL.get("emergency_stop"): dizer("🛑 Paragem de emergencia - estado guardado")
         else:
             dizer(f"📧 FASE 7 - Relatorio final para {FINAL_DESTINATARIO}")
@@ -3068,21 +2703,25 @@ async def main():
                 ok1 = await enviar_email_unico(FINAL_DESTINATARIO, CAMPAIGN["subject"], html_base, cf)
                 dizer(f"  📨 Email da campanha: {'✅ OK' if ok1 else '❌ FALHOU'}")
                 await asyncio.sleep(5)
-                
+
         try: await upload_unknowns_hf()
         except Exception: pass
         try: await salvar_logs_hf()
         except Exception: pass
-        
+
+        # Parar log writer e fazer flush final
+        parar_log_writer()
+        time.sleep(1)  # Aguardar flush final
+
         taxa = rt['aceites'] / max(1, rt['tentados']) * 100
         print("", flush=True)
         print("=" * 70, flush=True)
         print(f"🏁 EXECUCAO TERMINADA - {GLOBAL.get('exec_id')}", flush=True)
         print(f"  🏷️ Campaign ID     : {GLOBAL.get('campaign_id')}", flush=True)
         print(f"  🏆 Aceites (250 OK): {rt['aceites']:,}", flush=True)
-        print(f"  📤 Tentativas      : {rt['tentados']:,}", flush=True)
+        print(f"  📤 RCPTs Tentados  : {rt['tentados']:,} (CONTAGEM CORRETA)", flush=True)
         print(f"  📊 Taxa            : {taxa:.2f}%", flush=True)
-        print(f"  🔌 Via proxy       : {rt['via_proxy']:,}", flush=True)
+        print(f"  🔌 Via Tunnel      : {rt['via_proxy']:,}", flush=True)
         print(f"  🖥️ Via Colab       : {rt['via_colab']:,}", flush=True)
         print(f"  🌐 Pool final      : {len(GLOBAL['pool'])}/{TARGET_VALID_PROXIES}", flush=True)
         print(f"  🚫 Banidos         : {GLOBAL['proxies_banidos']}", flush=True)
@@ -3090,11 +2729,17 @@ async def main():
         print(f"  📦 Parquets        : {GLOBAL['pq_downloaded']}/{GLOBAL['pq_total']}", flush=True)
         print(f"  🧬 DNS confirmado  : {GLOBAL.get('dns_updated', 0)}/{GLOBAL.get('dns_total', 0)}", flush=True)
         print(f"  🌐 DESec Requests  : {GLOBAL.get('desec_requests', 0)} | OK: {GLOBAL.get('desec_success', 0)}", flush=True)
-        print(f"  📊 SMTP Log Local  : /content/smtp_log_audit.txt", flush=True)
+        print(f"  🔄 Retries 421/452 : {GLOBAL.get('smtp_retries', 0)}", flush=True)
+        print(f"  📊 SMTP Log Local  : /content/smtp_log_audit.txt (LOG COMPLETO)", flush=True)
         print(f"  🔄 MODO RECUPERACAO: {'♻️ SIM' if GLOBAL.get('modo_recuperacao') else '❌ NAO'}", flush=True)
         print(f"  🏁 STATUS FINAL    : {GLOBAL.get('status', 'UNKNOWN')}", flush=True)
         print("=" * 70, flush=True)
         anotacao("notice", f"Run terminou: {rt['aceites']:,} aceites · checkpoint enviado p/ HF")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Execução interrompida manualmente pelo utilizador.", flush=True)
+    except Exception as e:
+        print(f"\n❌ ERRO FATAL NA EXECUÇÃO: {e}", flush=True)
