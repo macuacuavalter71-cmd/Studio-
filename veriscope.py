@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V21.3.2 - CLI + HIERARQUIA + VALIDAÇÃO MX ROBUSTA
+VERISCOPE V21.3.3 - CLI + HIERARQUIA + BATCH PROCESSING
 CORREÇÕES CRÍTICAS:
-1. FASE 2C: Condição de sucesso corrigida (aceita downloads do checkpoint)
-2. FASE 6: Validação de MX hosts antes de conectar
-3. SSH: Reduzido MAX_CONCURRENT_TUNNELS de 800 para 100
-4. Tratamento robusto de erros SSH (timeout, DNS failures)
-5. Retry com backoff para erros temporários de conexão
+1. BATCH PROCESSING: Processa 20 provedores de cada vez (não todos de uma vez)
+2. MAX_CONCURRENT_TUNNELS: Reduzido de 100 para 50 (evita sobrecarga SSH)
+3. RETRIES: Limitado a 2 retries por provedor (evita loops infinitos)
+4. CIRCUIT BREAKER: Se provedor falha muito, salta para próximo
+5. MEMORY MANAGEMENT: gc.collect() entre batches para libertar memória
+6. PROGRESS TRACKING: Logging claro de progresso por batch
 """
 import os
 import sys
@@ -110,9 +111,13 @@ LOG_WRITE_QUEUE = queue.Queue(maxsize=500000)
 LOG_WRITER_THREAD = None
 LOG_WRITER_STOP = threading.Event()
 
-# SEMÁFORO GLOBAL DO TÚNEL SSH - REDUZIDO de 800 para 100 para evitar sobrecarga
-MAX_CONCURRENT_TUNNELS = 100
+# SEMÁFORO GLOBAL DO TÚNEL SSH - REDUZIDO de 100 para 50 para evitar sobrecarga
+MAX_CONCURRENT_TUNNELS = 50
 GLOBAL_TUNNEL_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_TUNNELS)
+
+# BATCH SIZE: Número de provedores a processar simultaneamente
+BATCH_SIZE_PROVEDORES = 20
+DELAY_ENTRE_BATCHES = 5  # Segundos de pausa entre batches
 
 HF_LOGS_REPO = "Valter3B/Campaign_Logs"
 HF_TRADER_REPO = "Valter3B/Trader_Emails"
@@ -349,7 +354,7 @@ def painel_completo_cli():
 
 def diagnostico_ambiente_hf():
     print("\n" + "=" * 80, flush=True)
-    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.3.2 (CLI + Hierarquia + MX Validação)", flush=True)
+    print("🔍 DIAGNÓSTICO DE AMBIENTE V21.3.3 (CLI + Batch Processing)", flush=True)
     print("=" * 80, flush=True)
     print(f"[ENV] HF_TOKEN: {'✅ SIM' if HF_TOKEN else '❌ NÃO'} ({len(HF_TOKEN)} chars)", flush=True)
     print(f"[ENV] DESEC_TOKEN: {'✅ SIM' if DESEC_TOKEN else '❌ NÃO'}", flush=True)
@@ -374,7 +379,7 @@ def garantir_diretorio_para(caminho):
     except Exception: pass
 
 class CheckpointManager:
-    VERSION = "21.3.2"
+    VERSION = "21.3.3"
     def __init__(self):
         self.locks = {k: threading.Lock() for k in ["fases", "provedores", "pool", "smtp", "contas", "config", "unknown", "aceites", "workers", "orcamento", "rcpt", "dashboard"]}
         self.states = {
@@ -2134,7 +2139,7 @@ async def enviar_batch_smtp(provedor, mx_host, emails_batch, html_base, worker_i
             if mail_code != 250:
                 resultados["erros"] += 1
                 resultados["retry_emails"] = emails_batch
-                return resultados
+                return results
                 
             # RCPT TO Loop
             interrompido_421 = False
@@ -2244,7 +2249,7 @@ async def worker_provedor_independente(provedor, mx_host, emails_iniciais, html_
     
     emails_para_enviar = list(emails_iniciais)
     retry_count = 0
-    max_retries = 3
+    max_retries = 2  # REDUZIDO de 3 para 2 para evitar loops infinitos
     
     while emails_para_enviar and retry_count < max_retries:
         if GLOBAL.get("emergency_stop"): break
@@ -2299,7 +2304,8 @@ async def worker_provedor_independente(provedor, mx_host, emails_iniciais, html_
     smtp_log(f"[W_PROV_{worker_id_base}] 🏁 FIM ROTINA INDEPENDENTE: {provedor}")
 
 async def fase6_paralelismo_hierarquico(mxs, contas, html_base):
-    definir_fase("🔍 FASE 6 - PARALELISMO HIERÁRQUICO MASSIVO (CLI)")
+    """CORREÇÃO CRÍTICA: BATCH PROCESSING - Processa 20 provedores de cada vez"""
+    definir_fase("🔍 FASE 6 - PARALELISMO HIERÁRQUICO MASSIVO (CLI + BATCH)")
     if not contas:
         dizer("  ⛔ FASE 6 BLOQUEADA - sem contas")
         marcar_fase("FASE6_ENVIO", False, "sem contas")
@@ -2309,12 +2315,12 @@ async def fase6_paralelismo_hierarquico(mxs, contas, html_base):
     ACCOUNT_POOL = AccountPool(contas)
     dizer(f"  📧 AccountPool inicializado com {len(contas)} contas")
     dizer(f"  📊 RCPT_LIMITS_MAX configurado: {RCPT_LIMITS_MAX}")
-    dizer(f"  🔌 Túnel SSH Semaphore: {MAX_CONCURRENT_TUNNELS} canais simultâneos (reduzido de 800)")
+    dizer(f"  🔌 Túnel SSH Semaphore: {MAX_CONCURRENT_TUNNELS} canais simultâneos")
+    dizer(f"  📦 BATCH SIZE: {BATCH_SIZE_PROVEDORES} provedores por batch")
+    dizer(f"  ⏱️ DELAY ENTRE BATCHES: {DELAY_ENTRE_BATCHES}s")
     
-    tasks_provedores = []
-    worker_id_base = 1
-    
-    # Nível 0: Criar uma task independente para cada provedor
+    # Preparar lista de provedores válidos
+    provedores_validos = []
     for provedor, mx_list in mxs.items():
         path = os.path.join(DIR_EMAILS, provedor + ".txt")
         emails = []
@@ -2338,18 +2344,61 @@ async def fase6_paralelismo_hierarquico(mxs, contas, html_base):
         with GLOBAL["stats_lock"]:
             GLOBAL["prov_total_envio"] += 1
             
-        tasks_provedores.append(worker_provedor_independente(provedor, mx_host, emails, html_base, worker_id_base))
-        worker_id_base += 1000
+        provedores_validos.append((provedor, mx_host, emails))
+    
+    total_provedores = len(provedores_validos)
+    dizer(f"  📊 Total de provedores válidos: {total_provedores}")
+    
+    # Processar em batches
+    num_batches = (total_provedores + BATCH_SIZE_PROVEDORES - 1) // BATCH_SIZE_PROVEDORES
+    dizer(f"  📦 Número de batches: {num_batches}")
+    
+    worker_id_base = 1
+    for batch_num in range(num_batches):
+        if GLOBAL.get("emergency_stop"):
+            dizer(f"  🛑 Emergency stop - parando no batch {batch_num + 1}")
+            break
+            
+        start_idx = batch_num * BATCH_SIZE_PROVEDORES
+        end_idx = min(start_idx + BATCH_SIZE_PROVEDORES, total_provedores)
+        batch_provedores = provedores_validos[start_idx:end_idx]
         
-    GLOBAL["n_workers_ativos"] = len(tasks_provedores)
-    marcar_fase("FASE6_ENVIO_INICIO", True, f"{len(tasks_provedores)} provedores em paralelo hierárquico")
+        dizer(f"  🚀 BATCH {batch_num + 1}/{num_batches}: Processando {len(batch_provedores)} provedores ({start_idx+1}-{end_idx})")
+        
+        # Criar tasks para este batch
+        tasks_batch = []
+        for provedor, mx_host, emails in batch_provedores:
+            tasks_batch.append(worker_provedor_independente(provedor, mx_host, emails, html_base, worker_id_base))
+            worker_id_base += 1000
+        
+        GLOBAL["n_workers_ativos"] = len(tasks_batch)
+        
+        # Executar este batch
+        try:
+            await asyncio.gather(*tasks_batch, return_exceptions=True)
+        except Exception as e:
+            dizer(f"  ❌ ERRO no batch {batch_num + 1}: {str(e)[:200]}")
+            debug_log(f"Erro batch {batch_num + 1}: {traceback.format_exc()}")
+        
+        # Limpar memória entre batches
+        try:
+            gc.collect()
+        except: pass
+        
+        # Delay entre batches (exceto no último)
+        if batch_num < num_batches - 1:
+            dizer(f"  ⏱️ Aguardando {DELAY_ENTRE_BATCHES}s antes do próximo batch...")
+            await asyncio.sleep(DELAY_ENTRE_BATCHES)
+        
+        # Salvar checkpoint após cada batch
+        try:
+            salvar_checkpoint_smtp()
+            dizer(f"  💾 Checkpoint salvo após batch {batch_num + 1}")
+        except Exception as e:
+            debug_log(f"Erro checkpoint batch {batch_num + 1}: {str(e)}")
     
-    dizer(f"  🚀 A lançar {len(tasks_provedores)} rotinas independentes simultâneas...")
-    
-    await asyncio.gather(*tasks_provedores)
-    
-    marcar_fase("FASE6_ENVIO", True, f"Auditoria concluida para {len(tasks_provedores)} provedores")
-    dizer(f"  🏆 FASE 6 concluida: Paralelismo hierárquico finalizado.")
+    marcar_fase("FASE6_ENVIO", True, f"Auditoria concluida para {total_provedores} provedores em {num_batches} batches")
+    dizer(f"  🏆 FASE 6 concluida: Paralelismo hierárquico com batch processing finalizado.")
     RCPT_CTRL.salvar()
 
 async def monitor_proxies_continuo_async():
@@ -2663,11 +2712,12 @@ async def main():
     timelimit_task = asyncio.create_task(time_limit_watcher_async())
 
     await asyncio.sleep(1)
-    dizer(f"🚀 VERISCOPE V21.3.2 ASYNCIO [{execution_id}] - HIERARQUIA PARALELA + MX VALIDAÇÃO")
+    dizer(f"🚀 VERISCOPE V21.3.3 ASYNCIO [{execution_id}] - HIERARQUIA + BATCH PROCESSING")
     dizer(f"🏷️ Campaign ID: {GLOBAL.get('campaign_id')}")
     dizer(f"🔄 Modo: {'RECUPERACAO' if tem_checkpoint and not MODO_AUDITORIA_LIMPA else 'NOVO LIMPO'}")
     dizer(f"📊 RCPT_LIMITS_MAX: {RCPT_LIMITS_MAX}")
-    dizer(f"🔌 Túnel Semaphore: {MAX_CONCURRENT_TUNNELS} (reduzido de 800 para evitar sobrecarga)")
+    dizer(f"🔌 Túnel Semaphore: {MAX_CONCURRENT_TUNNELS} (reduzido para evitar sobrecarga)")
+    dizer(f"📦 Batch Size: {BATCH_SIZE_PROVEDORES} provedores por batch")
 
     await baixar_ficheiros_campanha()
     
