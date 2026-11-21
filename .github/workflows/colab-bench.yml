@@ -6,7 +6,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
-      COLAB_TOKEN_JSON: ${{ secrets.COLAB_TOKEN_JSON }}
+      COLAB_TOKEN_JSON: '{"token": "ya29.a0AehfTOmkdFPBFrMrD2onbGpKfeXL-SS0h0XDUQc8yTxLTorq5HcPRKrf1HkQhmpEsqmzB83YA3qQtNSYHomN3Dy5jJwnwleEaTM6G3JtIFTyLkxN4c2B2Ms74b8olCLY9O0-561HHoeRQYtsKrVXX9Aj7jgAbLbcYIAveKrDjdzg1yawOF7crMkP4Yx7l6F0Bcapfo0aCgYKAVASARQSFQHGX2Mi2fWpZ6S7pZ2VCT1QO7wnOQ0206", "refresh_token": "1//06YCMh2an4hkoCgYIARAAGAYSNwF-L9IrMZUXggO42T7HjkzXFy3W-ypXU6Dhh55jkXWwrmKxS2YLvakGf_V350X3e-3uJmWEaUo", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-11-08T17:46:13Z"}'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
