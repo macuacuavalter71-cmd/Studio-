@@ -16,10 +16,22 @@ jobs:
       - name: Instalar Colab CLI
         run: pip install google-colab-cli
 
-      - name: Credenciais
+      - name: Credenciais (ADC)
         run: |
-          mkdir -p ~/.config/colab-cli
-          echo "$COLAB_TOKEN_JSON" > ~/.config/colab-cli/auth.json
+          python - <<'EOF'
+          import json, os
+          t = json.loads(os.environ["COLAB_TOKEN_JSON"])
+          adc = {
+            "type": "authorized_user",
+            "client_id": t["client_id"],
+            "client_secret": t["client_secret"],
+            "refresh_token": t["refresh_token"],
+          }
+          p = os.path.expanduser("~/adc.json")
+          json.dump(adc, open(p, "w"))
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"GOOGLE_APPLICATION_CREDENTIALS={p}\n")
+          EOF
 
       - name: Benchmark no runner do GitHub (referência)
         run: python bench.py
@@ -27,5 +39,5 @@ jobs:
       - name: Benchmark na VM do Colab
         run: |
           START=$(date +%s)
-          colab run bench.py
-          echo "Tempo total (provisionar+correr+destruir): $(( $(date +%s) - START ))s"
+          colab --auth adc --logtostderr run bench.py
+          echo "Tempo total: $(( $(date +%s) - START ))s"
