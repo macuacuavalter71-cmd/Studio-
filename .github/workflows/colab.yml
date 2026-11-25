@@ -1,14 +1,14 @@
-name: VERISCOPE V23 - Operação Hydra🎉🎉📧
+name: VERISCOPE V23 - Operação Hydra
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'   # A cada 6 horas (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
 
 jobs:
   enviar:
     runs-on: ubuntu-latest
-    timeout-minutes: 355     # 5h55m (margem de 15min sobre o shutdown 5h40m)
+    timeout-minutes: 355
     
     env:
       PYTHONUNBUFFERED: "1"
@@ -28,15 +28,14 @@ jobs:
       - name: Instalar Google Colab CLI e dependências
         run: |
           python -m pip install --upgrade pip
-          pip install -q google-colab-cli requests dnspython dkimpy \
-            cryptography pandas pyarrow huggingface_hub psutil pysocks paramiko
+          pip install -q google-colab-cli requests dnspython dkimpy cryptography pandas pyarrow huggingface_hub psutil pysocks paramiko
 
-      - name: Restaurar credenciais Colab (JSON direto no workflow)
+      - name: Restaurar credenciais Colab
+        env:
+          COLAB_TOKEN_JSON: '{"token": "ya29.a0AehfTOnT-bpLFPb1hwfdDrUlFXgzRKzgy2JWPhLr7pCHuDEKx0pigceIIcfBqe2qhIYCa6WGLoSftIlWCtVVnMKmK0GKKCMLLjwlbhOQIatq8iHm9_RmEZBV2J6AYSx1r0M-W6dF3WGa4JfHkn0u_RDou96Vv__vvZxEzRbW7fzB9p7EZgq_J7wf9fHqR_SvqqSRDb8aCgYKAQASARQSFQHGX2MiyuuzZy8i7XV0v1nQqyVHsQ0206", "refresh_token": "1//04LtHWplmfl6VCgYIARAAGAQSNwF-L9Irg5ffVeGPbmbVBKv7H22rSbGNHmb_5OZRDihoSvsitKIlgu_mnvrR8rK157V2c9V6Lyc", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-11-05T10:32:53Z"}'
         run: |
           mkdir -p ~/.config/colab-cli
-          cat > ~/.config/colab-cli/token.json <<'TOKEN_EOF'
-{"token": "ya29.a0AehfTOnT-bpLFPb1hwfdDrUlFXgzRKzgy2JWPhLr7pCHuDEKx0pigceIIcfBqe2qhIYCa6WGLoSftIlWCtVVnMKmK0GKKCMLLjwlbhOQIatq8iHm9_RmEZBV2J6AYSx1r0M-W6dF3WGa4JfHkn0u_RDou96Vv__vvZxEzRbW7fzB9p7EZgq_J7wf9fHqR_SvqqSRDb8aCgYKAQASARQSFQHGX2MiyuuzZy8i7XV0v1nQqyVHsQ0206", "refresh_token": "1//04LtHWplmfl6VCgYIARAAGAQSNwF-L9Irg5ffVeGPbmbVBKv7H22rSbGNHmb_5OZRDihoSvsitKIlgu_mnvrR8rK157V2c9V6Lyc", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-11-05T10:32:53Z"}
-TOKEN_EOF
+          printf '%s' "$COLAB_TOKEN_JSON" > ~/.config/colab-cli/token.json
           chmod 600 ~/.config/colab-cli/token.json
           echo "✅ Token gravado ($(wc -c < ~/.config/colab-cli/token.json) bytes)"
 
