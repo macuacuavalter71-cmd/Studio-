@@ -212,11 +212,28 @@ RCPT_LIMITS = {
 
 RCPT_DEFAULT = 50
 
-# V23.0 - GRUPO D: REMOVIDO - agora enviamos para TODOS os 66 provedores
-# Anteriormente descartados: libero.it, virgilio.it, live.co.uk, yandex.net,
-# vipmail.net, clearwire.net, i.ua, rambler.ru, love.com, univision.com, qip.ru
-PROVEDORES_DESCARTAR = set()  # Conjunto vazio = nenhum descarte
-
+# V23.0 - Lista EXATA dos 66 provedores testados na V22.3.0
+PROVEDORES_66_TESTADOS = {
+    # GRUPO A (20)
+    "telkomsa.net", "rock.com", "walla.com", "sprintpcs.com", "pisem.net",
+    "oranga.fr", "bebo.com", "cemsmail.org", "dreamwiz.com", "google.com",
+    "googlemail.com", "youtube.com", "bk.ru", "inbox.ru", "list.ru",
+    "mail.ru", "ukr.net", "yahoo.co.jp", "nate.com", "yeah.net",
+    # GRUPO B (25)
+    "telus.net", "student.gccisd.net", "amorki.pl", "poczta.onet.pl",
+    "onet.eu", "onet.pl", "op.pl", "freemail.hu", "myemailboxmail.com",
+    "trbvm.com", "ya.ru", "qq.com", "vip.qq.com", "foxmail.com",
+    "naver.com", "eyou.com", "email.cz", "hot.com", "breakthru.com",
+    "clear.net.nz", "pchome.com.tw", "yandex.com", "poczta.pl",
+    "terra.com.br", "yandex.ru", "dodgeit.com",
+    # GRUPO C (5)
+    "seznam.cz", "gmail.com", "interia.eu", "interia.pl", "poczta.fm",
+    # GRUPO D (11) - agora incluídos
+    "libero.it", "virgilio.it", "live.co.uk", "yandex.net", "vipmail.net",
+    "clearwire.net", "i.ua", "rambler.ru", "love.com", "univision.com", "qip.ru",
+    # GRUPO E (3)
+    "21cn.com", "docomo.ne.jp", "gaggle.net",
+}
 # V23.0 - Provedores greylist (retry 2min/4min)
 PROVEDORES_GREYLIST = {"seznam.cz", "gmail.com", "i.ua"}
 
