@@ -224,13 +224,12 @@ PROVEDORES_GREYLIST = {"seznam.cz", "gmail.com", "i.ua"}
 PROVEDORES_TRACKING_IP = {"qq.com", "vip.qq.com", "foxmail.com"}
 
 PROVEDORES_ASIATICOS = {
-    "naver.com", "hanmail.net", "daum.net", "korea.com", "lycos.co.kr",
-    "nate.com", "empal.com", "dreamwiz.com",
-    "qq.com", "foxmail.com", "vip.qq.com", "163.com", "126.com", "yeah.net",
-    "sohu.com", "sina.com", "tom.com", "21cn.com", "eyou.com",
-    "ezweb.ne.jp", "i.softbank.jp", "docomo.ne.jp", "softbank.ne.jp",
-    "yahoo.co.jp", "hotmail.co.jp",
-    "pchome.com.tw", "kimo.com", "yahoo.com.tw"
+    "naver.com", "nate.com", "dreamwiz.com",
+    "qq.com", "foxmail.com", "vip.qq.com", "yeah.net",
+    "21cn.com", "eyou.com",
+    "docomo.ne.jp",
+    "yahoo.co.jp",
+    "pchome.com.tw",
 }
 
 CAMPAIGN_MAP = {
