@@ -1832,11 +1832,11 @@ def descobrir_provedores_reais():
             if len(parts) >= 2 and parts[1]:
                 provs.add(parts[1])
 
-        # ============================================================
-    # V23.0 - 66 PROVEDORES SEM EXCEÇÃO (GRUPO D agora incluído)
+            # ============================================================
+    # V23.0 - FILTRAR APENAS os 66 provedores testados
     # ============================================================
-    # Removido filtro PROVEDORES_DESCARTAR - enviamos para todos os 66
-    dizer("  V23.0: " + str(len(provs)) + " provedores activos (sem descartes)")
+    provs = provs.intersection(PROVEDORES_66_TESTADOS)
+    dizer("  V23.0: " + str(len(provs)) + " provedores activos (filtrado para 66)")
 
     GLOBAL["prov_total"] = len(provs)
     dizer("Provedores descobertos: " + str(len(provs)))
