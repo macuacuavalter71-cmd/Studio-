@@ -223,14 +223,13 @@ RCPT_LIMITS = {
 
 RCPT_DEFAULT = 50
 
-# V23.0 - GRUPO D: Provedores a descartar (blacklist / erro conexão / lista suja)
-PROVEDORES_DESCARTAR = {
-    "libero.it", "virgilio.it", "live.co.uk", "yandex.net", "vipmail.net",
-    "clearwire.net", "i.ua", "rambler.ru", "love.com", "univision.com", "qip.ru",
-}
+# V23.0 - GRUPO D: REMOVIDO - agora enviamos para TODOS os 66 provedores
+# Anteriormente descartados: libero.it, virgilio.it, live.co.uk, yandex.net,
+# vipmail.net, clearwire.net, i.ua, rambler.ru, love.com, univision.com, qip.ru
+PROVEDORES_DESCARTAR = set()  # Conjunto vazio = nenhum descarte
 
 # V23.0 - Provedores greylist (retry 2min/4min)
-PROVEDORES_GREYLIST = {"seznam.cz", "gmail.com"}
+PROVEDORES_GREYLIST = {"seznam.cz", "gmail.com", "i.ua"}
 
 # V23.0 - Provedores com tracking por IP (rotação agressiva)
 PROVEDORES_TRACKING_IP = {"qq.com", "vip.qq.com", "foxmail.com"}
@@ -1823,14 +1822,11 @@ def descobrir_provedores_reais():
             if len(parts) >= 2 and parts[1]:
                 provs.add(parts[1])
 
+        # ============================================================
+    # V23.0 - 66 PROVEDORES SEM EXCEÇÃO (GRUPO D agora incluído)
     # ============================================================
-    # V23.0 - Filtrar provedores descartados (GRUPO D)
-    # ============================================================
-    antes = len(provs)
-    provs = {p for p in provs if p not in PROVEDORES_DESCARTAR}
-    descartados = antes - len(provs)
-    if descartados > 0:
-        dizer("  V23.0: " + str(descartados) + " provedores descartados (GRUPO D)")
+    # Removido filtro PROVEDORES_DESCARTAR - enviamos para todos os 66
+    dizer("  V23.0: " + str(len(provs)) + " provedores activos (sem descartes)")
 
     GLOBAL["prov_total"] = len(provs)
     dizer("Provedores descobertos: " + str(len(provs)))
@@ -4493,13 +4489,12 @@ def fase_envio_massivo(mxs, contas, html_base):
         marcar_fase("FASE6_ENVIO", False, "0 IPs Aracloud")
         return
 
-    # Filtrar provedores: apenas usáveis e com emails
+        # V23.0 - 66 PROVEDORES SEM EXCEÇÃO
     provedores_prontos = []
     for prov, mx_list in mxs.items():
         if not mx_list:
             continue
-        if prov in PROVEDORES_DESCARTAR:
-            continue
+        # Removido: if prov in PROVEDORES_DESCARTAR: continue
         path = os.path.join(DIR_EMAILS, prov + ".txt")
         if os.path.exists(path) and os.path.getsize(path) > 0:
             cp_info = CHECKPOINT.obter_provedor_index(prov)
