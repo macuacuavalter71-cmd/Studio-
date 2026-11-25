@@ -2619,7 +2619,7 @@ class AracloudManager:
 
         try:
             r = requests.post(
-                self.auth_url + "/servers/" + server_id + "/action",
+                self.compute_urls.get(nome_conta, self.auth_url) + "/servers/" + server_id + "/action",
                 headers={"X-Auth-Token": token, "Content-Type": "application/json"},
                 json={"addFloatingIp": {"address": ip}},
                 timeout=30,
@@ -2638,7 +2638,7 @@ class AracloudManager:
 
         try:
             r = requests.post(
-                self.auth_url + "/servers/" + server_id + "/action",
+                self.compute_urls.get(nome_conta, self.auth_url) + "/servers/" + server_id + "/action",
                 headers={"X-Auth-Token": token, "Content-Type": "application/json"},
                 json={"removeFloatingIp": {"address": ip}},
                 timeout=30,
