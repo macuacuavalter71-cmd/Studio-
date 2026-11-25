@@ -184,20 +184,9 @@ RATE_INCREM_SUCESSO = 5
 TAXA_SUCESSO_AUMENTAR = 0.90
 
 # ============================================================
-# RCPT LIMITS - FUNDIDO V19.6.1 + V23.0 (66 provedores testados)
-# Origem: V19 = original | V23 = medido no relatório
+# RCPT LIMITS - APENAS os 66 provedores testados na V22.3.0
 # ============================================================
 RCPT_LIMITS = {
-    # --- V19.6.1 originais (mantidos; sobrepostos abaixo se testados em V23) ---
-    "yahoo.com": 20, "ymail.com": 20, "aol.com": 20, "rocketmail.com": 20,
-    "yahoo.co.uk": 20, "yahoo.fr": 20, "yahoo.de": 20, "yahoo.it": 20,
-    "yahoo.es": 20, "yahoo.ca": 20, "yahoo.com.br": 20, "yahoo.com.mx": 20,
-    "aim.com": 20, "netscape.net": 20, "mail.com": 20,
-    "outlook.com": 50, "hotmail.com": 50, "live.com": 50, "msn.com": 50,
-    "hotmail.co.uk": 50, "hotmail.fr": 50, "hotmail.de": 50,
-    "icloud.com": 50, "me.com": 50, "mac.com": 50,
-    "protonmail.com": 50, "protonmail.ch": 50,
-    "daum.net": 50,
     # --- GRUPO A: Aceitação perfeita (V23) ---
     "telkomsa.net": 1715, "rock.com": 2126, "walla.com": 1908,
     "sprintpcs.com": 1000, "pisem.net": 1000, "oranga.fr": 1000,
