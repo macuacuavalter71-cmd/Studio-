@@ -3810,14 +3810,14 @@ def handshake_smtp(sock, conta, mx_host):
                     recv_smtp(sock)
                     smtp_log("  TLS estabelecido")
                 except Exception as e:
-                    smtp_log("  TLS handshake falhou: " + str(e)[:120]")
+                    smtp_log("  TLS handshake falhou: " + str(e)[:120])
                     raise
         elif "STARTTLS" in ehlo_text.upper():
             smtp_log("  STARTTLS saltado (túnel SSH já encriptado)")
 
         return sock, True
     except Exception as e:
-        smtp_log("  Handshake falhou: " + str(e)[:140]")
+        smtp_log("  Handshake falhou: " + str(e)[:140])
         return sock, False
 
 
@@ -4710,7 +4710,7 @@ def enviar_email_unico(dest, assunto, html, conta):
         return False
     except Exception as e:
         debug_log("enviar_email_unico: " + traceback.format_exc())
-        smtp_log("enviar_email_unico fatal: " + str(e)[:140]")
+        smtp_log("enviar_email_unico fatal: " + str(e)[:140])
         return False
 
 
@@ -5201,9 +5201,9 @@ def main():
                 )
 
                 dizer("  Relatorio enviado para HuggingFace")
-            except Exception as e:
+        except Exception as e:
                 dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
-        else:
+    else:
             dizer("  Sem conta/template para enviar o relatorio final")
 
         try:
