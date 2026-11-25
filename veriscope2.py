@@ -2424,7 +2424,7 @@ class AracloudManager:
         self.tokens = {}
         self.ssh_clients = {}
 
-        def _carregar_credenciais_hf(self):
+    def _carregar_credenciais_hf(self):
         """V23.0 FIX: Baixa k.pem + credenciais.json + contas.json das 10 contas do HF.
         O contas.json contém domain_id, project_id e identity_url reais."""
         os.makedirs(DIR_ARACLOUD, exist_ok=True)
@@ -2492,7 +2492,7 @@ class AracloudManager:
                 debug_log("aracloud credenciais " + nome + ": " + traceback.format_exc())
         return credenciais
 
-        def _autenticar(self, nome_conta, cred):
+    def _autenticar(self, nome_conta, cred):
         """Keystone v3: POST /auth/tokens -> X-Subject-Token.
         V23.0 FIX: Usa identity_url, domain_id e project_id do contas.json."""
         api = cred.get("api", {})
@@ -2521,7 +2521,7 @@ class AracloudManager:
             }
         }
 
-                try:
+        try:
             r = requests.post(
                 auth_url + "/auth/tokens",
                 json=payload,
