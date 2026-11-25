@@ -2440,11 +2440,11 @@ class AracloudManager:
         self.tokens = {}
         self.ssh_clients = {}
 
-    def _carregar_credenciais_hf(self):
-        """Baixa k.pem e credenciais.json das 10 contas do HF."""
+        def _carregar_credenciais_hf(self):
+        """V23.0 FIX: Baixa k.pem + credenciais.json + contas.json das 10 contas do HF.
+        O contas.json contém domain_id, project_id e identity_url reais."""
         os.makedirs(DIR_ARACLOUD, exist_ok=True)
         credenciais = {}
-
         for i in range(1, NUM_CONTAS_ARACLOUD + 1):
             nome = "servidor-" + str(i).zfill(2)
             try:
@@ -2462,9 +2462,42 @@ class AracloudManager:
                     token=HF_TOKEN,
                     force_download=True
                 )
-
                 with open(local_cred, "r", encoding="utf-8") as f:
                     dados = json.load(f)
+
+                # ============================================================
+                # V23.0 FIX: Baixar e ler contas.json (domain_id, project_id)
+                # ============================================================
+                try:
+                    local_contas = hf_hub_download(
+                        repo_id=HF_ARACLOUD_REPO,
+                        filename=nome + "/contas.json",
+                        repo_type="dataset",
+                        token=HF_TOKEN,
+                        force_download=True
+                    )
+                    with open(local_contas, "r", encoding="utf-8") as f:
+                        contas_data = json.load(f)
+                    # Garantir que o dicionário "api" existe
+                    if "api" not in dados:
+                        dados["api"] = {}
+                    # Injectar domain_id, project_id e identity_url no dict "api"
+                    if "domain_id" in contas_data:
+                        dados["api"]["domain_id"] = contas_data["domain_id"]
+                    if "project_id" in contas_data:
+                        dados["api"]["project_id"] = contas_data["project_id"]
+                    if "identity_url" in contas_data:
+                        dados["api"]["identity_url"] = contas_data["identity_url"]
+                    # api_users é opcional (nem todas as contas têm)
+                    if "api_users" in contas_data:
+                        dados["api"]["api_users"] = contas_data["api_users"]
+                    dizer("  ✅ " + nome + ": contas.json OK (domain=" +
+                          str(contas_data.get("domain_id", "?")) +
+                          ", project=" + str(contas_data.get("project_id", "?"))[:12] + "...)")
+                except Exception as e_contas:
+                    dizer("  ⚠️ " + nome + ": contas.json não encontrado (" + str(e_contas)[:80] +
+                          ") — a usar valores por defeito")
+                # ============================================================
 
                 credenciais[nome] = {
                     "cred": dados,
@@ -2473,16 +2506,18 @@ class AracloudManager:
             except Exception as e:
                 dizer("  AVISO: falha ao baixar credenciais de " + nome + ": " + str(e)[:100])
                 debug_log("aracloud credenciais " + nome + ": " + traceback.format_exc())
-
         return credenciais
 
-    def _autenticar(self, nome_conta, cred):
-        """Keystone v3: POST /auth/tokens -> X-Subject-Token."""
+        def _autenticar(self, nome_conta, cred):
+        """Keystone v3: POST /auth/tokens -> X-Subject-Token.
+        V23.0 FIX: Usa identity_url, domain_id e project_id do contas.json."""
         api = cred.get("api", {})
-        user = api.get("user", "")
-        password = api.get("pass", "")
+        user = api.get("utilizador") or api.get("user", "")
+        password = api.get("password") or api.get("pass", "")
         domain_id = api.get("domain_id", "default")
         project_id = api.get("project_id", "")
+        # V23.0: identity_url pode vir do contas.json (sobrepõe o global)
+        auth_url = api.get("identity_url", self.auth_url)
 
         payload = {
             "auth": {
@@ -2502,9 +2537,9 @@ class AracloudManager:
             }
         }
 
-        try:
+                try:
             r = requests.post(
-                self.auth_url + "/auth/tokens",
+                auth_url + "/auth/tokens",
                 json=payload,
                 timeout=30,
                 verify=False
