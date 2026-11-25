@@ -5201,10 +5201,10 @@ def main():
                 )
 
                 dizer("  Relatorio enviado para HuggingFace")
-        except Exception as e:
+            except Exception as e:
                 dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
-    else:
-            dizer("  Sem conta/template para enviar o relatorio final")
+            else:
+                dizer("  Sem conta/template para enviar o relatorio final")
 
         try:
             upload_unknowns_hf()
