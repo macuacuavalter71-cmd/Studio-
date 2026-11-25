@@ -1736,9 +1736,9 @@ def carregar_contas():
     with open(p, "r", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    contas = []
+        contas = []
     for r in rows:
-        priv = (r.get("dkim_private_key_pem") or "").strip().replace("\\n", "\n")
+        priv = (r.get("dkim_private_key_pem") or "").strip().replace("\n", "\n")
         if not priv.startswith("-----BEGIN "):
             continue
 
@@ -1751,6 +1751,11 @@ def carregar_contas():
             "private_key_pem": priv,
             "public_key_txt": (r.get("dkim_public_txt") or "").strip(),
         })
+
+        # V23.0 FIX: Limitar a 30 contas DKIM (1 por IP Aracloud)
+        if len(contas) >= 30:
+            dizer("  Limite de 30 contas DKIM atingido")
+            break
 
     GLOBAL["contas"] = contas
     CHECKPOINT.salvar_contas(len(contas))
