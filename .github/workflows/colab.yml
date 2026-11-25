@@ -1,0 +1,106 @@
+name: VERISCOPE V23 - Operação Hydra🎉🎉📧
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'   # A cada 6 horas (00:00, 06:00, 12:00, 18:00 UTC)
+
+jobs:
+  enviar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355     # 5h55m (margem de 15min sobre o shutdown 5h40m)
+    
+    env:
+      PYTHONUNBUFFERED: "1"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Google Colab CLI e dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install -q google-colab-cli requests dnspython dkimpy \
+            cryptography pandas pyarrow huggingface_hub psutil pysocks paramiko
+
+      - name: Restaurar credenciais Colab (JSON direto no workflow)
+        run: |
+          mkdir -p ~/.config/colab-cli
+          cat > ~/.config/colab-cli/token.json <<'TOKEN_EOF'
+{"token": "ya29.a0AehfTOnT-bpLFPb1hwfdDrUlFXgzRKzgy2JWPhLr7pCHuDEKx0pigceIIcfBqe2qhIYCa6WGLoSftIlWCtVVnMKmK0GKKCMLLjwlbhOQIatq8iHm9_RmEZBV2J6AYSx1r0M-W6dF3WGa4JfHkn0u_RDou96Vv__vvZxEzRbW7fzB9p7EZgq_J7wf9fHqR_SvqqSRDb8aCgYKAQASARQSFQHGX2MiyuuzZy8i7XV0v1nQqyVHsQ0206", "refresh_token": "1//04LtHWplmfl6VCgYIARAAGAQSNwF-L9Irg5ffVeGPbmbVBKv7H22rSbGNHmb_5OZRDihoSvsitKIlgu_mnvrR8rK157V2c9V6Lyc", "token_uri": "https://oauth2.googleapis.com/token", "client_id": "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com", "client_secret": "d-FL95Q19q7MQmFpd7hHD0Ty", "scopes": ["openid", "https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/cloud-platform", "https://www.googleapis.com/auth/colaboratory", "https://www.googleapis.com/auth/drive.file"], "universe_domain": "googleapis.com", "account": "", "expiry": "2026-11-05T10:32:53Z"}
+TOKEN_EOF
+          chmod 600 ~/.config/colab-cli/token.json
+          echo "✅ Token gravado ($(wc -c < ~/.config/colab-cli/token.json) bytes)"
+
+      - name: Verificar credenciais
+        run: |
+          echo "=== Token file ==="
+          ls -la ~/.config/colab-cli/token.json
+          echo "=== JSON válido? ==="
+          python -c "import json; d=json.load(open('$HOME/.config/colab-cli/token.json')); print('OK, keys:', list(d.keys()))"
+
+      - name: Build combined.py com secrets injetados
+        run: |
+          python - <<'PY'
+          import os, json, textwrap, sys
+          
+          if not os.path.exists("veriscope2.py"):
+              print("[ERRO] veriscope2.py não encontrado no repositório!")
+              print("Ficheiros presentes:", os.listdir("."))
+              sys.exit(1)
+          
+          with open("veriscope2.py", "r", encoding="utf-8") as f:
+              original = f.read()
+          
+          hf_token = os.environ.get("HF_TOKEN", "")
+          gh_pat = os.environ.get("GITHUB_PAT", "")
+          gh_repo = os.environ.get("GITHUB_REPOSITORY", "")
+          
+          wrapper = textwrap.dedent(f"""\
+              import os, sys
+              print("=" * 70, flush=True)
+              print("[WRAPPER] A inicializar ambiente...", flush=True)
+              os.environ['HF_TOKEN'] = {json.dumps(hf_token)}
+              os.environ['GITHUB_PAT'] = {json.dumps(gh_pat)}
+              os.environ['GITHUB_REPOSITORY'] = {json.dumps(gh_repo)}
+              print("[WRAPPER] HF_TOKEN prefix:", (os.environ.get('HF_TOKEN','')[:8]+'...') if os.environ.get('HF_TOKEN') else 'VAZIO', flush=True)
+              print("[WRAPPER] GITHUB_REPOSITORY:", os.environ.get('GITHUB_REPOSITORY'), flush=True)
+              print("=" * 70, flush=True)
+              sys.stdout.flush()
+          """)
+          
+          with open("combined.py", "w", encoding="utf-8") as f:
+              f.write(wrapper)
+              f.write(original)
+          
+          print(f"[OK] combined.py criado com {os.path.getsize('combined.py')} bytes")
+          PY
+
+      - name: Criar sessão no Colab
+        run: colab --auth oauth2 new -s veriscope-job
+        continue-on-error: true
+
+      - name: Executar Veriscope V23 no Colab (5h40m)
+        run: colab --auth oauth2 exec -s veriscope-job --timeout 21000 -f combined.py
+        timeout-minutes: 350
+        continue-on-error: true
+
+      - name: Mostrar logs completos da sessão
+        if: always()
+        run: |
+          colab --auth oauth2 log -s veriscope-job -o log.md || true
+          echo "=== INÍCIO DOS LOGS ==="
+          cat log.md || echo "(sem logs)"
+          echo "=== FIM DOS LOGS ==="
+
+      - name: Desligar VM do Colab
+        if: always()
+        run: colab --auth oauth2 stop -s veriscope-job || true
