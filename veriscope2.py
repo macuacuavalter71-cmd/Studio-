@@ -172,7 +172,7 @@ RATE_REDUCAO_452 = 0.75
 RATE_INCREM_SUCESSO = 5
 TAXA_SUCESSO_AUMENTAR = 0.90
 
-# V23.0 FIX: Singleton do AracloudManager (Definido no topo)
+# V23.0 FIX: Singleton do AracloudManager
 ARACLOUD_MGR_SINGLETON = None
 
 # ============================================================
@@ -244,7 +244,7 @@ PROVEDORES_ASIATICOS = {
 
 CAMPAIGN_MAP = {
     1: {"subject": "Can I show you something tomorrow?", "template": "veriscope_email_01.html"},
-    2: {"subject": "": "The question behind Session Matrix", "template": "veriscope_email_02.html"},
+    2: {"subject": "The question behind Session Matrix", "template": "veriscope_email_02.html"},
     3: {"subject": "The chart is only part of the process", "template": "veriscope_email_03.html"},
     4: {"subject": "Now you can see the complete picture", "template": "veriscope_email_04.html"},
 }
@@ -3582,4 +3582,313 @@ def salvar_logs_hf():
         enviados = 0
         ficheiros_log = [("log", LOG_FILE), ("smtp", SMTP_LOG), ("debug", DEBUG_LOG), ("desec", DESEC_LOG), ("smtp_raw", SMTP_RAW_LOG)]
         for fname, fpath in ficheiros_log:
-            if not fpath or not os.path
+            if not fpath or not os.path.exists(fpath):
+                continue
+            try:
+                api.upload_file(path_or_fileobj=fpath, path_in_repo="logs/" + fname + "_" + str(GLOBAL['exec_id']) + ".txt", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                enviados += 1
+            except Exception as e:
+                debug_log("upload log " + fname + ": " + str(e)[:160])
+        dizer("  Logs enviados para HuggingFace: " + str(enviados) + "/5")
+        GLOBAL["logs_uploaded"] = True
+    except Exception as e:
+        dizer("  AVISO: upload de logs falhou (" + str(e)[:100] + ")")
+
+def baixar_ficheiros_campanha():
+    dizer("A baixar ficheiros de campanha do HuggingFace...")
+    try:
+        local_mailfrom = hf_hub_download(repo_id=HF_LOGS_REPO, filename="campaign_data/templates/" + MAIL_FROM_FILE_LOCAL, repo_type="dataset", token=HF_TOKEN, force_download=True)
+        shutil.copy(local_mailfrom, os.path.join(BASE_LOCAL, MAIL_FROM_FILE_LOCAL))
+        dizer("  mail_from_variations descarregado para " + BASE_LOCAL)
+    except Exception as e:
+        dizer("  AVISO: Falha ao baixar mail_from_variations: " + str(e)[:100])
+
+
+# ====================================================================
+# MAIN V23.0
+# ====================================================================
+def main():
+    global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG, ARACLOUD_MGR_SINGLETON
+    diagnostico_ambiente_hf()
+    execution_id = reset_global_state()
+    download_all_checkpoints_from_hf()
+    CHECKPOINT._carregar_tudo()
+    config = CHECKPOINT.obter_config()
+    if config.get("status") == "COMPLETED":
+        print("=" * 70, flush=True)
+        print("[FIM] A campanha já foi totalmente concluída em execução anterior.", flush=True)
+        print("[FIM] Status: COMPLETED. A sair sem enviar nada.", flush=True)
+        print("=" * 70, flush=True)
+        sys.exit(0)
+    tem_checkpoint = CHECKPOINT.existe_checkpoint()
+    if tem_checkpoint:
+        print("\n", flush=True)
+        print("=" * 70, flush=True)
+        print("[RECUPERACAO] Checkpoint detectado - a retomar execucao anterior", flush=True)
+        print("=" * 70, flush=True)
+        GLOBAL["modo_recuperacao"] = True
+        GLOBAL["checkpoint_loaded"] = True
+        GLOBAL["status"] = "RUNNING"
+        if config.get("exec_id"):
+            execution_id = config["exec_id"]
+            GLOBAL["exec_id"] = execution_id
+        if config.get("ip_colab"):
+            GLOBAL["ip_colab"] = config["ip_colab"]
+        if config.get("start_time"):
+            try:
+                dt = datetime.fromisoformat(config["start_time"])
+                GLOBAL["start_time"] = dt.timestamp()
+            except Exception:
+                pass
+        stats_antigos = CHECKPOINT.obter_smtp_stats()
+        for k, v in stats_antigos.items():
+            if k in GLOBAL:
+                GLOBAL[k] = v
+        GLOBAL["smtp_aceites_ultima_checkpoint"] = GLOBAL["smtp_aceites"]
+        GLOBAL["por_provedor"] = CHECKPOINT.obter_por_provedor()
+        por_prov_cp = CHECKPOINT.obter_por_provedor()
+        for prov_nome, prov_info in por_prov_cp.items():
+            if isinstance(prov_info, dict) and prov_info.get("concluido", False):
+                GLOBAL["provedores_concluidos_set"].add(prov_nome)
+        GLOBAL["provs_concluidos"] = len(GLOBAL["provedores_concluidos_set"])
+        with GLOBAL["stats_lock"]:
+            for chave, info in CHECKPOINT.states["fases"].items():
+                GLOBAL["fases"][chave] = info
+        
+        # V23.0 FIX: Recuperar estado Aracloud e REABRIR TÚNEIS SSH
+        aracloud_state = CHECKPOINT.obter_aracloud()
+        if aracloud_state.get("contas"):
+            GLOBAL["aracloud_contas"] = aracloud_state["contas"]
+            GLOBAL["aracloud_ips_usados_hoje"] = set(aracloud_state.get("ips_usados_hoje", []))
+            GLOBAL["aracloud_data_reset"] = aracloud_state.get("data_ultimo_reset")
+            dizer("[RECUPERACAO] Estado Aracloud carregado: " + str(len(GLOBAL["aracloud_ips_usados_hoje"])) + " IPs usados hoje")
+            
+            try:
+                _mgr = AracloudManager()
+                _cred = _mgr._carregar_credenciais_hf()
+                _pem_por_conta = {n: d["pem_path"] for n, d in _cred.items()}
+                reconectados = 0
+                for _nome, _estado in GLOBAL["aracloud_contas"].items():
+                    _pem = _pem_por_conta.get(_nome) or _estado.get("pem_path", "")
+                    if not _pem:
+                        continue
+                    if _mgr._autenticar(_nome, _estado):
+                        _vivos = []
+                        for _ip in list(_estado.get("ips_ativos", [])):
+                            _cli = _mgr._abrir_ssh(_nome, _ip, _pem)
+                            if _cli is not None:
+                                _vivos.append(_ip)
+                                GLOBAL["aracloud_ips_ativos"].append(_ip)
+                                GLOBAL["aracloud_clients_ssh"][_ip] = _cli
+                                GLOBAL.setdefault("orcamento_por_ip", {})[_ip] = {}
+                                reconectados += 1
+                            else:
+                                dizer("  [RECUPERACAO] SSH falhou para " + _ip + " - descartado")
+                        _estado["ips_ativos"] = _vivos
+                dizer("[RECUPERACAO] " + str(reconectados) + " IPs reconectados via SSH")
+                GLOBAL["aracloud_manager_singleton"] = _mgr
+                ARACLOUD_MGR_SINGLETON = _mgr
+            except Exception as e_rec:
+                dizer("[RECUPERACAO] Erro ao reconectar IPs: " + str(e_rec)[:120])
+
+        rate_limits_cp = CHECKPOINT.obter_rate_limits()
+        if rate_limits_cp:
+            GLOBAL["rate_limits_aprendidos"].update(rate_limits_cp)
+            dizer("[RECUPERACAO] Rate limits aprendidos carregados: " + str(len(rate_limits_cp)))
+        offsets_cp = CHECKPOINT.obter_offsets()
+        if offsets_cp:
+            GLOBAL["offsets_por_provedor"] = offsets_cp
+        if os.path.exists(SAIDA_ACEITES):
+            try:
+                with open(SAIDA_ACEITES, "r", encoding="utf-8", errors="ignore") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        if row and row.get("email"):
+                            GLOBAL["aceites_emails"].add(row["email"].lower().strip())
+                dizer("[RECUPERACAO] Aceites anteriores carregados: " + "{:,}".format(len(GLOBAL["aceites_emails"])))
+            except Exception as e:
+                debug_log("recuperar aceites do ficheiro: " + str(e))
+        limpar_logs_antigos(preservar_checkpoints=True, preservar_saida=True)
+    else:
+        limpar_logs_antigos(preservar_checkpoints=False, preservar_saida=False)
+
+    LOG_FILE = os.path.join(LOG_DIR, "log_" + execution_id + ".txt")
+    SMTP_LOG = os.path.join(LOG_DIR, "smtp_" + execution_id + ".txt")
+    DEBUG_LOG = os.path.join(LOG_DIR, "debug_" + execution_id + ".txt")
+    try:
+        open(LOG_FILE, "w", encoding="utf-8").close()
+        open(SMTP_LOG, "w", encoding="utf-8").close()
+        open(DEBUG_LOG, "w", encoding="utf-8").close()
+        open(DESEC_LOG, "w", encoding="utf-8").close()
+        open(SMTP_RAW_LOG, "w", encoding="utf-8").close()
+    except Exception:
+        pass
+    GLOBAL["user_unknowns_file"] = UNKNOWN_FILE_LOCAL
+    threading.Thread(target=monitor_live, daemon=True).start()
+    threading.Thread(target=keep_alive_thread, daemon=True).start()
+    threading.Thread(target=time_limit_watcher, daemon=True).start()
+    threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
+    time.sleep(1)
+    dizer("VERISCOPE V23.0 HEADLESS [" + execution_id + "]")
+    dizer("ARQUITETURA: " + str(NUM_CONTAS_ARACLOUD) + " contas Aracloud x " + str(MAX_IPS_POR_CONTA) + " IPs = " + str(NUM_WORKERS) + " workers")
+    dizer("ORCAMENTO: " + str(IP_BUDGET_POR_PROVEDOR) + " emails/IP/provedor | " + str(MAX_IPS_UNICOS_POR_DIA) + " IPs únicos/conta/dia")
+    dizer("CHECKPOINT: " + ("RECUPERAR" if tem_checkpoint else "NOVO"))
+    if tem_checkpoint:
+        dizer("  Aceites recuperados: " + "{:,}".format(GLOBAL["smtp_aceites"]))
+        dizer("  Tentativas recuperadas: " + "{:,}".format(GLOBAL["smtp_tentativas"]))
+    baixar_ficheiros_campanha()
+    contas = []
+    html_base = ""
+    mxs = {}
+    rt = None
+    try:
+        ip_colab = obter_ip_colab()
+        CHECKPOINT.salvar_config(execution_id, ip_colab, status="RUNNING")
+        GLOBAL["status"] = "RUNNING"
+        verificar_blacklists(ip_colab)
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        DESEC_TOKENS_VALIDOS = testar_tokens_desec()
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        contas = carregar_contas()
+        html_base = carregar_template()
+        carregar_mail_from_variations()
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        provedores = descobrir_provedores_reais()
+        mxs = resolver_mxs_paralelo(provedores)
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        baixar_todos_emails_paralelo(sorted(mxs.keys()))
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        definir_fase("FASE 2D - Blacklist persistente de USER_UNKNOWN")
+        baixar_unknowns_acumulado()
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        
+        # FASE 2.5 - Aracloud (substitui proxies)
+        definir_fase("FASE 2.5 - Aracloud: autenticacao + IPs flutuantes + SSH")
+        aracloud_mgr = AracloudManager()
+        ARACLOUD_MGR_SINGLETON = aracloud_mgr
+        total_ips = aracloud_mgr.inicializar()
+        if total_ips == 0:
+            dizer("  AVISO CRÍTICO: nenhum IP Aracloud activo. Envio impossível.")
+            marcar_fase("FASE25_ARACLOUD", False, "0 IPs Aracloud")
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        
+        fase3_dns_completo(contas)
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        fase4_esperar_propagacao()
+        verificar_propagacao_amostra(contas)
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        aguardar_ips_aracloud(MIN_PROXIES_REFILL, timeout_seg=ESPERA_POOL_ANTES_ENVIO)
+        if GLOBAL.get("emergency_stop"):
+            raise KeyboardInterrupt()
+        monitor_thread = threading.Thread(target=monitor_ips_continuo, daemon=True)
+        monitor_thread.start()
+        dizer("  Monitor de IPs Aracloud activado (rotação + SPF refresh)")
+        fase_envio_massivo(mxs, contas, html_base)
+    except KeyboardInterrupt:
+        GLOBAL["emergency_stop"] = True
+        dizer("Interrompido pelo utilizador / paragem de emergencia")
+    except Exception as e:
+        dizer("ERRO GLOBAL: " + str(e))
+        debug_log("main:\n" + traceback.format_exc())
+        try:
+            traceback.print_exc()
+        except Exception:
+            pass
+    finally:
+        GLOBAL["monitor_running"] = False
+        try:
+            dizer("[CHECKPOINT] Salvamento final do estado...")
+            salvar_checkpoint_smtp()
+            CHECKPOINT.salvar_aracloud(GLOBAL.get("aracloud_contas", {}), list(GLOBAL.get("aracloud_ips_usados_hoje", set())), GLOBAL.get("aracloud_data_reset"))
+            CHECKPOINT.salvar_rate_limits(GLOBAL.get("rate_limits_aprendidos", {}))
+            final_status = GLOBAL.get("status", "RUNNING")
+            if final_status != "COMPLETED" and final_status != "TIME_LIMIT_SHUTDOWN":
+                final_status = "RUNNING"
+            CHECKPOINT.salvar_config(GLOBAL["exec_id"], GLOBAL.get("ip_colab"), status=final_status)
+            CHECKPOINT.salvar_tudo()
+            upload_all_checkpoints_to_hf()
+            dizer("[CHECKPOINT] Estado salvo com sucesso e enviado para HF")
+        except Exception as e:
+            dizer("ERRO ao salvar checkpoint final: " + str(e))
+            debug_log("checkpoint final: " + traceback.format_exc())
+        try:
+            gerar_ficheiros_finais()
+        except Exception as e:
+            dizer("ERRO ao gerar ficheiros finais: " + str(e))
+            debug_log("gerar_ficheiros_finais: " + traceback.format_exc())
+        rt = {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0, "via_aracloud": 0, "por_provedor": GLOBAL["por_provedor"]}
+        for r in GLOBAL["por_provedor"].values():
+            for k in ("aceites", "tentados", "rejeitados", "erros", "via_aracloud"):
+                if k in r:
+                    rt[k] += r[k]
+        if GLOBAL.get("emergency_stop"):
+            dizer("Paragem de emergencia - estado guardado no checkpoint")
+            dizer("Na proxima execucao o sistema retoma automaticamente")
+        else:
+            dizer("FASE 7 - Relatorio final para " + FINAL_DESTINATARIO)
+            cf = random.choice(contas) if contas else None
+            if cf and html_base:
+                ok1 = enviar_email_unico(FINAL_DESTINATARIO, CAMPAIGN["subject"], html_base, cf)
+                dizer("  Email da campanha: " + ("OK" if ok1 else "FALHOU"))
+                time.sleep(5)
+            ar, cr = gerar_relatorio(rt)
+            ok2 = enviar_email_unico(FINAL_DESTINATARIO, ar, cr, cf)
+            dizer("  Relatorio HTML: " + ("OK" if ok2 else "FALHOU"))
+            try:
+                rp = os.path.join(DIR_AUDIT, "relatorio_final.html")
+                with open(rp, "w", encoding="utf-8") as f:
+                    f.write(cr)
+                api = HfApi(token=HF_TOKEN)
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_0_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                dizer("  Relatorio enviado para HuggingFace")
+            except Exception as e:
+                dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
+            else:
+                dizer("  Sem conta/template para enviar o relatorio final")
+            try:
+                upload_unknowns_hf()
+            except Exception as e:
+                debug_log("upload_unknowns_hf finally: " + str(e))
+            try:
+                salvar_logs_hf()
+            except Exception as e:
+                debug_log("salvar_logs_hf finally: " + str(e))
+        taxa = rt['aceites'] / max(1, rt['tentados']) * 100
+        print("\n", flush=True)
+        print("=" * 70, flush=True)
+        print("EXECUCAO TERMINADA - " + str(GLOBAL.get('exec_id')), flush=True)
+        print("  Aceites (250 OK) : " + "{:,}".format(rt['aceites']), flush=True)
+        print("  Tentativas         : " + "{:,}".format(rt['tentados']), flush=True)
+        print("  Taxa             : " + "{:.2f}".format(taxa) + "%", flush=True)
+        print("  Via Aracloud     : " + "{:,}".format(rt['via_aracloud']), flush=True)
+        print("  IPs Aracloud     : " + str(len(GLOBAL.get('aracloud_ips_ativos', []))) + "/" + str(NUM_WORKERS), flush=True)
+        print("  IPs usados hoje  : " + str(len(GLOBAL.get('aracloud_ips_usados_hoje', set()))), flush=True)
+        print("  USER_UNKNOWN     : " + "{:,}".format(len(GLOBAL['user_unknowns'])), flush=True)
+        print("  Aceites ficheiro : " + "{:,}".format(len(GLOBAL.get('aceites_emails', set()))), flush=True)
+        print("  Respostas 4xx    : " + "{:,}".format(GLOBAL.get('smtp_4xx', 0)), flush=True)
+        print("  Respostas 5xx    : " + "{:,}".format(GLOBAL.get('smtp_5xx', 0)), flush=True)
+        print("  Retries          : " + "{:,}".format(GLOBAL.get('smtp_retries', 0)), flush=True)
+        print("  Abandonados      : " + "{:,}".format(GLOBAL.get('smtp_abandonados', 0)), flush=True)
+        print("  Parquets         : " + str(GLOBAL['pq_downloaded']) + "/" + str(GLOBAL['pq_total']) + " (falhas " + str(GLOBAL['pq_falhados']) + ")", flush=True)
+        print("  DESec Requests   : " + str(GLOBAL.get('desec_requests', 0)) + " | OK: " + str(GLOBAL.get('desec_success', 0)) + " | Fail: " + str(GLOBAL.get('desec_failures', 0)), flush=True)
+        print("  Ficheiros saida  : " + SAIDA_ACEITES + " | " + SAIDA_UNKNOWN, flush=True)
+        print("  Checkpoints      : " + BASE_LOCAL + "/cp_*.json", flush=True)
+        print("  Log DESec        : " + DESEC_LOG, flush=True)
+        print("  Log SMTP cru     : " + SMTP_RAW_LOG, flush=True)
+        print("  Logs             : " + LOG_DIR, flush=True)
+        print("  MODO RECUPERACAO : " + ("SIM" if GLOBAL.get("modo_recuperacao") else "NAO"), flush=True)
+        print("  STATUS FINAL     : " + str(GLOBAL.get("status", "UNKNOWN")), flush=True)
+        print("=" * 70, flush=True)
+
+if __name__ == "__main__":
+    main()
