@@ -3607,7 +3607,9 @@ def baixar_ficheiros_campanha():
 # MAIN V23.0
 # ====================================================================
 def main():
+    # V23.0 FIX: Declarar TODAS as variáveis globais no topo da função
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG, ARACLOUD_MGR_SINGLETON
+    
     diagnostico_ambiente_hf()
     execution_id = reset_global_state()
     download_all_checkpoints_from_hf()
@@ -3769,7 +3771,6 @@ def main():
         
         # FASE 2.5 - Aracloud (substitui proxies)
         definir_fase("FASE 2.5 - Aracloud: autenticacao + IPs flutuantes + SSH")
-        global ARACLOUD_MGR_SINGLETON
         aracloud_mgr = AracloudManager()
         ARACLOUD_MGR_SINGLETON = aracloud_mgr
         total_ips = aracloud_mgr.inicializar()
