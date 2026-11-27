@@ -12,10 +12,12 @@ V23.0 FIX FINAL (v5 - adaptado para 4 contas funcionais):
   DKIM apenas em domínios possuídos, PUT bulk 1 pedido/domínio, SPF-only refresh.
 - Checkpoint: offsets anti-reenvio, IPs, orçamento, rate limits, greylist.
 """
+
 import os
 import sys
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
@@ -79,7 +81,6 @@ except Exception:
 CLEAR_SCREEN = "\033[2J\033[H"
 STOP_FILE = "/tmp/veriscope_stop"
 MAX_EXECUTION_SECONDS = 5 * 3600 + 40 * 60
-
 GLOBAL_CONNECTION_SEMAPHORE = threading.Semaphore(300)
 GLOBAL_HF_SEMAPHORE = threading.Semaphore(16)
 GLOBAL_DESEC_SEMAPHORE = threading.Semaphore(4)
@@ -107,7 +108,6 @@ WORKERS_ENVIO = 9999
 WORKERS_SCRAPER = 9999
 WORKERS_PROXY_PIPELINE = 9999
 SNAPSHOT_MAX_WORKERS = 9999
-
 APAGAR_PARQUETS_APOS_USO = True
 USAR_SNAPSHOT_PRIMEIRO = True
 
@@ -144,11 +144,9 @@ MAX_IPS_UNICOS_POR_DIA = 20
 IP_BUDGET_POR_PROVEDOR = 1000
 SSH_CONNECT_TIMEOUT = 20
 SSH_TUNNEL_TIMEOUT = 15
-
 GREYLIST_DELAY_1 = 120
 GREYLIST_DELAY_2 = 240
 GREYLIST_MAX_TENTATIVAS = 3
-
 RATE_REDUCAO_452 = 0.75
 RATE_INCREM_SUCESSO = 5
 TAXA_SUCESSO_AUMENTAR = 0.90
@@ -193,10 +191,8 @@ PROVEDORES_66_TESTADOS = {
     "21cn.com", "docomo.ne.jp", "gaggle.net",
 }
 PROVEDORES_USAVEIS = list(PROVEDORES_66_TESTADOS)
-
 PROVEDORES_GREYLIST = {"seznam.cz", "gmail.com", "i.ua"}
 PROVEDORES_TRACKING_IP = {"qq.com", "vip.qq.com", "foxmail.com"}
-
 PROVEDORES_ASIATICOS = {
     "naver.com", "nate.com", "dreamwiz.com",
     "qq.com", "foxmail.com", "vip.qq.com", "yeah.net",
@@ -237,9 +233,11 @@ DIR_REPO = "/content/trader_repo"
 PROXY_STATE_FILE = os.path.join(BASE_LOCAL, "proxy_state.json")
 UNKNOWN_FILE_LOCAL = os.path.join(BASE_LOCAL, "user_unknowns_acumulado.csv")
 MAIL_FROM_FILE_LOCAL = "mail_from_variations.txt"
+
 SAIDA_ACEITES = "/content/aceites_finais.csv"
 SAIDA_UNKNOWN = "/content/user_unknowns_final.csv"
 SAIDA_REJEICAOES = "/content/rejeicoes_finais.csv"
+
 DESEC_LOG = os.path.join(BASE_LOCAL, "desec_requests.log")
 SMTP_RAW_LOG = os.path.join(LOG_DIR, "smtp_raw.txt")
 
@@ -255,6 +253,7 @@ CP_OFFSETS = os.path.join(BASE_LOCAL, "cp_offsets.json")
 CP_RATE_LIMITS = os.path.join(BASE_LOCAL, "cp_rate_limits.json")
 
 FASES_OBRIGATORIAS_ANTES_ENVIO = ["FASE0_IP", "FASE1_TOKENS", "FASE2A_CONTAS", "FASE2B_MX", "FASE2C_DOWNLOAD", "FASE25_ARACLOUD", "FASE3_DNS", "FASE4_PROPAGACAO"]
+
 
 def diagnostico_ambiente_hf():
     print("\n" + "=" * 80, flush=True)
@@ -282,11 +281,17 @@ def diagnostico_ambiente_hf():
 
 class CheckpointManager:
     def __init__(self):
-        self.locks = {"fases": threading.Lock(), "provedores": threading.Lock(), "pool": threading.Lock(), "smtp": threading.Lock(), "contas": threading.Lock(), "config": threading.Lock(), "aracloud": threading.Lock(), "desec": threading.Lock(), "offsets": threading.Lock(), "rate_limits": threading.Lock()}
+        self.locks = {"fases": threading.Lock(), "provedores": threading.Lock(), "pool": threading.Lock(),
+                      "smtp": threading.Lock(), "contas": threading.Lock(), "config": threading.Lock(),
+                      "aracloud": threading.Lock(), "desec": threading.Lock(), "offsets": threading.Lock(),
+                      "rate_limits": threading.Lock()}
         self.states = {
             "fases": {}, "provedores": {},
             "pool": {"pool": [], "scraping_checkpoint": 0, "raw_count": 0},
-            "smtp": {"smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0, "smtp_user_unknown": 0, "smtp_erros": 0, "smtp_conexoes": 0, "smtp_via_proxy": 0, "smtp_via_colab": 0, "smtp_4xx": 0, "smtp_5xx": 0, "smtp_retries": 0, "smtp_abandonados": 0, "provedor_index": {}, "por_provedor": {}, "por_ip": {}},
+            "smtp": {"smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0, "smtp_user_unknown": 0,
+                     "smtp_erros": 0, "smtp_conexoes": 0, "smtp_via_proxy": 0, "smtp_via_colab": 0,
+                     "smtp_4xx": 0, "smtp_5xx": 0, "smtp_retries": 0, "smtp_abandonados": 0,
+                     "provedor_index": {}, "por_provedor": {}, "por_ip": {}},
             "contas": {"contas_carregadas": 0, "contas_idx": 0},
             "config": {"exec_id": None, "ip_colab": None, "start_time": None, "last_save": None, "status": "NEW"},
             "aracloud": {"contas": {}, "ips_usados_hoje": [], "data_ultimo_reset": None},
@@ -294,7 +299,9 @@ class CheckpointManager:
             "offsets": {"global_por_provedor": {}},
             "rate_limits": {"aprendidos": {}},
         }
-        self.paths = {"fases": CP_FASES, "provedores": CP_PROVEDORES, "pool": CP_POOL, "smtp": CP_SMTP, "contas": CP_CONTAS, "config": CP_CONFIG, "aracloud": CP_ARACLOUD, "desec": CP_DESEC, "offsets": CP_OFFSETS, "rate_limits": CP_RATE_LIMITS}
+        self.paths = {"fases": CP_FASES, "provedores": CP_PROVEDORES, "pool": CP_POOL, "smtp": CP_SMTP,
+                      "contas": CP_CONTAS, "config": CP_CONFIG, "aracloud": CP_ARACLOUD, "desec": CP_DESEC,
+                      "offsets": CP_OFFSETS, "rate_limits": CP_RATE_LIMITS}
         self._carregar_tudo()
 
     def _carregar_tudo(self):
@@ -314,7 +321,7 @@ class CheckpointManager:
                                 base[k] = v
                         else:
                             self.states[nome] = dados
-                        print("[CHECKPOINT] Carregado local: " + nome, flush=True)
+                    print("[CHECKPOINT] Carregado local: " + nome, flush=True)
                 except Exception as e:
                     print("[CHECKPOINT] AVISO ao carregar " + nome + ": " + str(e)[:100], flush=True)
 
@@ -325,7 +332,7 @@ class CheckpointManager:
             with GLOBAL_FILEWRITE_SEMAPHORE:
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(self.states[nome], f, indent=2, ensure_ascii=False)
-                os.replace(tmp, path)
+            os.replace(tmp, path)
             return True
         except Exception as e:
             debug_log("checkpoint salvar " + nome + ": " + str(e))
@@ -346,7 +353,7 @@ class CheckpointManager:
     def atualizar_fase(self, chave, ok, detalhe=""):
         with self.locks["fases"]:
             self.states["fases"][chave] = {"ok": bool(ok), "detalhe": str(detalhe)[:200], "ts": datetime.now().isoformat()}
-            self._salvar_um("fases")
+        self._salvar_um("fases")
 
     def fase_completa(self, chave):
         with self.locks["fases"]:
@@ -363,7 +370,7 @@ class CheckpointManager:
     def registrar_provedor_baixado(self, provedor, total_emails, total_parquets):
         with self.locks["provedores"]:
             self.states["provedores"][provedor] = {"emails": total_emails, "parquets": total_parquets, "concluido": True, "ts": datetime.now().isoformat()}
-            self._salvar_um("provedores")
+        self._salvar_um("provedores")
 
     def provedor_ja_baixado(self, provedor):
         with self.locks["provedores"]:
@@ -379,14 +386,17 @@ class CheckpointManager:
             for k, v in stats_dict.items():
                 if k not in ("provedor_index", "por_provedor", "por_ip"):
                     self.states["smtp"][k] = v
-            self._salvar_um("smtp")
+        self._salvar_um("smtp")
 
     def atualizar_provedor_index(self, provedor, offset, aceites, concluido=False, total_linhas=0):
         with self.locks["smtp"]:
             if "provedor_index" not in self.states["smtp"]:
                 self.states["smtp"]["provedor_index"] = {}
-            self.states["smtp"]["provedor_index"][provedor] = {"offset": offset, "aceites": aceites, "concluido": concluido, "total_linhas": total_linhas, "ts": datetime.now().isoformat()}
-            self._salvar_um("smtp")
+            self.states["smtp"]["provedor_index"][provedor] = {
+                "offset": offset, "aceites": aceites, "concluido": concluido,
+                "total_linhas": total_linhas, "ts": datetime.now().isoformat()
+            }
+        self._salvar_um("smtp")
 
     def obter_provedor_index(self, provedor):
         with self.locks["smtp"]:
@@ -395,7 +405,7 @@ class CheckpointManager:
     def salvar_por_provedor(self, por_provedor):
         with self.locks["smtp"]:
             self.states["smtp"]["por_provedor"] = por_provedor
-            self._salvar_um("smtp")
+        self._salvar_um("smtp")
 
     def obter_por_provedor(self):
         with self.locks["smtp"]:
@@ -403,7 +413,10 @@ class CheckpointManager:
 
     def obter_smtp_stats(self):
         with self.locks["smtp"]:
-            return {k: self.states["smtp"].get(k, 0) for k in ["smtp_tentativas", "smtp_aceites", "smtp_rejeitados", "smtp_user_unknown", "smtp_erros", "smtp_conexoes", "smtp_via_proxy", "smtp_via_colab", "smtp_4xx", "smtp_5xx", "smtp_retries", "smtp_abandonados"]}
+            return {k: self.states["smtp"].get(k, 0) for k in
+                    ["smtp_tentativas", "smtp_aceites", "smtp_rejeitados", "smtp_user_unknown", "smtp_erros",
+                     "smtp_conexoes", "smtp_via_proxy", "smtp_via_colab", "smtp_4xx", "smtp_5xx",
+                     "smtp_retries", "smtp_abandonados"]}
 
     def salvar_config(self, exec_id, ip_colab, status="RUNNING"):
         with self.locks["config"]:
@@ -412,7 +425,7 @@ class CheckpointManager:
             self.states["config"]["status"] = status
             self.states["config"]["start_time"] = self.states["config"].get("start_time") or datetime.now().isoformat()
             self.states["config"]["last_save"] = datetime.now().isoformat()
-            self._salvar_um("config")
+        self._salvar_um("config")
 
     def obter_config(self):
         with self.locks["config"]:
@@ -421,14 +434,14 @@ class CheckpointManager:
     def salvar_contas(self, n_carregadas):
         with self.locks["contas"]:
             self.states["contas"]["contas_carregadas"] = n_carregadas
-            self._salvar_um("contas")
+        self._salvar_um("contas")
 
     def salvar_aracloud(self, contas, ips_usados_hoje, data_reset):
         with self.locks["aracloud"]:
             self.states["aracloud"]["contas"] = contas
             self.states["aracloud"]["ips_usados_hoje"] = ips_usados_hoje
             self.states["aracloud"]["data_ultimo_reset"] = data_reset
-            self._salvar_um("aracloud")
+        self._salvar_um("aracloud")
 
     def obter_aracloud(self):
         with self.locks["aracloud"]:
@@ -439,7 +452,7 @@ class CheckpointManager:
             self.states["desec"]["dominios_ativos"] = dominios_ativos
             self.states["desec"]["baseline_hash"] = baseline_hash
             self.states["desec"]["ultima_atualizacao"] = datetime.now().isoformat()
-            self._salvar_um("desec")
+        self._salvar_um("desec")
 
     def obter_desec(self):
         with self.locks["desec"]:
@@ -448,7 +461,7 @@ class CheckpointManager:
     def salvar_offset(self, provedor, offset):
         with self.locks["offsets"]:
             self.states["offsets"]["global_por_provedor"][provedor] = offset
-            self._salvar_um("offsets")
+        self._salvar_um("offsets")
 
     def obter_offsets(self):
         with self.locks["offsets"]:
@@ -457,7 +470,7 @@ class CheckpointManager:
     def salvar_rate_limits(self, rate_limits):
         with self.locks["rate_limits"]:
             self.states["rate_limits"]["aprendidos"] = rate_limits
-            self._salvar_um("rate_limits")
+        self._salvar_um("rate_limits")
 
     def obter_rate_limits(self):
         with self.locks["rate_limits"]:
@@ -467,11 +480,14 @@ class CheckpointManager:
         for nome in self.paths.keys():
             self._salvar_um(nome)
 
+
 CHECKPOINT = CheckpointManager()
+
 GLOBAL = {}
 LOG_FILE = None
 SMTP_LOG = None
 DEBUG_LOG = None
+
 
 def reset_global_state():
     global GLOBAL
@@ -521,7 +537,11 @@ class RateController:
     def _get_identity_stats(self, identity_id):
         with self.lock:
             if identity_id not in self.stats:
-                self.stats[identity_id] = {"aceites": 0, "rejeitados": 0, "erros_consecutivos": 0, "rate_current": float(RATE_BASELINE_EMAILS_MIN), "ultima_acao": time.time(), "throttled_ate": 0, "greylist_ate": 0, "provedor_stats": {}}
+                self.stats[identity_id] = {
+                    "aceites": 0, "rejeitados": 0, "erros_consecutivos": 0,
+                    "rate_current": float(RATE_BASELINE_EMAILS_MIN), "ultima_acao": time.time(),
+                    "throttled_ate": 0, "greylist_ate": 0, "provedor_stats": {}
+                }
             return self.stats[identity_id]
 
     def pode_enviar(self, identity_id, provedor):
@@ -586,11 +606,14 @@ class RateController:
             stats["greylist_ate"] = time.time() + delay
             return True
 
+
 RATE_CTRL = RateController()
+
 
 def obter_batch_size(provedor):
     with GLOBAL["rate_limits_lock"]:
         return GLOBAL["rate_limits_aprendidos"].get(provedor, RCPT_DEFAULT)
+
 
 def adaptar_batch_size(provedor, resultado):
     with GLOBAL["rate_limits_lock"]:
@@ -610,10 +633,11 @@ def adaptar_batch_size(provedor, resultado):
             return GLOBAL["rate_limits_aprendidos"][provedor], "metade"
         return limite_atual, "mantido"
 
+
 def limpar_logs_antigos(preservar_checkpoints=True, preservar_saida=False):
     if os.path.exists(LOG_DIR):
         shutil.rmtree(LOG_DIR, ignore_errors=True)
-    os.makedirs(LOG_DIR, exist_ok=True)
+        os.makedirs(LOG_DIR, exist_ok=True)
     if os.path.exists(DIR_EMAILS):
         for f in glob.glob(os.path.join(DIR_EMAILS, "*.txt")):
             try:
@@ -634,6 +658,7 @@ def limpar_logs_antigos(preservar_checkpoints=True, preservar_saida=False):
             except Exception:
                 pass
 
+
 def excepthook_cru(exc_type, exc_value, exc_traceback):
     if LOG_FILE:
         try:
@@ -648,7 +673,9 @@ def excepthook_cru(exc_type, exc_value, exc_traceback):
         pass
     sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
+
 sys.excepthook = excepthook_cru
+
 
 def dizer(msg, save=True):
     if not GLOBAL:
@@ -669,6 +696,7 @@ def dizer(msg, save=True):
         except Exception:
             pass
 
+
 def smtp_log(msg):
     if not SMTP_LOG:
         return
@@ -679,6 +707,7 @@ def smtp_log(msg):
                 f.write("[" + ts + "] " + str(msg) + "\n")
     except Exception:
         pass
+
 
 def smtp_log_raw(worker_id, ip, provedor, msg):
     try:
@@ -691,6 +720,7 @@ def smtp_log_raw(worker_id, ip, provedor, msg):
     except Exception as e:
         debug_log("smtp_log_raw: " + str(e))
 
+
 def debug_log(msg):
     if not DEBUG_LOG:
         return
@@ -702,15 +732,30 @@ def debug_log(msg):
     except Exception:
         pass
 
+
 def registar_resposta_smtp(message_id, smtp_code, smtp_message, provider, recipient_domain, sending_account, sending_ip, domain, subdomain, attempt_number, response_time):
     try:
-        registo = {"timestamp": datetime.now(timezone.utc).isoformat(), "message_id": str(message_id or ""), "smtp_code": int(smtp_code) if smtp_code else 0, "smtp_message": str(smtp_message or "")[:500], "provider": str(provider or ""), "recipient_domain": str(recipient_domain or ""), "sending_account": str(sending_account or ""), "sending_ip": str(sending_ip or ""), "domain": str(domain or ""), "subdomain": str(subdomain or ""), "attempt_number": int(attempt_number or 1), "response_time": float(response_time or 0)}
+        registo = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message_id": str(message_id or ""),
+            "smtp_code": int(smtp_code) if smtp_code else 0,
+            "smtp_message": str(smtp_message or "")[:500],
+            "provider": str(provider or ""),
+            "recipient_domain": str(recipient_domain or ""),
+            "sending_account": str(sending_account or ""),
+            "sending_ip": str(sending_ip or ""),
+            "domain": str(domain or ""),
+            "subdomain": str(subdomain or ""),
+            "attempt_number": int(attempt_number or 1),
+            "response_time": float(response_time or 0)
+        }
         with GLOBAL["smtp_responses_lock"]:
             GLOBAL["smtp_responses"].append(registo)
             if len(GLOBAL["smtp_responses"]) > 10000:
                 GLOBAL["smtp_responses"] = GLOBAL["smtp_responses"][-10000:]
     except Exception as e:
         debug_log("registar_resposta_smtp: " + str(e))
+
 
 def log_desec_request(domain, url, method, status_code, response_body, headers, duration_ms, attempt, payload_preview=None):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -734,6 +779,7 @@ def log_desec_request(domain, url, method, status_code, response_body, headers, 
     except Exception as e:
         debug_log("log_desec_request: " + str(e))
 
+
 def upload_all_checkpoints_to_hf():
     dizer("[HF SYNC] A enviar checkpoints e resultados para HuggingFace...")
     try:
@@ -753,6 +799,7 @@ def upload_all_checkpoints_to_hf():
         dizer("[HF SYNC] Upload concluido.")
     except Exception as e:
         dizer("[HF SYNC] ERRO geral: " + str(e)[:100])
+
 
 def download_all_checkpoints_from_hf():
     dizer("[HF SYNC] A baixar checkpoints e resultados do HuggingFace...")
@@ -775,6 +822,7 @@ def download_all_checkpoints_from_hf():
     except Exception as e:
         dizer("[HF SYNC] ERRO geral no download: " + str(e)[:100])
 
+
 def trigger_next_run():
     pat = os.environ.get("GITHUB_PAT")
     repo = os.environ.get("GITHUB_REPOSITORY")
@@ -792,12 +840,14 @@ def trigger_next_run():
     except Exception as e:
         dizer(f"[AUTO-RESTART] Exceção: {str(e)[:100]}")
 
+
 def definir_fase(nome):
     GLOBAL["fase_atual"] = nome
     GLOBAL["fase_inicio"] = time.time()
     dizer("=" * 68)
     dizer(">>> " + nome)
     dizer("=" * 68)
+
 
 def marcar_fase(chave, ok, detalhe=""):
     try:
@@ -808,11 +858,14 @@ def marcar_fase(chave, ok, detalhe=""):
     CHECKPOINT.atualizar_fase(chave, ok, detalhe)
     dizer(("[OK] " if ok else "[FALHOU] ") + chave + " -> " + str(detalhe)[:150])
 
+
 def fases_faltantes_para_envio():
     return CHECKPOINT.fases_faltantes(FASES_OBRIGATORIAS_ANTES_ENVIO)
 
+
 def fase_ja_completa(chave):
     return CHECKPOINT.fase_completa(chave)
+
 
 def espaco_disco_livre_gb(path="/content"):
     try:
@@ -820,6 +873,7 @@ def espaco_disco_livre_gb(path="/content"):
         return (st.f_bavail * st.f_frsize) / float(1024 ** 3)
     except Exception:
         return -1.0
+
 
 def mutar_url(url, email_recipient, identity_id):
     try:
@@ -833,6 +887,7 @@ def mutar_url(url, email_recipient, identity_id):
         return urlunparse(parsed._replace(fragment=novo_fragment))
     except Exception:
         return url
+
 
 def mutar_html_abracadabra(html_base, conta, recipient_email):
     try:
@@ -853,6 +908,7 @@ def mutar_html_abracadabra(html_base, conta, recipient_email):
     except Exception as e:
         debug_log("mutar_html_abracadabra: " + str(e))
         return html_base
+
 
 def carregar_mail_from_variations():
     dizer("A carregar variacoes de Mail From...")
@@ -889,6 +945,7 @@ def carregar_mail_from_variations():
     GLOBAL["mail_from_idx_counter"] = 0
     return variations
 
+
 def obter_display_name(conta, idx_conta):
     variations = GLOBAL.get("mail_from_variations", [])
     if not variations:
@@ -897,6 +954,7 @@ def obter_display_name(conta, idx_conta):
             return base.replace("-", " ").replace("_", " ").title()
         return "Alex"
     return variations[idx_conta % len(variations)]
+
 
 def render_dashboard_text():
     if not GLOBAL:
@@ -941,6 +999,7 @@ def render_dashboard_text():
         print("║  " + " " * 74 + " ║", flush=True)
     print("╚" + "═" * 76 + "╝", flush=True)
 
+
 def monitor_live():
     exec_id_local = GLOBAL.get("exec_id")
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
@@ -952,6 +1011,7 @@ def monitor_live():
             pass
         time.sleep(10)
 
+
 def keep_alive_thread():
     while GLOBAL.get("monitor_running"):
         try:
@@ -960,6 +1020,7 @@ def keep_alive_thread():
         except Exception:
             pass
         time.sleep(30)
+
 
 def time_limit_watcher():
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
@@ -981,6 +1042,7 @@ def time_limit_watcher():
             os._exit(0)
         time.sleep(30)
 
+
 def periodic_checkpoint_thread():
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
         time.sleep(CHECKPOINT_TIME_INTERVAL)
@@ -995,12 +1057,14 @@ def periodic_checkpoint_thread():
         except Exception as e:
             debug_log("Erro checkpoint 1h: " + str(e))
 
+
 def check_stop_file():
     if os.path.exists(STOP_FILE):
         dizer("[STOP FILE] Detectado " + STOP_FILE + ". Parando...")
         GLOBAL["emergency_stop"] = True
         return True
     return False
+
 
 def obter_ip_colab():
     definir_fase("FASE 0 - IP do Colab + verificacao de blacklists")
@@ -1033,6 +1097,7 @@ def obter_ip_colab():
     marcar_fase("FASE0_IP", True, "IP " + ip)
     return ip
 
+
 def verificar_blacklists(ip):
     dizer("A verificar blacklists do IP " + str(ip))
     reversed_ip = ".".join(ip.split(".")[::-1])
@@ -1052,15 +1117,18 @@ def verificar_blacklists(ip):
         dizer("IP Colab limpo em " + str(len(listas)) + " listas")
     return listado
 
+
 DESEC_TOKENS_VALIDOS = []
 DOM_TOKEN = {}
 DOM_TOKEN_LOCK = threading.RLock()
+
 
 def testar_tokens_desec():
     definir_fase("FASE 1 - Validacao dos tokens deSEC")
     if fase_ja_completa("FASE1_TOKENS"):
         dizer("  Fase 1 ja concluida no checkpoint - a recarregar tokens")
         return list(DESEC_TOKENS_ALL)
+
     def _testar_um(tok):
         if GLOBAL.get("emergency_stop"):
             return None
@@ -1071,6 +1139,7 @@ def testar_tokens_desec():
         except Exception:
             pass
         return None
+
     validos = []
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(DESEC_TOKENS_ALL) or 1)) as ex:
@@ -1086,10 +1155,12 @@ def testar_tokens_desec():
     marcar_fase("FASE1_TOKENS", True, str(len(validos)) + " tokens")
     return validos
 
+
 def descobrir_dominios_desec():
     dizer("  A descobrir domínios por token deSEC (mapa bulk)...")
     dom_token = {}
     por_token = {}
+
     def _um(tok):
         try:
             r = requests.get("https://desec.io/api/v1/domains/", headers={"Authorization": "Token " + tok}, timeout=30)
@@ -1098,6 +1169,7 @@ def descobrir_dominios_desec():
         except Exception as e:
             debug_log("desec list domains: " + str(e)[:120])
         return []
+
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(14, len(DESEC_TOKENS_VALIDOS) or 1)) as ex:
             for tok, nomes in zip(DESEC_TOKENS_VALIDOS, ex.map(_um, DESEC_TOKENS_VALIDOS)):
@@ -1116,6 +1188,7 @@ def descobrir_dominios_desec():
         dizer("  AVISO: nenhum domínio listado em nenhum token")
     return dom_token
 
+
 def download_hf_com_retry(repo_id, filename, repo_type, max_retries=4):
     ultima = None
     for tentativa in range(max_retries):
@@ -1132,6 +1205,7 @@ def download_hf_com_retry(repo_id, filename, repo_type, max_retries=4):
             time.sleep(espera)
     raise ultima if ultima else RuntimeError("download_hf_com_retry falhou")
 
+
 def carregar_contas():
     definir_fase("FASE 2A - Contas DKIM + template da campanha")
     if fase_ja_completa("FASE2A_CONTAS"):
@@ -1144,7 +1218,15 @@ def carregar_contas():
         priv = (r.get("dkim_private_key_pem") or "").strip()
         if not priv.startswith("-----BEGIN "):
             continue
-        contas_all.append({"identity_id": (r.get("identity_id") or "").strip(), "sender_email": (r.get("sender_email") or "").strip(), "domain": (r.get("domain") or "").strip(), "base": (r.get("base") or "").strip(), "selector": (r.get("dkim_selector") or "default").strip(), "private_key_pem": priv, "public_key_txt": (r.get("dkim_public_txt") or "").strip()})
+        contas_all.append({
+            "identity_id": (r.get("identity_id") or "").strip(),
+            "sender_email": (r.get("sender_email") or "").strip(),
+            "domain": (r.get("domain") or "").strip(),
+            "base": (r.get("base") or "").strip(),
+            "selector": (r.get("dkim_selector") or "default").strip(),
+            "private_key_pem": priv,
+            "public_key_txt": (r.get("dkim_public_txt") or "").strip()
+        })
     # Escolher apenas contas cujos domínios pertencem aos nossos tokens deSEC
     owned = GLOBAL.get("desec_dominios", set())
     contas = []
@@ -1175,12 +1257,14 @@ def carregar_contas():
     marcar_fase("FASE2A_CONTAS", True, str(len(contas)) + " contas")
     return contas
 
+
 def carregar_template():
     p = download_hf_com_retry(HF_LOGS_REPO, "campaign_data/templates/" + CAMPAIGN['template'], "dataset")
     with open(p, "r", encoding="utf-8") as f:
         html = f.read()
     dizer("Template carregado: " + CAMPAIGN['template'] + " (" + str(len(html)) + " bytes)")
     return html
+
 
 def listar_ficheiros_repo():
     if GLOBAL.get("repo_files_cache"):
@@ -1191,13 +1275,14 @@ def listar_ficheiros_repo():
         try:
             with GLOBAL_HF_SEMAPHORE:
                 todos = list(api.list_repo_files(HF_TRADER_REPO, repo_type="dataset"))
-                GLOBAL["repo_files_cache"] = todos
-                return todos
+            GLOBAL["repo_files_cache"] = todos
+            return todos
         except Exception as e:
             ultima = e
             debug_log("list_repo_files tentativa " + str(tentativa + 1) + ": " + str(e)[:200])
             time.sleep(10 * (tentativa + 1))
     raise ultima if ultima else RuntimeError("list_repo_files falhou")
+
 
 def descobrir_provedores_reais():
     definir_fase("FASE 2B - Descoberta de provedores + resolucao de MX")
@@ -1216,6 +1301,7 @@ def descobrir_provedores_reais():
         raise RuntimeError("Nenhum provedor encontrado em " + HF_TRADER_REPO)
     return sorted(provs)
 
+
 def resolver_mx_um(prov):
     try:
         ans = dns.resolver.resolve(prov, 'MX')
@@ -1224,8 +1310,15 @@ def resolver_mx_um(prov):
             return prov, [mm[1] for mm in mxs]
         return prov, None
     except Exception:
-        fb = {"naver.com": ["mx1.mail.naver.com", "mx2.mail.naver.com"], "gmail.com": ["gmail-smtp-in.l.google.com"], "googlemail.com": ["gmail-smtp-in.l.google.com"], "mail.ru": ["mxs.mail.ru"], "bk.ru": ["mxs.mail.ru"], "list.ru": ["mxs.mail.ru"], "inbox.ru": ["mxs.mail.ru"]}
+        fb = {
+            "naver.com": ["mx1.mail.naver.com", "mx2.mail.naver.com"],
+            "gmail.com": ["gmail-smtp-in.l.google.com"],
+            "googlemail.com": ["gmail-smtp-in.l.google.com"],
+            "mail.ru": ["mxs.mail.ru"], "bk.ru": ["mxs.mail.ru"],
+            "list.ru": ["mxs.mail.ru"], "inbox.ru": ["mxs.mail.ru"]
+        }
         return (prov, fb.get(prov, None))
+
 
 def resolver_mxs_paralelo(provedores):
     dizer("A resolver MX de " + str(len(provedores)) + " provedores...")
@@ -1241,6 +1334,7 @@ def resolver_mxs_paralelo(provedores):
     marcar_fase("FASE2B_MX", len(out) > 0, str(len(out)) + "/" + str(len(provedores)) + " com MX")
     return out
 
+
 def _heartbeat_snapshot(evento_parar):
     ultimo = -1
     while not evento_parar.is_set():
@@ -1253,10 +1347,11 @@ def _heartbeat_snapshot(evento_parar):
                             n += 1
             if n != ultimo:
                 dizer("  ... snapshot em curso: " + str(n) + " parquets | livre " + "{:.1f}GB".format(espaco_disco_livre_gb()))
-                ultimo = n
+            ultimo = n
         except Exception:
             pass
         evento_parar.wait(30)
+
 
 def baixar_snapshot_repo():
     if not USAR_SNAPSHOT_PRIMEIRO:
@@ -1275,7 +1370,11 @@ def baixar_snapshot_repo():
             try:
                 dizer("  snapshot_download tentativa " + str(tentativa + 1) + "/3 ...")
                 inicio = time.time()
-                local = snapshot_download(repo_id=HF_TRADER_REPO, repo_type="dataset", token=HF_TOKEN, allow_patterns=padroes, local_dir=DIR_REPO, max_workers=max(8, min(SNAPSHOT_MAX_WORKERS, 64)), etag_timeout=60)
+                local = snapshot_download(
+                    repo_id=HF_TRADER_REPO, repo_type="dataset", token=HF_TOKEN,
+                    allow_patterns=padroes, local_dir=DIR_REPO,
+                    max_workers=max(8, min(SNAPSHOT_MAX_WORKERS, 64)), etag_timeout=60
+                )
                 decorrido = time.time() - inicio
                 contar = sum(1 for _r, _d, fs in os.walk(local or DIR_REPO) for f in fs if f.endswith(".parquet"))
                 dizer("  Snapshot OK em " + "{:.0f}".format(decorrido) + "s (" + str(contar) + " parquets)")
@@ -1291,6 +1390,7 @@ def baixar_snapshot_repo():
     finally:
         evento.set()
     return resultado
+
 
 def baixar_todos_emails_paralelo(provedores):
     definir_fase("FASE 2C - Download HuggingFace (snapshot) + extraccao de emails")
@@ -1347,6 +1447,7 @@ def baixar_todos_emails_paralelo(provedores):
     dizer("  Parquets processados: " + str(GLOBAL['pq_downloaded']) + "/" + str(GLOBAL['pq_total']) + " | falhas: " + str(GLOBAL['pq_falhados']))
     completos = (GLOBAL['pq_downloaded'] + GLOBAL['pq_falhados']) >= GLOBAL['pq_total']
     marcar_fase("FASE2C_DOWNLOAD", completos and GLOBAL['pq_downloaded'] > 0, str(GLOBAL['pq_downloaded']) + "/" + str(GLOBAL['pq_total']) + " parquets")
+
 
 def processar_provedor_emails(args):
     prov, itens = args
@@ -1443,12 +1544,13 @@ def processar_provedor_emails(args):
         pass
     if total > 0:
         CHECKPOINT.registrar_provedor_baixado(prov, total, ok_pq)
-        with GLOBAL["stats_lock"]:
-            GLOBAL["pq_downloaded"] += ok_pq
-            GLOBAL["pq_falhados"] += falha_pq
-            GLOBAL["prov_processed"] += 1
-            GLOBAL["emails_read"] += total
+    with GLOBAL["stats_lock"]:
+        GLOBAL["pq_downloaded"] += ok_pq
+        GLOBAL["pq_falhados"] += falha_pq
+        GLOBAL["prov_processed"] += 1
+        GLOBAL["emails_read"] += total
     return prov, total
+
 
 def baixar_unknowns_acumulado():
     definir_fase("FASE 2D - Blacklist persistente de USER_UNKNOWN")
@@ -1459,7 +1561,7 @@ def baixar_unknowns_acumulado():
         if local and os.path.exists(local):
             shutil.copy(local, UNKNOWN_FILE_LOCAL)
             baixou = True
-            dizer("  Ficheiro de blacklist descarregado do HuggingFace")
+        dizer("  Ficheiro de blacklist descarregado do HuggingFace")
     except Exception as e:
         dizer("  Ficheiro ainda nao existe no HuggingFace (normal na 1a execucao)")
     unknowns = set()
@@ -1475,6 +1577,7 @@ def baixar_unknowns_acumulado():
     GLOBAL["user_unknowns"] = unknowns
     dizer("  USER_UNKNOWNs activos: " + "{:,}".format(len(unknowns)))
     return unknowns
+
 
 def salvar_unknown(email, provedor):
     try:
@@ -1498,6 +1601,7 @@ def salvar_unknown(email, provedor):
     except Exception as e:
         debug_log("salvar_unknown: " + str(e))
 
+
 def registrar_aceite(email, provedor, conta_id, mx_host):
     try:
         email_lower = email.lower().strip()
@@ -1517,6 +1621,7 @@ def registrar_aceite(email, provedor, conta_id, mx_host):
         debug_log("registrar_aceite: " + str(e))
         return False
 
+
 def registrar_rejeicao(email, provedor, smtp_code, smtp_message):
     try:
         with REJEICOES_FILE_LOCK:
@@ -1529,6 +1634,7 @@ def registrar_rejeicao(email, provedor, smtp_code, smtp_message):
     except Exception as e:
         debug_log("registrar_rejeicao: " + str(e))
 
+
 def upload_unknowns_hf():
     if not os.path.exists(UNKNOWN_FILE_LOCAL):
         return
@@ -1539,6 +1645,7 @@ def upload_unknowns_hf():
     except Exception as e:
         dizer("  AVISO: upload de blacklist falhou (" + str(e)[:100] + ")")
 
+
 def gerar_ficheiros_finais():
     definir_fase("GERACAO DE FICHEIROS FINAIS")
     try:
@@ -1548,8 +1655,11 @@ def gerar_ficheiros_finais():
             with open(SAIDA_ACEITES, "w", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow(["email", "provedor", "conta_id", "mx_host", "timestamp"])
-                ts = datetime.now().isoformat()
-                for email in aceites_set:
+        ts = datetime.now().isoformat()
+        for email in aceites_set:
+            with ACEITES_FILE_LOCK:
+                with open(SAIDA_ACEITES, "a", encoding="utf-8", newline="") as f:
+                    writer = csv.writer(f)
                     writer.writerow([email, "", "", "", ts])
         dizer("  Aceites: " + "{:,}".format(len(aceites_set)))
     except Exception as e:
@@ -1718,7 +1828,7 @@ class AracloudManager:
                 return token
         except Exception as e:
             debug_log("aracloud auth " + nome_conta + ": " + str(e)[:160])
-        return None
+            return None
 
     def _listar_servidor(self, nome_conta, cred):
         token = self.tokens.get(nome_conta)
@@ -1887,7 +1997,6 @@ class AracloudManager:
         dizer("  Aracloud: " + str(len(credenciais)) + " contas com credenciais")
         total_ips = 0
         contas_funcionais = 0
-
         for nome_conta, dados in credenciais.items():
             if GLOBAL.get("emergency_stop"):
                 break
@@ -1908,7 +2017,6 @@ class AracloudManager:
             if not port_id:
                 dizer("  AVISO: port_id do servidor nao encontrado em " + nome_conta)
                 continue
-
             contas_funcionais += 1
             conta_estado = GLOBAL["aracloud_contas"].get(nome_conta, {
                 "server_id": server_id, "port_id": port_id,
@@ -1917,12 +2025,10 @@ class AracloudManager:
             })
             conta_estado["server_id"] = server_id
             conta_estado["port_id"] = port_id
-
             # Migrar estrutura antiga (lista de strings) para nova (lista de dicts)
             if conta_estado["ips_ativos"] and isinstance(conta_estado["ips_ativos"][0], str):
                 dizer("  AVISO: " + nome_conta + " tem IPs antigos sem fip_id — a descartar")
                 conta_estado["ips_ativos"] = []
-
             # Reaproveitar IPs flutuantes existentes
             for fip_info in self._listar_ips_flutuantes(nome_conta):
                 if len(conta_estado["ips_ativos"]) >= MAX_IPS_POR_CONTA:
@@ -1953,7 +2059,6 @@ class AracloudManager:
                     GLOBAL["orcamento_por_ip"].setdefault(ip_addr, {})
                 total_ips += 1
                 dizer("  Aracloud: IP existente " + ip_addr + " reaproveitado em " + nome_conta)
-
             # Criar novos até MAX_IPS_POR_CONTA (3)
             while len(conta_estado["ips_ativos"]) < MAX_IPS_POR_CONTA:
                 if GLOBAL.get("emergency_stop"):
@@ -1993,9 +2098,7 @@ class AracloudManager:
                     GLOBAL["orcamento_por_ip"][novo_ip] = {}
                 total_ips += 1
                 dizer("  Aracloud: IP " + novo_ip + " activo em " + nome_conta)
-
             GLOBAL["aracloud_contas"][nome_conta] = conta_estado
-
         CHECKPOINT.salvar_aracloud(GLOBAL["aracloud_contas"], list(GLOBAL["aracloud_ips_usados_hoje"]), GLOBAL.get("aracloud_data_reset"))
         dizer("  Aracloud: " + str(contas_funcionais) + " contas funcionais, " + str(total_ips) + " IPs activos")
         dizer("  Arquitectura real: " + str(contas_funcionais) + " contas x 3 IPs = " + str(total_ips) + " workers")
@@ -2090,6 +2193,7 @@ def abrir_canal_smtp_aracloud(ssh_client, mx_host, porta=25, timeout=None):
         debug_log("abrir_canal_smtp_aracloud " + str(mx_host) + ": " + str(e)[:160])
         return None
 
+
 def _canal_suporta_tls(sock):
     try:
         import paramiko
@@ -2102,6 +2206,7 @@ def _canal_suporta_tls(sock):
         return True
     except Exception:
         return False
+
 
 def tentar_conexao_via_aracloud(worker_ctx, mx_host, timeout, provedor):
     ip = worker_ctx.get("ip") if worker_ctx else None
@@ -2150,6 +2255,7 @@ def tentar_conexao_via_aracloud(worker_ctx, mx_host, timeout, provedor):
                 pass
         return None, None, "erro"
 
+
 def obter_socket_para_mx(mx_list, provedor, worker_ctx):
     if not mx_list:
         return None, None, None
@@ -2161,6 +2267,7 @@ def obter_socket_para_mx(mx_list, provedor, worker_ctx):
         if sock is not None:
             return sock, mx_host, "aracloud"
     return None, None, None
+
 
 def ip_publico_valido(ip):
     if not ip:
@@ -2194,6 +2301,7 @@ def ip_publico_valido(ip):
         return False
     return True
 
+
 def token_para_dominio(domain):
     with DOM_TOKEN_LOCK:
         if domain in DOM_TOKEN:
@@ -2211,6 +2319,7 @@ def token_para_dominio(domain):
             continue
     return None
 
+
 def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
     payload_preview = None
     try:
@@ -2219,8 +2328,8 @@ def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
                 if rrset.get("type") == "TXT":
                     payload_preview = json.dumps(rrset, indent=2)
                     break
-        if not payload_preview:
-            payload_preview = json.dumps(payload[0], indent=2)
+            if not payload_preview:
+                payload_preview = json.dumps(payload[0], indent=2)
     except Exception as e:
         payload_preview = "erro ao serializar: " + str(e)
     for tentativa in range(max_retries):
@@ -2264,6 +2373,7 @@ def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
             return False, "MAX_RETRIES"
     return False, "MAX_RETRIES"
 
+
 def _dividir_em_chunks_com_aspas(texto, tamanho_max=255):
     if not texto:
         return '""'
@@ -2282,6 +2392,7 @@ def _dividir_em_chunks_com_aspas(texto, tamanho_max=255):
         restante = restante[split_idx:].lstrip()
     return " ".join(['"' + c + '"' for c in chunks])
 
+
 def montar_spf_record(ips):
     if not ips:
         return '"v=spf1 ~all"'
@@ -2291,6 +2402,7 @@ def montar_spf_record(ips):
     spf_parts.append("~all")
     return _dividir_em_chunks_com_aspas(" ".join(spf_parts), 255)
 
+
 def obter_ips_para_spf():
     ips = set()
     with GLOBAL.get("ips_lock", threading.Lock()):
@@ -2298,6 +2410,7 @@ def obter_ips_para_spf():
             if ip and ip_publico_valido(ip):
                 ips.add(ip)
     return [i for i in ips if i][:MAX_SPF_IPS]
+
 
 def construir_rrsets_completos(contas_do_dominio, spf_record, ip_aracloud=None):
     rrsets = []
@@ -2319,6 +2432,7 @@ def construir_rrsets_completos(contas_do_dominio, spf_record, ip_aracloud=None):
         rrsets.append({"subname": base, "type": "A", "ttl": DESEC_TTL, "records": [ip_alvo]})
         rrsets.append({"subname": base, "type": "MX", "ttl": DESEC_TTL, "records": ["10 " + base + "." + domain + "."]})
     return rrsets
+
 
 def atualizar_dominio_completo(domain, contas_dom, spf_record, ip_aracloud=None):
     tok = token_para_dominio(domain)
@@ -2345,6 +2459,7 @@ def atualizar_dominio_completo(domain, contas_dom, spf_record, ip_aracloud=None)
             dizer("    Chunk " + str(i // DESEC_CHUNK + 1) + " FALHOU: " + str(status)[:100])
         time.sleep(1.0)
     return domain, ok_count, total_rrsets
+
 
 def fase3_dns_completo(contas):
     definir_fase("FASE 3 - DNS completo BULK (SPF+DKIM+DMARC+A+WX+MX) - 1ª vez")
@@ -2388,6 +2503,7 @@ def fase3_dns_completo(contas):
     marcar_fase("FASE3_DNS", ok_bases > 0, str(ok_bases) + "/" + str(total_bases) + " bases")
     return ok_bases > 0
 
+
 def refresh_spf_bulk(motivo=""):
     ips_spf = obter_ips_para_spf()
     if not ips_spf:
@@ -2419,6 +2535,7 @@ def refresh_spf_bulk(motivo=""):
     GLOBAL["spf_sujo"] = False
     dizer("  SPF actualizado (bulk 1 req/dom) em " + str(ok_dom) + "/" + str(len(por_dom)) + " dominios")
 
+
 def fase4_esperar_propagacao():
     definir_fase("FASE 4 - Propagacao DNS (" + str(DNS_PROPAGACAO_SEGUNDOS) + "s)")
     if fase_ja_completa("FASE4_PROPAGACAO"):
@@ -2432,6 +2549,7 @@ def fase4_esperar_propagacao():
         time.sleep(passo)
         restante -= passo
     dizer("  Propagacao concluida")
+
 
 def verificar_propagacao_amostra(contas, ip_ref=None):
     dizer("  Verificacao de propagacao (amostra de 5)")
@@ -2463,6 +2581,7 @@ def verificar_propagacao_amostra(contas, ip_ref=None):
     marcar_fase("FASE4_PROPAGACAO", True, str(ok) + "/" + str(len(amostra)) + " propagados")
     return ok >= max(1, len(amostra) // 2)
 
+
 def aplicar_mutacao_abracadabra(html_base, conta, target_emails, subject=None):
     if subject is None:
         subject = CAMPAIGN["subject"]
@@ -2487,6 +2606,7 @@ def aplicar_mutacao_abracadabra(html_base, conta, target_emails, subject=None):
     except Exception as e:
         smtp_log("DKIM falhou em " + str(conta.get('identity_id')) + ": " + str(e))
     return b
+
 
 def recv_smtp(sock, timeout=SMTP_RECV_TIMEOUT):
     sock.settimeout(timeout)
@@ -2514,6 +2634,7 @@ def recv_smtp(sock, timeout=SMTP_RECV_TIMEOUT):
         resp.append(" ".join(atual))
     return resp
 
+
 def criar_contexto_tls():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -2532,10 +2653,12 @@ def criar_contexto_tls():
         pass
     return ctx
 
+
 def get_timeout(provedor):
     if provedor in PROVEDORES_ASIATICOS:
         return SMTP_TIMEOUT_ASIATICO
     return SMTP_TIMEOUT
+
 
 def classificar_resposta_smtp(smtp_code, smtp_message, provedor):
     code = int(smtp_code) if smtp_code else 0
@@ -2573,6 +2696,7 @@ def classificar_resposta_smtp(smtp_code, smtp_message, provedor):
         return "PERMANENTE", "Rejeicao permanente generica"
     return "DESCONHECIDA", "Codigo " + str(code)
 
+
 class RetryQueue:
     def __init__(self):
         self.items = deque()
@@ -2604,7 +2728,9 @@ class RetryQueue:
             self.items = remaining
         return prontos
 
+
 RETRY_QUEUE = RetryQueue()
+
 
 def adicionar_greylist(provedor, emails_batch, tentativa):
     delay = GREYLIST_DELAY_1 if tentativa == 1 else GREYLIST_DELAY_2
@@ -2614,6 +2740,7 @@ def adicionar_greylist(provedor, emails_batch, tentativa):
         for em in emails_batch:
             GLOBAL["greylist_queue"][provedor].append({"email": em, "tentativa": tentativa, "retry_em": time.time() + delay})
     smtp_log("  GREYLIST " + provedor + ": " + str(len(emails_batch)) + " emails retry em " + str(delay) + "s (tent " + str(tentativa) + ")")
+
 
 def obter_greylist_prontos(provedor, max_items=200):
     agora = time.time()
@@ -2629,19 +2756,25 @@ def obter_greylist_prontos(provedor, max_items=200):
         GLOBAL["greylist_queue"][provedor] = restantes
     return prontos
 
+
 def salvar_checkpoint_smtp():
     try:
-        stats = {k: GLOBAL.get(k, 0) for k in ["smtp_tentativas", "smtp_aceites", "smtp_rejeitados", "smtp_user_unknown", "smtp_erros", "smtp_conexoes", "smtp_via_proxy", "smtp_via_colab", "smtp_4xx", "smtp_5xx", "smtp_retries", "smtp_abandonados"]}
+        stats = {k: GLOBAL.get(k, 0) for k in
+                 ["smtp_tentativas", "smtp_aceites", "smtp_rejeitados", "smtp_user_unknown", "smtp_erros",
+                  "smtp_conexoes", "smtp_via_proxy", "smtp_via_colab", "smtp_4xx", "smtp_5xx",
+                  "smtp_retries", "smtp_abandonados"]}
         CHECKPOINT.salvar_smtp_stats(stats)
         CHECKPOINT.salvar_por_provedor(GLOBAL.get("por_provedor", {}))
         GLOBAL["smtp_aceites_ultima_checkpoint"] = GLOBAL["smtp_aceites"]
     except Exception as e:
         debug_log("salvar_checkpoint_smtp: " + str(e))
 
+
 def talvez_salvar_checkpoint():
     diff = GLOBAL["smtp_aceites"] - GLOBAL.get("smtp_aceites_ultima_checkpoint", 0)
     if diff >= CHECKPOINT_SAVE_INTERVAL:
         salvar_checkpoint_smtp()
+
 
 def handshake_smtp(sock, conta, mx_host):
     try:
@@ -2671,6 +2804,7 @@ def handshake_smtp(sock, conta, mx_host):
         smtp_log("  Handshake falhou: " + str(e)[:140])
         return sock, False
 
+
 def aguardar_ips_aracloud(minimo, timeout_seg=900):
     definir_fase("FASE 5 - Aguardar IPs Aracloud minimo (" + str(minimo) + ")")
     inicio = time.time()
@@ -2686,6 +2820,7 @@ def aguardar_ips_aracloud(minimo, timeout_seg=900):
     n = len(GLOBAL.get("aracloud_ips_ativos", []))
     dizer("  AVISO: timeout a aguardar IPs Aracloud (tem " + str(n) + ").")
     return n > 0
+
 
 def enviar_para_provedor(task):
     if len(task) == 5:
@@ -2720,7 +2855,7 @@ def enviar_para_provedor(task):
     if cp_info:
         offset_inicial = cp_info.get("offset", 0)
         aceites_iniciais = cp_info.get("aceites", 0)
-    if cp_info.get("concluido", False) or (total_linhas > 0 and offset_inicial >= total_linhas):
+    if cp_info and (cp_info.get("concluido", False) or (total_linhas > 0 and offset_inicial >= total_linhas)):
         dizer("  " + prov + ": Ja totalmente tentado. Saltando.")
         res["aceites"] = aceites_iniciais
         res["concluido"] = True
@@ -2822,7 +2957,7 @@ def enviar_para_provedor(task):
                         bs = min(lr or rcpt_limit, len(fila), MAX_RCPT_POR_CONEXAO)
                         if bs <= 0:
                             bs = min(1, len(fila))
-                        batch = [fila.popleft() for _ in range(bs)]
+                    batch = [fila.popleft() for _ in range(bs)]
                     if not batch:
                         break
                     res["tentados"] += len(batch)
@@ -2902,7 +3037,7 @@ def enviar_para_provedor(task):
                                         res["smtp_4xx"] += 1
                                         with GLOBAL["stats_lock"]:
                                             GLOBAL["smtp_4xx"] += 1
-                                        RATE_CTRL.registar_erro_temporario(conta["identity_id"], prov, smtp_code)
+                                        RATE_CTRL.registar_erro_temporario(conta["identity_id"], provedor=prov, smtp_code=smtp_code)
                                         RETRY_QUEUE.adicionar(em, prov, attempts=1)
                                     elif classe == "BLACKLIST":
                                         res["smtp_5xx"] += 1
@@ -3040,8 +3175,8 @@ def enviar_para_provedor(task):
                     sock.close()
                 except Exception:
                     pass
-                if res["aceites"] >= META_ACEITES_POR_PROVEDOR:
-                    break
+            if res["aceites"] >= META_ACEITES_POR_PROVEDOR:
+                break
     except Exception:
         debug_log("enviar_para_provedor " + prov + ": " + traceback.format_exc())
     finally:
@@ -3063,6 +3198,7 @@ def enviar_para_provedor(task):
     GLOBAL["por_provedor"][prov] = res
     CHECKPOINT.salvar_por_provedor(GLOBAL["por_provedor"])
     return res
+
 
 def worker_loop(worker_ctx, mxs, contas, html_base):
     worker_id = worker_ctx.get("worker_id", "---")
@@ -3101,6 +3237,7 @@ def worker_loop(worker_ctx, mxs, contas, html_base):
     smtp_log_raw(worker_id, worker_ip, "---", "WORKER TERMINADO")
     with GLOBAL["workers_lock"]:
         GLOBAL["workers_ativos"] = max(0, GLOBAL.get("workers_ativos", 0) - 1)
+
 
 def fase_envio_massivo(mxs, contas, html_base):
     global ARACLOUD_MGR_SINGLETON
@@ -3156,7 +3293,8 @@ def fase_envio_massivo(mxs, contas, html_base):
         GLOBAL["status"] = "COMPLETED"
         CHECKPOINT.salvar_config(GLOBAL["exec_id"], GLOBAL.get("ip_colab"), status="COMPLETED")
         upload_all_checkpoints_to_hf()
-        marcar_fase("FASE6_ENVIO", True, str(GLOBAL['smtp_aceites']) + " aceites")
+    marcar_fase("FASE6_ENVIO", True, str(GLOBAL['smtp_aceites']) + " aceites")
+
 
 def monitor_ips_continuo():
     global ARACLOUD_MGR_SINGLETON
@@ -3182,6 +3320,7 @@ def monitor_ips_continuo():
                 GLOBAL["workers"] = aracloud_mgr.obter_lista_workers()
             except Exception as e:
                 debug_log("monitor_ips refresh SPF: " + str(e))
+
 
 def enviar_email_unico(dest, assunto, html, conta):
     worker_ctx = GLOBAL["workers"][0] if GLOBAL.get("workers") else None
@@ -3240,6 +3379,7 @@ def enviar_email_unico(dest, assunto, html, conta):
         debug_log("enviar_email_unico: " + traceback.format_exc())
         return False
 
+
 def gerar_relatorio(rt):
     assunto = "VERISCOPE V23.0 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
     linhas_fases = ""
@@ -3279,6 +3419,7 @@ th{background:#3a7d44;color:#fff;text-align:left}.ok{color:#2c5f2d;font-weight:b
 </body></html>"""
     return assunto, html
 
+
 def salvar_logs_hf():
     if GLOBAL.get("logs_uploaded"):
         return
@@ -3297,6 +3438,7 @@ def salvar_logs_hf():
     except Exception as e:
         dizer("  AVISO: upload de logs falhou (" + str(e)[:100] + ")")
 
+
 def baixar_ficheiros_campanha():
     dizer("A baixar ficheiros de campanha do HuggingFace...")
     try:
@@ -3312,14 +3454,17 @@ def baixar_ficheiros_campanha():
 # ====================================================================
 def main():
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG, ARACLOUD_MGR_SINGLETON
+
     diagnostico_ambiente_hf()
     execution_id = reset_global_state()
     download_all_checkpoints_from_hf()
     CHECKPOINT._carregar_tudo()
     config = CHECKPOINT.obter_config()
+
     if config.get("status") == "COMPLETED":
         print("[FIM] Campanha já concluída em execução anterior. A sair.", flush=True)
         sys.exit(0)
+
     tem_checkpoint = CHECKPOINT.existe_checkpoint()
     if tem_checkpoint:
         print("[RECUPERACAO] Checkpoint detectado - a retomar execucao anterior", flush=True)
@@ -3353,34 +3498,34 @@ def main():
             GLOBAL["aracloud_contas"] = aracloud_state["contas"]
             GLOBAL["aracloud_ips_usados_hoje"] = set(aracloud_state.get("ips_usados_hoje", []))
             GLOBAL["aracloud_data_reset"] = aracloud_state.get("data_ultimo_reset")
-            dizer("[RECUPERACAO] Estado Aracloud carregado: " + str(len(GLOBAL["aracloud_ips_usados_hoje"])) + " IPs usados hoje")
-            try:
-                _mgr = AracloudManager()
-                _cred = _mgr._carregar_credenciais_hf()
-                _pem_por_conta = {n: d["pem_path"] for n, d in _cred.items()}
-                reconectados = 0
-                for _nome, _estado in GLOBAL["aracloud_contas"].items():
-                    _pem = _pem_por_conta.get(_nome) or _estado.get("pem_path", "")
-                    if not _pem:
-                        continue
-                    if _mgr._autenticar(_nome, _estado):
-                        _vivos = []
-                        for ip_info in list(_estado.get("ips_ativos", [])):
-                            _ip = ip_info.get("ip") if isinstance(ip_info, dict) else ip_info
-                            _cli = _mgr._abrir_ssh(_nome, _ip, _pem)
-                            if _cli is not None:
-                                _vivos.append(ip_info)
-                                GLOBAL["aracloud_ips_ativos"].append(_ip)
-                                GLOBAL["aracloud_clients_ssh"][_ip] = _cli
-                                GLOBAL.setdefault("orcamento_por_ip", {}).setdefault(_ip, {})
-                                reconectados += 1
-                            else:
-                                dizer("  [RECUPERACAO] SSH falhou para " + _ip + " - descartado")
-                        _estado["ips_ativos"] = _vivos
-                dizer("[RECUPERACAO] " + str(reconectados) + " IPs reconectados via SSH")
-                ARACLOUD_MGR_SINGLETON = _mgr
-            except Exception as e_rec:
-                dizer("[RECUPERACAO] Erro ao reconectar IPs: " + str(e_rec)[:120])
+        dizer("[RECUPERACAO] Estado Aracloud carregado: " + str(len(GLOBAL["aracloud_ips_usados_hoje"])) + " IPs usados hoje")
+        try:
+            _mgr = AracloudManager()
+            _cred = _mgr._carregar_credenciais_hf()
+            _pem_por_conta = {n: d["pem_path"] for n, d in _cred.items()}
+            reconectados = 0
+            for _nome, _estado in GLOBAL["aracloud_contas"].items():
+                _pem = _pem_por_conta.get(_nome) or _estado.get("pem_path", "")
+                if not _pem:
+                    continue
+                if _mgr._autenticar(_nome, _estado):
+                    _vivos = []
+                    for ip_info in list(_estado.get("ips_ativos", [])):
+                        _ip = ip_info.get("ip") if isinstance(ip_info, dict) else ip_info
+                        _cli = _mgr._abrir_ssh(_nome, _ip, _pem)
+                        if _cli is not None:
+                            _vivos.append(ip_info)
+                            GLOBAL["aracloud_ips_ativos"].append(_ip)
+                            GLOBAL["aracloud_clients_ssh"][_ip] = _cli
+                            GLOBAL.setdefault("orcamento_por_ip", {}).setdefault(_ip, {})
+                            reconectados += 1
+                        else:
+                            dizer("  [RECUPERACAO] SSH falhou para " + _ip + " - descartado")
+                    _estado["ips_ativos"] = _vivos
+            dizer("[RECUPERACAO] " + str(reconectados) + " IPs reconectados via SSH")
+            ARACLOUD_MGR_SINGLETON = _mgr
+        except Exception as e_rec:
+            dizer("[RECUPERACAO] Erro ao reconectar IPs: " + str(e_rec)[:120])
         rate_limits_cp = CHECKPOINT.obter_rate_limits()
         if rate_limits_cp:
             GLOBAL["rate_limits_aprendidos"].update(rate_limits_cp)
@@ -3410,19 +3555,23 @@ def main():
     except Exception:
         pass
     GLOBAL["user_unknowns_file"] = UNKNOWN_FILE_LOCAL
+
     threading.Thread(target=monitor_live, daemon=True).start()
     threading.Thread(target=keep_alive_thread, daemon=True).start()
     threading.Thread(target=time_limit_watcher, daemon=True).start()
     threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
     time.sleep(1)
+
     dizer("VERISCOPE V23.0 HEADLESS [" + execution_id + "]")
     dizer("ARQUITETURA: " + str(MAX_IPS_POR_CONTA) + " IPs/conta x " + str(MAX_IPS_UNICOS_POR_DIA) + " únicos/conta/dia")
     dizer("CHECKPOINT: " + ("RECUPERAR" if tem_checkpoint else "NOVO"))
     baixar_ficheiros_campanha()
+
     contas = []
     html_base = ""
     mxs = {}
     rt = None
+
     try:
         ip_colab = obter_ip_colab()
         CHECKPOINT.salvar_config(execution_id, ip_colab, status="RUNNING")
@@ -3430,25 +3579,31 @@ def main():
         verificar_blacklists(ip_colab)
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         DESEC_TOKENS_VALIDOS = testar_tokens_desec()
         descobrir_dominios_desec()
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         contas = carregar_contas()
         html_base = carregar_template()
         carregar_mail_from_variations()
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         provedores = descobrir_provedores_reais()
         mxs = resolver_mxs_paralelo(provedores)
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         baixar_todos_emails_paralelo(sorted(mxs.keys()))
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         baixar_unknowns_acumulado()
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         definir_fase("FASE 2.5 - Aracloud: autenticacao + IPs flutuantes + SSH")
         aracloud_mgr = AracloudManager()
         ARACLOUD_MGR_SINGLETON = aracloud_mgr
@@ -3458,13 +3613,16 @@ def main():
             marcar_fase("FASE25_ARACLOUD", False, "0 IPs Aracloud")
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         fase3_dns_completo(contas)
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         fase4_esperar_propagacao()
         verificar_propagacao_amostra(contas)
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         # Fail-fast se FASE25 falhou
         if len(GLOBAL.get("aracloud_ips_ativos", [])) == 0 and not fase_ja_completa("FASE25_ARACLOUD"):
             dizer("  FASE 5 SALTADA (fail-fast): FASE25 falhou com 0 IPs - nada para aguardar")
@@ -3472,9 +3630,11 @@ def main():
             aguardar_ips_aracloud(5, timeout_seg=ESPERA_POOL_ANTES_ENVIO)
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
+
         threading.Thread(target=monitor_ips_continuo, daemon=True).start()
         dizer("  Monitor de IPs Aracloud activado (rotação + SPF refresh)")
         fase_envio_massivo(mxs, contas, html_base)
+
     except KeyboardInterrupt:
         GLOBAL["emergency_stop"] = True
         dizer("Interrompido pelo utilizador / paragem de emergencia")
@@ -3505,58 +3665,63 @@ def main():
             gerar_ficheiros_finais()
         except Exception as e:
             dizer("ERRO ao gerar ficheiros finais: " + str(e))
-        rt = {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0, "via_aracloud": 0, "por_provedor": GLOBAL["por_provedor"]}
-        for r in GLOBAL["por_provedor"].values():
-            for k in ("aceites", "tentados", "rejeitados", "erros", "via_aracloud"):
-                if k in r:
-                    rt[k] += r[k]
-        if GLOBAL.get("emergency_stop"):
-            dizer("Paragem de emergencia - estado guardado no checkpoint")
+
+    rt = {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0, "via_aracloud": 0, "por_provedor": GLOBAL["por_provedor"]}
+    for r in GLOBAL["por_provedor"].values():
+        for k in ("aceites", "tentados", "rejeitados", "erros", "via_aracloud"):
+            if k in r:
+                rt[k] += r[k]
+
+    if GLOBAL.get("emergency_stop"):
+        dizer("Paragem de emergencia - estado guardado no checkpoint")
+    else:
+        dizer("FASE 7 - Relatorio final para " + FINAL_DESTINATARIO)
+        cf = random.choice(contas) if contas else None
+        if cf and html_base:
+            ok1 = enviar_email_unico(FINAL_DESTINATARIO, CAMPAIGN["subject"], html_base, cf)
+            dizer("  Email da campanha: " + ("OK" if ok1 else "FALHOU"))
+            time.sleep(5)
+            ar, cr = gerar_relatorio(rt)
+            ok2 = enviar_email_unico(FINAL_DESTINATARIO, ar, cr, cf)
+            dizer("  Relatorio HTML: " + ("OK" if ok2 else "FALHOU"))
+            try:
+                rp = os.path.join(DIR_AUDIT, "relatorio_final.html")
+                with open(rp, "w", encoding="utf-8") as f:
+                    f.write(cr)
+                api = HfApi(token=HF_TOKEN)
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_0_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                dizer("  Relatorio enviado para HuggingFace")
+            except Exception as e:
+                dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
         else:
-            dizer("FASE 7 - Relatorio final para " + FINAL_DESTINATARIO)
-            cf = random.choice(contas) if contas else None
-            if cf and html_base:
-                ok1 = enviar_email_unico(FINAL_DESTINATARIO, CAMPAIGN["subject"], html_base, cf)
-                dizer("  Email da campanha: " + ("OK" if ok1 else "FALHOU"))
-                time.sleep(5)
-                ar, cr = gerar_relatorio(rt)
-                ok2 = enviar_email_unico(FINAL_DESTINATARIO, ar, cr, cf)
-                dizer("  Relatorio HTML: " + ("OK" if ok2 else "FALHOU"))
-                try:
-                    rp = os.path.join(DIR_AUDIT, "relatorio_final.html")
-                    with open(rp, "w", encoding="utf-8") as f:
-                        f.write(cr)
-                    api = HfApi(token=HF_TOKEN)
-                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_0_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
-                    dizer("  Relatorio enviado para HuggingFace")
-                except Exception as e:
-                    dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
-            else:
-                dizer("  Sem conta/template para enviar o relatorio final")
-            try:
-                upload_unknowns_hf()
-            except Exception as e:
-                debug_log("upload_unknowns_hf: " + str(e))
-            try:
-                salvar_logs_hf()
-            except Exception as e:
-                debug_log("salvar_logs_hf: " + str(e))
-        taxa = rt['aceites'] / max(1, rt['tentados']) * 100
-        print("\n" + "=" * 70, flush=True)
-        print("EXECUCAO TERMINADA - " + str(GLOBAL.get('exec_id')), flush=True)
-        print("  Aceites (250 OK) : " + "{:,}".format(rt['aceites']), flush=True)
-        print("  Tentativas       : " + "{:,}".format(rt['tentados']), flush=True)
-        print("  Taxa             : " + "{:.2f}".format(taxa) + "%", flush=True)
-        print("  Via Aracloud     : " + "{:,}".format(rt['via_aracloud']), flush=True)
-        print("  IPs Aracloud     : " + str(len(GLOBAL.get('aracloud_ips_ativos', []))), flush=True)
-        print("  IPs usados hoje  : " + str(len(GLOBAL.get('aracloud_ips_usados_hoje', set()))), flush=True)
-        print("  USER_UNKNOWN     : " + "{:,}".format(len(GLOBAL['user_unknowns'])), flush=True)
-        print("  4xx / 5xx        : " + "{:,}".format(GLOBAL.get('smtp_4xx', 0)) + " / " + "{:,}".format(GLOBAL.get('smtp_5xx', 0)), flush=True)
-        print("  Retries / Aband. : " + "{:,}".format(GLOBAL.get('smtp_retries', 0)) + " / " + "{:,}".format(GLOBAL.get('smtp_abandonados', 0)), flush=True)
-        print("  DESec            : " + str(GLOBAL.get('desec_requests', 0)) + " req | " + str(GLOBAL.get('desec_success', 0)) + " OK | " + str(GLOBAL.get('desec_failures', 0)) + " fail", flush=True)
-        print("  STATUS FINAL     : " + str(GLOBAL.get("status", "UNKNOWN")), flush=True)
-        print("=" * 70, flush=True)
+            dizer("  Sem conta/template para enviar o relatorio final")
+
+    try:
+        upload_unknowns_hf()
+    except Exception as e:
+        debug_log("upload_unknowns_hf: " + str(e))
+    try:
+        salvar_logs_hf()
+    except Exception as e:
+        debug_log("salvar_logs_hf: " + str(e))
+
+    taxa = rt['aceites'] / max(1, rt['tentados']) * 100
+    print("\n" + "=" * 70, flush=True)
+    print("EXECUCAO TERMINADA - " + str(GLOBAL.get('exec_id')), flush=True)
+    print("  Aceites (250 OK) : " + "{:,}".format(rt['aceites']), flush=True)
+    print("  Tentativas       : " + "{:,}".format(rt['tentados']), flush=True)
+    print("  Taxa             : " + "{:.2f}".format(taxa) + "%", flush=True)
+    print("  Via Aracloud     : " + "{:,}".format(rt['via_aracloud']), flush=True)
+    print("  IPs Aracloud     : " + str(len(GLOBAL.get('aracloud_ips_ativos', []))), flush=True)
+    print("  IPs usados hoje  : " + str(len(GLOBAL.get('aracloud_ips_usados_hoje', set()))), flush=True)
+    print("  USER_UNKNOWN     : " + "{:,}".format(len(GLOBAL['user_unknowns'])), flush=True)
+    print("  4xx / 5xx        : " + "{:,}".format(GLOBAL.get('smtp_4xx', 0)) + " / " + "{:,}".format(GLOBAL.get('smtp_5xx', 0)), flush=True)
+    print("  Retries / Aband. : " + "{:,}".format(GLOBAL.get('smtp_retries', 0)) + " / " + "{:,}".format(GLOBAL.get('smtp_abandonados', 0)), flush=True)
+    print("  DESec            : " + str(GLOBAL.get('desec_requests', 0)) + " req | " + str(GLOBAL.get('desec_success', 0)) + " OK | " + str(GLOBAL.get('desec_failures', 0)) + " fail", flush=True)
+    print("  STATUS FINAL     : " + str(GLOBAL.get("status", "UNKNOWN")), flush=True)
+    print("=" * 70, flush=True)
+
 
 if __name__ == "__main__":
     main()
