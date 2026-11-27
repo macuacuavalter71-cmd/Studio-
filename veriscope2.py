@@ -3,15 +3,9 @@
 VERISCOPE V23.0 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
 PARALELISMO HIERÁRQUICO: 30 IPs ROTATIVOS (ARACLOUD) x WORKERS INDEPENDENTES
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
-V23.0: Camada cirúrgica sobre o V19.6.1. NADA do motor original foi removido.
-- 10 contas Aracloud x 3 IPs simultâneos = 30 IPs ativos
-- 20 IPs únicos por conta por dia (200 disponíveis)
-- deSEC Bulk (SPF + A + Wildcard) em rotações; completo na 1a execução
-- 30 Workers independentes com round-robin por provedor
-- Rate limit adaptativo + Greylist handler (2min / 4min)
-- Orçamento de 1000 emails por IP por provedor
-- Classificação exata dos 66 provedores testados
-Compatível com checkpoints do V19.6.1.
+V23.0 FIX: descoberta dinâmica das pastas servidor-XX-<sufixo> no HF,
+Contas.json (C maiúsculo), auth Keystone 2 passos, compute_url do catálogo,
+SSH ubuntu, singleton do AracloudManager, reconexão SSH na recuperação.
 """
 import os
 import sys
@@ -30,10 +24,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 import subprocess
 
 def install_packages():
-    packages = [
-        "requests", "dnspython", "dkimpy", "cryptography", "pandas",
-        "pyarrow", "huggingface_hub", "psutil", "pysocks", "paramiko"
-    ]
+    packages = ["requests", "dnspython", "dkimpy", "cryptography", "pandas", "pyarrow", "huggingface_hub", "psutil", "pysocks", "paramiko"]
     for pkg in packages:
         try:
             __import__(pkg.replace("-", "_"))
@@ -150,9 +141,6 @@ DESEC_BACKOFF_MULTIPLIER = 2.0
 CONTAS_PARALELAS_POR_PROVEDOR = 10
 PROVEDORES_PARALELOS = 407
 
-# ============================================================
-# V23.0 - ARQUITETURA ARACLOUD
-# ============================================================
 ARACLOUD_AUTH_URL = "https://vhi.servermania.com:5000/v3"
 NUM_CONTAS_ARACLOUD = 10
 MAX_IPS_POR_CONTA = 3
@@ -162,31 +150,23 @@ NUM_WORKERS = 30
 SSH_CONNECT_TIMEOUT = 20
 SSH_TUNNEL_TIMEOUT = 15
 
-# V23.0 - Greylist handler (relatório 7.4)
 GREYLIST_DELAY_1 = 120
 GREYLIST_DELAY_2 = 240
 GREYLIST_MAX_TENTATIVAS = 3
 
-# V23.0 - Rate limit adaptativo (relatório 7.2)
 RATE_REDUCAO_452 = 0.75
 RATE_INCREM_SUCESSO = 5
 TAXA_SUCESSO_AUMENTAR = 0.90
 
-# V23.0 FIX: Singleton do AracloudManager
 ARACLOUD_MGR_SINGLETON = None
 
-# ============================================================
-# RCPT LIMITS - APENAS os 66 provedores testados na V22.3.0
-# ============================================================
 RCPT_LIMITS = {
-    # --- GRUPO A: Aceitação perfeita (V23) ---
     "telkomsa.net": 1715, "rock.com": 2126, "walla.com": 1908,
     "sprintpcs.com": 1000, "pisem.net": 1000, "oranga.fr": 1000,
     "bebo.com": 100, "cemsmail.org": 100, "dreamwiz.com": 100,
     "google.com": 100, "googlemail.com": 100, "youtube.com": 100,
     "bk.ru": 100, "inbox.ru": 100, "list.ru": 100, "mail.ru": 100,
     "ukr.net": 100, "yahoo.co.jp": 100, "nate.com": 77, "yeah.net": 79,
-    # --- GRUPO B: Rate limit controlado (V23) ---
     "telus.net": 75, "student.gccisd.net": 47, "amorki.pl": 67,
     "poczta.onet.pl": 48, "onet.eu": 48, "onet.pl": 48, "op.pl": 48,
     "freemail.hu": 45, "myemailboxmail.com": 50, "trbvm.com": 50,
@@ -195,51 +175,37 @@ RCPT_LIMITS = {
     "breakthru.com": 20, "clear.net.nz": 20, "pchome.com.tw": 20,
     "yandex.com": 16, "poczta.pl": 13, "terra.com.br": 13,
     "yandex.ru": 11, "dodgeit.com": 10,
-    # --- GRUPO C: Greylist / restritivo (V23) ---
     "seznam.cz": 2, "gmail.com": 2, "interia.eu": 2, "interia.pl": 2,
     "poczta.fm": 8,
-    # --- GRUPO E: Extremamente restritivo (V23) ---
     "21cn.com": 3, "docomo.ne.jp": 3, "gaggle.net": 1,
 }
 RCPT_DEFAULT = 50
 
-# V23.0 - Lista EXATA dos 66 provedores testados na V22.3.0
 PROVEDORES_66_TESTADOS = {
-    # GRUPO A (20)
     "telkomsa.net", "rock.com", "walla.com", "sprintpcs.com", "pisem.net",
     "oranga.fr", "bebo.com", "cemsmail.org", "dreamwiz.com", "google.com",
     "googlemail.com", "youtube.com", "bk.ru", "inbox.ru", "list.ru",
     "mail.ru", "ukr.net", "yahoo.co.jp", "nate.com", "yeah.net",
-    # GRUPO B (25)
     "telus.net", "student.gccisd.net", "amorki.pl", "poczta.onet.pl",
     "onet.eu", "onet.pl", "op.pl", "freemail.hu", "myemailboxmail.com",
     "trbvm.com", "ya.ru", "qq.com", "vip.qq.com", "foxmail.com",
     "naver.com", "eyou.com", "email.cz", "hot.com", "breakthru.com",
     "clear.net.nz", "pchome.com.tw", "yandex.com", "poczta.pl",
     "terra.com.br", "yandex.ru", "dodgeit.com",
-    # GRUPO C (5)
     "seznam.cz", "gmail.com", "interia.eu", "interia.pl", "poczta.fm",
-    # GRUPO D (11) - agora incluídos
     "libero.it", "virgilio.it", "live.co.uk", "yandex.net", "vipmail.net",
     "clearwire.net", "i.ua", "rambler.ru", "love.com", "univision.com", "qip.ru",
-    # GRUPO E (3)
     "21cn.com", "docomo.ne.jp", "gaggle.net",
 }
 PROVEDORES_USAVEIS = list(PROVEDORES_66_TESTADOS)
 
-# V23.0 - Provedores greylist (retry 2min/4min)
 PROVEDORES_GREYLIST = {"seznam.cz", "gmail.com", "i.ua"}
-
-# V23.0 - Provedores com tracking por IP (rotação agressiva)
 PROVEDORES_TRACKING_IP = {"qq.com", "vip.qq.com", "foxmail.com"}
 
 PROVEDORES_ASIATICOS = {
     "naver.com", "nate.com", "dreamwiz.com",
     "qq.com", "foxmail.com", "vip.qq.com", "yeah.net",
-    "21cn.com", "eyou.com",
-    "docomo.ne.jp",
-    "yahoo.co.jp",
-    "pchome.com.tw",
+    "21cn.com", "eyou.com", "docomo.ne.jp", "yahoo.co.jp", "pchome.com.tw",
 }
 
 CAMPAIGN_MAP = {
@@ -294,15 +260,9 @@ CP_DESEC = os.path.join(BASE_LOCAL, "cp_desec.json")
 CP_OFFSETS = os.path.join(BASE_LOCAL, "cp_offsets.json")
 CP_RATE_LIMITS = os.path.join(BASE_LOCAL, "cp_rate_limits.json")
 
-PROXY_SEARCH_DIRS = [
-    DIR_PROXIES, "/content/proxies", "/content", "/content/data",
-    "/content/uploads", "./", "/content/drive/MyDrive", "/content/drive/MyDrive/proxies", "/content/drive/MyDrive/Proxies",
-]
+PROXY_SEARCH_DIRS = [DIR_PROXIES, "/content/proxies", "/content", "/content/data", "/content/uploads", "./", "/content/drive/MyDrive", "/content/drive/MyDrive/proxies", "/content/drive/MyDrive/Proxies"]
 
-FASES_OBRIGATORIAS_ANTES_ENVIO = [
-    "FASE0_IP", "FASE1_TOKENS", "FASE2A_CONTAS", "FASE2B_MX",
-    "FASE2C_DOWNLOAD", "FASE25_ARACLOUD", "FASE3_DNS", "FASE4_PROPAGACAO",
-]
+FASES_OBRIGATORIAS_ANTES_ENVIO = ["FASE0_IP", "FASE1_TOKENS", "FASE2A_CONTAS", "FASE2B_MX", "FASE2C_DOWNLOAD", "FASE25_ARACLOUD", "FASE3_DNS", "FASE4_PROPAGACAO"]
 
 def diagnostico_ambiente_hf():
     print("\n" + "=" * 80, flush=True)
@@ -312,16 +272,6 @@ def diagnostico_ambiente_hf():
     print(f"[ENV] HF_TOKEN existe: {'SIM' if hf_token else 'NÃO'}", flush=True)
     print(f"[ENV] HF_TOKEN length: {len(hf_token)}", flush=True)
     print(f"[ENV] HF_TOKEN starts with 'hf_': {hf_token.startswith('hf_') if hf_token else False}", flush=True)
-    print("\n[ENV] Variáveis de ambiente críticas:", flush=True)
-    critical_keys = ["HF_TOKEN", "COLAB_TOKEN_JSON", "GITHUB_PAT", "GITHUB_REPOSITORY", "PYTHONUNBUFFERED"]
-    for k in critical_keys:
-        v = os.environ.get(k, "")
-        if k == "HF_TOKEN" and v:
-            print(f"  - {k}: [REDACTED - {len(v)} chars]", flush=True)
-        elif k == "COLAB_TOKEN_JSON" and v:
-            print(f"  - {k}: [REDACTED JSON]", flush=True)
-        else:
-            print(f"  - {k}: {v}", flush=True)
     print("\n[HF HUB] A testar api.whoami()...", flush=True)
     try:
         from huggingface_hub import HfApi
@@ -336,32 +286,18 @@ def diagnostico_ambiente_hf():
         print(f"[HF HUB] Exception Message: {str(e)}", flush=True)
         if hasattr(e, 'response') and e.response is not None:
             print(f"[HF HUB] HTTP Status: {e.response.status_code}", flush=True)
-            print(f"[HF HUB] Response Headers: {dict(e.response.headers)}", flush=True)
             print(f"[HF HUB] Response Text: {e.response.text[:500]}", flush=True)
-        import traceback
-        print(f"[HF HUB] Traceback cru:", flush=True)
         traceback.print_exc()
     print("=" * 80 + "\n", flush=True)
 
 
 class CheckpointManager:
     def __init__(self):
-        self.locks = {
-            "fases": threading.Lock(), "provedores": threading.Lock(), "pool": threading.Lock(),
-            "smtp": threading.Lock(), "contas": threading.Lock(), "config": threading.Lock(),
-            "aracloud": threading.Lock(), "desec": threading.Lock(), "offsets": threading.Lock(),
-            "rate_limits": threading.Lock(),
-        }
+        self.locks = {"fases": threading.Lock(), "provedores": threading.Lock(), "pool": threading.Lock(), "smtp": threading.Lock(), "contas": threading.Lock(), "config": threading.Lock(), "aracloud": threading.Lock(), "desec": threading.Lock(), "offsets": threading.Lock(), "rate_limits": threading.Lock()}
         self.states = {
             "fases": {}, "provedores": {},
             "pool": {"pool": [], "scraping_checkpoint": 0, "raw_count": 0},
-            "smtp": {
-                "smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0,
-                "smtp_user_unknown": 0, "smtp_erros": 0, "smtp_conexoes": 0,
-                "smtp_via_proxy": 0, "smtp_via_colab": 0, "smtp_4xx": 0, "smtp_5xx": 0,
-                "smtp_retries": 0, "smtp_abandonados": 0, "provedor_index": {},
-                "por_provedor": {}, "por_ip": {},
-            },
+            "smtp": {"smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0, "smtp_user_unknown": 0, "smtp_erros": 0, "smtp_conexoes": 0, "smtp_via_proxy": 0, "smtp_via_colab": 0, "smtp_4xx": 0, "smtp_5xx": 0, "smtp_retries": 0, "smtp_abandonados": 0, "provedor_index": {}, "por_provedor": {}, "por_ip": {}},
             "contas": {"contas_carregadas": 0, "contas_idx": 0},
             "config": {"exec_id": None, "ip_colab": None, "start_time": None, "last_save": None, "status": "NEW"},
             "aracloud": {"contas": {}, "ips_usados_hoje": [], "data_ultimo_reset": None},
@@ -369,11 +305,7 @@ class CheckpointManager:
             "offsets": {"global_por_provedor": {}},
             "rate_limits": {"aprendidos": {}},
         }
-        self.paths = {
-            "fases": CP_FASES, "provedores": CP_PROVEDORES, "pool": CP_POOL, "smtp": CP_SMTP,
-            "contas": CP_CONTAS, "config": CP_CONFIG, "aracloud": CP_ARACLOUD, "desec": CP_DESEC,
-            "offsets": CP_OFFSETS, "rate_limits": CP_RATE_LIMITS,
-        }
+        self.paths = {"fases": CP_FASES, "provedores": CP_PROVEDORES, "pool": CP_POOL, "smtp": CP_SMTP, "contas": CP_CONTAS, "config": CP_CONFIG, "aracloud": CP_ARACLOUD, "desec": CP_DESEC, "offsets": CP_OFFSETS, "rate_limits": CP_RATE_LIMITS}
         self._carregar_tudo()
 
     def _carregar_tudo(self):
@@ -441,9 +373,7 @@ class CheckpointManager:
 
     def registrar_provedor_baixado(self, provedor, total_emails, total_parquets):
         with self.locks["provedores"]:
-            self.states["provedores"][provedor] = {
-                "emails": total_emails, "parquets": total_parquets, "concluido": True, "ts": datetime.now().isoformat()
-            }
+            self.states["provedores"][provedor] = {"emails": total_emails, "parquets": total_parquets, "concluido": True, "ts": datetime.now().isoformat()}
             self._salvar_um("provedores")
 
     def provedor_ja_baixado(self, provedor):
@@ -464,9 +394,7 @@ class CheckpointManager:
 
     def carregar_pool(self):
         with self.locks["pool"]:
-            return (list(self.states["pool"].get("pool", [])),
-                    int(self.states["pool"].get("scraping_checkpoint", 0)),
-                    int(self.states["pool"].get("raw_count", 0)))
+            return (list(self.states["pool"].get("pool", [])), int(self.states["pool"].get("scraping_checkpoint", 0)), int(self.states["pool"].get("raw_count", 0)))
 
     def salvar_smtp_stats(self, stats_dict):
         with self.locks["smtp"]:
@@ -479,10 +407,7 @@ class CheckpointManager:
         with self.locks["smtp"]:
             if "provedor_index" not in self.states["smtp"]:
                 self.states["smtp"]["provedor_index"] = {}
-            self.states["smtp"]["provedor_index"][provedor] = {
-                "offset": offset, "aceites": aceites, "concluido": concluido, "total_linhas": total_linhas,
-                "ts": datetime.now().isoformat(),
-            }
+            self.states["smtp"]["provedor_index"][provedor] = {"offset": offset, "aceites": aceites, "concluido": concluido, "total_linhas": total_linhas, "ts": datetime.now().isoformat()}
             self._salvar_um("smtp")
 
     def obter_provedor_index(self, provedor):
@@ -509,20 +434,7 @@ class CheckpointManager:
 
     def obter_smtp_stats(self):
         with self.locks["smtp"]:
-            return {
-                "smtp_tentativas": self.states["smtp"].get("smtp_tentativas", 0),
-                "smtp_aceites": self.states["smtp"].get("smtp_aceites", 0),
-                "smtp_rejeitados": self.states["smtp"].get("smtp_rejeitados", 0),
-                "smtp_user_unknown": self.states["smtp"].get("smtp_user_unknown", 0),
-                "smtp_erros": self.states["smtp"].get("smtp_erros", 0),
-                "smtp_conexoes": self.states["smtp"].get("smtp_conexoes", 0),
-                "smtp_via_proxy": self.states["smtp"].get("smtp_via_proxy", 0),
-                "smtp_via_colab": self.states["smtp"].get("smtp_via_colab", 0),
-                "smtp_4xx": self.states["smtp"].get("smtp_4xx", 0),
-                "smtp_5xx": self.states["smtp"].get("smtp_5xx", 0),
-                "smtp_retries": self.states["smtp"].get("smtp_retries", 0),
-                "smtp_abandonados": self.states["smtp"].get("smtp_abandonados", 0),
-            }
+            return {k: self.states["smtp"].get(k, 0) for k in ["smtp_tentativas", "smtp_aceites", "smtp_rejeitados", "smtp_user_unknown", "smtp_erros", "smtp_conexoes", "smtp_via_proxy", "smtp_via_colab", "smtp_4xx", "smtp_5xx", "smtp_retries", "smtp_abandonados"]}
 
     def salvar_config(self, exec_id, ip_colab, status="RUNNING"):
         with self.locks["config"]:
@@ -597,23 +509,6 @@ class CheckpointManager:
                     os.remove(path)
             except Exception:
                 pass
-        self.states = {
-            "fases": {}, "provedores": {},
-            "pool": {"pool": [], "scraping_checkpoint": 0, "raw_count": 0},
-            "smtp": {
-                "smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0,
-                "smtp_user_unknown": 0, "smtp_erros": 0, "smtp_conexoes": 0,
-                "smtp_via_proxy": 0, "smtp_via_colab": 0, "smtp_4xx": 0, "smtp_5xx": 0,
-                "smtp_retries": 0, "smtp_abandonados": 0, "provedor_index": {},
-                "por_provedor": {}, "por_ip": {},
-            },
-            "contas": {"contas_carregadas": 0, "contas_idx": 0},
-            "config": {"exec_id": None, "ip_colab": None, "start_time": None, "last_save": None, "status": "NEW"},
-            "aracloud": {"contas": {}, "ips_usados_hoje": [], "data_ultimo_reset": None},
-            "desec": {"dominios_ativos": [], "baseline_hash": "", "ultima_atualizacao": None},
-            "offsets": {"global_por_provedor": {}},
-            "rate_limits": {"aprendidos": {}},
-        }
 
 CHECKPOINT = CheckpointManager()
 GLOBAL = {}
@@ -652,17 +547,13 @@ def reset_global_state():
         "smtp_responses_lock": threading.Lock(), "checkpoint_loaded": False, "modo_recuperacao": False,
         "desec_requests": 0, "desec_success": 0, "desec_failures": 0, "desec_last_request": 0,
         "status": "NEW", "ultimo_checkpoint_tempo": time.time(),
-        # V23.0 - Estado Aracloud
         "aracloud_contas": {}, "aracloud_lock": threading.Lock(), "aracloud_ips_ativos": [],
         "aracloud_ips_usados_hoje": set(), "aracloud_data_reset": None, "aracloud_clients_ssh": {},
         "smtp_via_aracloud": 0,
-        # V23.0 - Workers hierárquicos (30)
         "workers": [], "workers_lock": threading.Lock(), "workers_ativos": 0,
-        # V23.0 - Greylist handler + rate limits aprendidos
         "greylist_queue": {}, "greylist_lock": threading.Lock(),
         "rate_limits_aprendidos": dict(RCPT_LIMITS), "rate_limits_lock": threading.Lock(),
         "orcamento_por_ip": {}, "orcamento_lock": threading.Lock(),
-        # V23.0 - Offsets anti-reenvio
         "offsets_por_provedor": {}, "offsets_lock": threading.Lock(),
     })
     return execution_id
@@ -676,12 +567,7 @@ class RateController:
     def _get_identity_stats(self, identity_id):
         with self.lock:
             if identity_id not in self.stats:
-                self.stats[identity_id] = {
-                    "aceites": 0, "rejeitados": 0, "erros_consecutivos": 0,
-                    "rate_current": float(RATE_BASELINE_EMAILS_MIN), "ultima_acao": time.time(),
-                    "ultima_resposta_4xx": 0, "ultima_resposta_5xx": 0, "throttled_ate": 0,
-                    "greylist_ate": 0, "provedor_stats": {},
-                }
+                self.stats[identity_id] = {"aceites": 0, "rejeitados": 0, "erros_consecutivos": 0, "rate_current": float(RATE_BASELINE_EMAILS_MIN), "ultima_acao": time.time(), "ultima_resposta_4xx": 0, "ultima_resposta_5xx": 0, "throttled_ate": 0, "greylist_ate": 0, "provedor_stats": {}}
             return self.stats[identity_id]
 
     def pode_enviar(self, identity_id, provedor):
@@ -876,20 +762,7 @@ def debug_log(msg):
 
 def registar_resposta_smtp(message_id, smtp_code, smtp_message, provider, recipient_domain, sending_account, sending_ip, domain, subdomain, attempt_number, response_time):
     try:
-        registo = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "message_id": str(message_id or ""),
-            "smtp_code": int(smtp_code) if smtp_code else 0,
-            "smtp_message": str(smtp_message or "")[:500],
-            "provider": str(provider or ""),
-            "recipient_domain": str(recipient_domain or ""),
-            "sending_account": str(sending_account or ""),
-            "sending_ip": str(sending_ip or ""),
-            "domain": str(domain or ""),
-            "subdomain": str(subdomain or ""),
-            "attempt_number": int(attempt_number or 1),
-            "response_time": float(response_time or 0),
-        }
+        registo = {"timestamp": datetime.now(timezone.utc).isoformat(), "message_id": str(message_id or ""), "smtp_code": int(smtp_code) if smtp_code else 0, "smtp_message": str(smtp_message or "")[:500], "provider": str(provider or ""), "recipient_domain": str(recipient_domain or ""), "sending_account": str(sending_account or ""), "sending_ip": str(sending_ip or ""), "domain": str(domain or ""), "subdomain": str(subdomain or ""), "attempt_number": int(attempt_number or 1), "response_time": float(response_time or 0)}
         with GLOBAL["smtp_responses_lock"]:
             GLOBAL["smtp_responses"].append(registo)
             if len(GLOBAL["smtp_responses"]) > 10000:
@@ -1295,9 +1168,7 @@ def testar_tokens_desec():
     definir_fase("FASE 1 - Validacao dos tokens deSEC")
     if fase_ja_completa("FASE1_TOKENS"):
         dizer("  Fase 1 ja concluida no checkpoint - a recarregar tokens")
-        DESEC_TOKENS_VALIDOS_LOCAL = list(DESEC_TOKENS_ALL)
-        dizer("  " + str(len(DESEC_TOKENS_VALIDOS_LOCAL)) + " tokens disponiveis (assumidos validos)")
-        return DESEC_TOKENS_VALIDOS_LOCAL
+        return list(DESEC_TOKENS_ALL)
     def _testar_um(tok):
         if GLOBAL.get("emergency_stop"):
             return None
@@ -1348,18 +1219,10 @@ def carregar_contas():
         rows = list(csv.DictReader(f))
     contas = []
     for r in rows:
-        priv = (r.get("dkim_private_key_pem") or "").strip().replace("\n", "\n")
+        priv = (r.get("dkim_private_key_pem") or "").strip()
         if not priv.startswith("-----BEGIN "):
             continue
-        contas.append({
-            "identity_id": (r.get("identity_id") or "").strip(),
-            "sender_email": (r.get("sender_email") or "").strip(),
-            "domain": (r.get("domain") or "").strip(),
-            "base": (r.get("base") or "").strip(),
-            "selector": (r.get("dkim_selector") or "default").strip(),
-            "private_key_pem": priv,
-            "public_key_txt": (r.get("dkim_public_txt") or "").strip(),
-        })
+        contas.append({"identity_id": (r.get("identity_id") or "").strip(), "sender_email": (r.get("sender_email") or "").strip(), "domain": (r.get("domain") or "").strip(), "base": (r.get("base") or "").strip(), "selector": (r.get("dkim_selector") or "default").strip(), "private_key_pem": priv, "public_key_txt": (r.get("dkim_public_txt") or "").strip()})
         if len(contas) >= 30:
             dizer("  Limite de 30 contas DKIM atingido")
             break
@@ -1699,7 +1562,6 @@ def baixar_unknowns_acumulado():
                         unknowns.add(row["email"].lower().strip())
         except Exception as e:
             dizer("  AVISO: blacklist local ilegivel (" + str(e)[:80] + ") - a comecar vazia")
-            debug_log("ler blacklist local: " + traceback.format_exc())
             unknowns = set()
     GLOBAL["user_unknowns"] = unknowns
     dizer("  USER_UNKNOWNs activos: " + "{:,}".format(len(unknowns)) + (" (descarregado)" if baixou else " (ficheiro novo, sera criado)"))
@@ -1771,13 +1633,11 @@ def upload_unknowns_hf():
         dizer("  USER_UNKNOWNs enviados para HuggingFace (" + "{:,}".format(len(GLOBAL['user_unknowns'])) + ")")
     except Exception as e:
         dizer("  AVISO: upload de blacklist falhou (" + str(e)[:100] + ")")
-        debug_log("upload unknowns: " + traceback.format_exc())
 
 def gerar_ficheiros_finais():
     definir_fase("GERACAO DE FICHEIROS FINAIS")
     dizer("A gerar ficheiro de aceites 250 OK...")
     try:
-        aceites_set = set()
         with GLOBAL["aceites_lock"]:
             aceites_set = set(GLOBAL.get("aceites_emails", set()))
         if os.path.exists(SAIDA_ACEITES):
@@ -1792,7 +1652,6 @@ def gerar_ficheiros_finais():
             dizer("  Ficheiro " + SAIDA_ACEITES + " criado com " + "{:,}".format(len(aceites_set)) + " aceites")
     except Exception as e:
         dizer("  ERRO ao gerar ficheiro de aceites: " + str(e))
-        debug_log("gerar_ficheiros_finais aceites: " + traceback.format_exc())
     dizer("A gerar ficheiro final de user_unknowns...")
     try:
         if os.path.exists(UNKNOWN_FILE_LOCAL):
@@ -1804,36 +1663,23 @@ def gerar_ficheiros_finais():
             dizer("  (sem ficheiro de user_unknowns para copiar)")
     except Exception as e:
         dizer("  ERRO ao copiar user_unknowns: " + str(e))
-        debug_log("gerar_ficheiros_finais unknowns: " + traceback.format_exc())
     dizer("A enviar ficheiros para HuggingFace...")
     try:
         api = HfApi(token=HF_TOKEN)
         ts_upload = datetime.now().strftime('%Y%m%d_%H%M%S')
-        if os.path.exists(SAIDA_ACEITES):
-            try:
-                api.upload_file(path_or_fileobj=SAIDA_ACEITES, path_in_repo="results/aceites_250ok_" + ts_upload + ".csv", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
-                dizer("  Ficheiro de aceites enviado para HuggingFace")
-            except Exception as e:
-                dizer("  ERRO upload aceites: " + str(e)[:120])
-        if os.path.exists(SAIDA_UNKNOWN):
-            try:
-                api.upload_file(path_or_fileobj=SAIDA_UNKNOWN, path_in_repo="results/user_unknowns_" + ts_upload + ".csv", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
-                dizer("  Ficheiro de user_unknowns enviado para HuggingFace")
-            except Exception as e:
-                dizer("  ERRO upload unknowns: " + str(e)[:120])
-        if os.path.exists(SAIDA_REJEICAOES):
-            try:
-                api.upload_file(path_or_fileobj=SAIDA_REJEICAOES, path_in_repo="results/rejeicoes_5xx_" + ts_upload + ".csv", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
-                dizer("  Ficheiro de rejeicoes enviado para HuggingFace")
-            except Exception as e:
-                dizer("  ERRO upload rejeicoes: " + str(e)[:120])
+        for fpath, nome in [(SAIDA_ACEITES, "aceites_250ok_"), (SAIDA_UNKNOWN, "user_unknowns_"), (SAIDA_REJEICAOES, "rejeicoes_5xx_")]:
+            if os.path.exists(fpath):
+                try:
+                    api.upload_file(path_or_fileobj=fpath, path_in_repo="results/" + nome + ts_upload + ".csv", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                    dizer("  Enviado: " + nome + ts_upload + ".csv")
+                except Exception as e:
+                    dizer("  ERRO upload " + nome + ": " + str(e)[:120])
     except Exception as e:
         dizer("  ERRO geral no upload: " + str(e))
-        debug_log("upload_finais: " + traceback.format_exc())
 
 
 # ====================================================================
-# V23.0 - ARACLOUD MANAGER (COM CORREÇÕES FATAIS APLICADAS)
+# V23.0 - ARACLOUD MANAGER (CORRIGIDO: descoberta dinâmica do repo HF)
 # ====================================================================
 class AracloudManager:
     def __init__(self):
@@ -1841,80 +1687,135 @@ class AracloudManager:
         self.contas = {}
         self.tokens = {}
         self.ssh_clients = {}
-        self.compute_urls = {}   # V23.0 FIX: URL da API Nova por conta
+        self.compute_urls = {}
 
     def _carregar_credenciais_hf(self):
+        """V23.0 FIX: descobre as pastas servidor-XX-<sufixo> no repo HF,
+        baixa credenciais.json + k.pem + Contas.json (C maiúsculo ou minúsculo)."""
         os.makedirs(DIR_ARACLOUD, exist_ok=True)
         credenciais = {}
-        for i in range(1, NUM_CONTAS_ARACLOUD + 1):
-            nome = "servidor-" + str(i).zfill(2)
+        try:
+            api = HfApi(token=HF_TOKEN)
+            fs = list(api.list_repo_files(repo_id=HF_ARACLOUD_REPO, repo_type="dataset"))
+        except Exception as e:
+            dizer("  AVISO: falha ao listar repo " + HF_ARACLOUD_REPO + ": " + str(e)[:120])
+            return credenciais
+        dizer("  Repo " + HF_ARACLOUD_REPO + ": " + str(len(fs)) + " ficheiros")
+        pastas = sorted({f.split("/")[0] for f in fs if f.startswith("servidor-") and "/" in f})
+        dizer("  Pastas de servidor: " + str(len(pastas)) + " -> " + ", ".join(pastas))
+        for pasta in pastas:
             try:
-                local_cred = hf_hub_download(repo_id=HF_ARACLOUD_REPO, filename=nome + "/credenciais.json", repo_type="dataset", token=HF_TOKEN, force_download=True)
-                local_pem = hf_hub_download(repo_id=HF_ARACLOUD_REPO, filename=nome + "/k.pem", repo_type="dataset", token=HF_TOKEN, force_download=True)
+                fcred = pasta + "/credenciais.json"
+                fpem = pasta + "/k.pem"
+                if fcred not in fs:
+                    dizer("  AVISO: " + pasta + " sem credenciais.json")
+                    continue
+                fcontas = None
+                for cand in (pasta + "/Contas.json", pasta + "/contas.json", pasta + "/conta.json"):
+                    if cand in fs:
+                        fcontas = cand
+                        break
+                local_cred = hf_hub_download(repo_id=HF_ARACLOUD_REPO, filename=fcred, repo_type="dataset", token=HF_TOKEN, force_download=True)
                 with open(local_cred, "r", encoding="utf-8") as f:
                     dados = json.load(f)
-                try:
-                    local_contas = hf_hub_download(repo_id=HF_ARACLOUD_REPO, filename=nome + "/contas.json", repo_type="dataset", token=HF_TOKEN, force_download=True)
+                if "api" not in dados:
+                    dados["api"] = {}
+                if fcontas:
+                    local_contas = hf_hub_download(repo_id=HF_ARACLOUD_REPO, filename=fcontas, repo_type="dataset", token=HF_TOKEN, force_download=True)
                     with open(local_contas, "r", encoding="utf-8") as f:
-                        contas_data = json.load(f)
-                    if "api" not in dados:
-                        dados["api"] = {}
-                    if "domain_id" in contas_data:
-                        dados["api"]["domain_id"] = contas_data["domain_id"]
-                    if "project_id" in contas_data:
-                        dados["api"]["project_id"] = contas_data["project_id"]
-                    if "identity_url" in contas_data:
-                        dados["api"]["identity_url"] = contas_data["identity_url"]
-                    if "api_users" in contas_data:
-                        dados["api"]["api_users"] = contas_data["api_users"]
-                    dizer("  ✅ " + nome + ": contas.json OK (domain=" + str(contas_data.get("domain_id", "?")) + ", project=" + str(contas_data.get("project_id", "?"))[:12] + "...)")
-                except Exception as e_contas:
-                    dizer("  ⚠️ " + nome + ": contas.json não encontrado (" + str(e_contas)[:80] + ") — a usar valores por defeito")
-                credenciais[nome] = {"cred": dados, "pem_path": local_pem}
+                        cd = json.load(f)
+                    for k in ("domain_id", "project_id", "identity_url"):
+                        if k in cd:
+                            dados["api"][k] = cd[k]
+                    if "api_users" in cd:
+                        dados["api"]["api_users"] = cd["api_users"]
+                    dizer("  ✅ " + pasta + ": " + fcontas.split("/")[-1] + " OK (domain=" + str(cd.get("domain_id", "?"))[:12] + "... project=" + str(cd.get("project_id", "?"))[:12] + "...)")
+                else:
+                    dizer("  ⚠️ " + pasta + ": sem Contas.json - auth descobrira o projeto")
+                pem_path = ""
+                if fpem in fs:
+                    pem_path = hf_hub_download(repo_id=HF_ARACLOUD_REPO, filename=fpem, repo_type="dataset", token=HF_TOKEN, force_download=True)
+                    try:
+                        os.chmod(pem_path, 0o600)
+                    except Exception:
+                        pass
+                else:
+                    dizer("  ⚠️ " + pasta + ": sem k.pem")
+                credenciais[pasta] = {"cred": dados, "pem_path": pem_path}
             except Exception as e:
-                dizer("  ⚠️ ERRO 404 ou falha ao baixar credenciais de " + nome + ": " + str(e)[:100])
-                dizer("  👉 VERIFIQUE: Os ficheiros 'credenciais.json', 'k.pem' e 'contas.json' existem no repo HF '" + HF_ARACLOUD_REPO + "'?")
-                debug_log("aracloud credenciais " + nome + ": " + traceback.format_exc())
+                dizer("  ⚠️ ERRO em " + pasta + ": " + str(e)[:120])
+                debug_log("aracloud cred " + pasta + ": " + traceback.format_exc())
         return credenciais
 
     def _autenticar(self, nome_conta, cred):
+        """Keystone v3 com fallback: scoped direto (project_id do Contas.json);
+        se falhar, unscoped -> GET /auth/projects -> scoped. Extrai compute_url."""
         api = cred.get("api", {})
         user = api.get("utilizador") or api.get("user", "")
         password = api.get("password") or api.get("pass", "")
         domain_id = api.get("domain_id", "default")
         project_id = api.get("project_id", "")
-        auth_url = api.get("identity_url", self.auth_url)
-        payload = {
-            "auth": {
-                "identity": {
-                    "methods": ["password"],
-                    "password": {
-                        "user": {"name": user, "domain": {"id": domain_id}, "password": password}
-                    }
-                },
-                "scope": {"project": {"id": project_id}}
-            }
-        }
+        auth_url = (api.get("identity_url") or self.auth_url).rstrip("/")
+        if not user or not password:
+            dizer("  AVISO: " + nome_conta + " sem utilizador/password")
+            return None
+        identity = {"methods": ["password"], "password": {"user": {"name": user, "domain": {"id": domain_id}, "password": password}}}
         try:
-            r = requests.post(auth_url + "/auth/tokens", json=payload, timeout=30, verify=False)
-            if r.status_code in (200, 201):
-                token = r.headers.get("X-Subject-Token")
-                if token:
-                    self.tokens[nome_conta] = token
-                    # V23.0 FIX: Extrair compute_url do catálogo de serviços
+            token = None
+            catalog = []
+            if project_id:
+                r = requests.post(auth_url + "/auth/tokens", json={"auth": {"identity": identity, "scope": {"project": {"id": project_id}}}}, timeout=30, verify=False)
+                if r.status_code in (200, 201):
+                    token = r.headers.get("X-Subject-Token")
                     try:
                         catalog = r.json().get("token", {}).get("catalog", [])
-                        for service in catalog:
-                            if service.get("type") == "compute":
-                                for endpoint in service.get("endpoints", []):
-                                    if endpoint.get("interface") == "public":
-                                        self.compute_urls[nome_conta] = endpoint["url"].rstrip("/")
-                                        dizer("  ✅ " + nome_conta + ": compute_url = " + self.compute_urls[nome_conta][:60] + "...")
-                                        break
+                    except Exception:
+                        catalog = []
+                else:
+                    debug_log("aracloud auth scoped " + nome_conta + ": HTTP " + str(r.status_code))
+            if not token:
+                r1 = requests.post(auth_url + "/auth/tokens", json={"auth": {"identity": identity}}, timeout=30, verify=False)
+                if r1.status_code not in (200, 201):
+                    debug_log("aracloud auth unscoped " + nome_conta + ": HTTP " + str(r1.status_code))
+                    return None
+                t1 = r1.headers.get("X-Subject-Token")
+                projects = []
+                try:
+                    rp = requests.get(auth_url + "/auth/projects", headers={"X-Auth-Token": t1}, timeout=30, verify=False)
+                    if rp.status_code == 200:
+                        projects = rp.json().get("projects", [])
+                except Exception:
+                    pass
+                if not projects:
+                    debug_log("aracloud auth " + nome_conta + ": sem projetos")
+                    return None
+                pid = project_id or projects[0].get("id")
+                r2 = requests.post(auth_url + "/auth/tokens", json={"auth": {"identity": identity, "scope": {"project": {"id": pid}}}}, timeout=30, verify=False)
+                if r2.status_code not in (200, 201):
+                    debug_log("aracloud auth scoped2 " + nome_conta + ": HTTP " + str(r2.status_code))
+                    return None
+                token = r2.headers.get("X-Subject-Token")
+                try:
+                    catalog = r2.json().get("token", {}).get("catalog", [])
+                except Exception:
+                    catalog = []
+            if token:
+                self.tokens[nome_conta] = token
+                cu = None
+                for service in catalog:
+                    if service.get("type") == "compute":
+                        for ep in service.get("endpoints", []):
+                            if ep.get("interface") == "public":
+                                cu = ep.get("url", "").rstrip("/")
                                 break
-                    except Exception as e_cat:
-                        debug_log("catalog parse " + nome_conta + ": " + str(e_cat)[:120])
-                    return token
+                        if cu:
+                            break
+                if cu:
+                    self.compute_urls[nome_conta] = cu
+                    dizer("  ✅ " + nome_conta + ": compute_url = " + cu[:60])
+                else:
+                    dizer("  ⚠️ " + nome_conta + ": sem endpoint compute no catalogo")
+                return token
         except Exception as e:
             debug_log("aracloud auth " + nome_conta + ": " + str(e)[:160])
         return None
@@ -1923,22 +1824,22 @@ class AracloudManager:
         token = self.tokens.get(nome_conta)
         if not token:
             return None
-        project_id = cred.get("api", {}).get("project_id", "")
-        hostname = cred.get("hostname", "")
-        # V23.0 FIX: usar compute_url (Nova API) em vez de auth_url (Keystone)
         compute_url = self.compute_urls.get(nome_conta)
         if not compute_url:
             dizer("  ❌ " + nome_conta + ": compute_url não disponível")
             return None
+        hostname = cred.get("hostname", "") or cred.get("name", "")
         try:
             r = requests.get(compute_url + "/servers/detail", headers={"X-Auth-Token": token}, timeout=30, verify=False)
             if r.status_code == 200:
                 servers = r.json().get("servers", [])
                 for s in servers:
-                    if s.get("name") == hostname or hostname in s.get("name", ""):
+                    if hostname and (s.get("name") == hostname or hostname in s.get("name", "")):
                         return s["id"]
                 if servers:
                     return servers[0]["id"]
+            else:
+                debug_log("aracloud listar " + nome_conta + ": HTTP " + str(r.status_code))
         except Exception as e:
             debug_log("aracloud listar " + nome_conta + ": " + str(e)[:160])
         return None
@@ -1947,16 +1848,14 @@ class AracloudManager:
         token = self.tokens.get(nome_conta)
         if not token:
             return None
-        # V23.0 FIX: usar compute_url
         compute_url = self.compute_urls.get(nome_conta)
         if not compute_url:
             return None
         try:
             r = requests.post(compute_url + "/os-floating-ips", headers={"X-Auth-Token": token, "Content-Type": "application/json"}, json={}, timeout=30, verify=False)
             if r.status_code in (200, 201):
-                data = r.json()
-                ip_info = data.get("floating_ip", {})
-                return ip_info.get("ip")
+                return r.json().get("floating_ip", {}).get("ip")
+            debug_log("aracloud criar ip " + nome_conta + ": HTTP " + str(r.status_code))
         except Exception as e:
             debug_log("aracloud criar ip " + nome_conta + ": " + str(e)[:160])
         return None
@@ -1993,20 +1892,21 @@ class AracloudManager:
         if paramiko is None:
             debug_log("paramiko indisponivel - sem tunel SSH")
             return None
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(
-                hostname=ip,
-                username="ubuntu",   # V23.0 FIX: era "root" - deve ser ubuntu
-                key_filename=pem_path,
-                timeout=SSH_CONNECT_TIMEOUT,
-                allow_agent=False,
-                look_for_keys=False
-            )
-            return client
-        except Exception as e:
-            debug_log("aracloud ssh " + nome_conta + " " + ip + ": " + str(e)[:160])
+        if not pem_path or not os.path.exists(pem_path):
+            debug_log("ssh " + nome_conta + ": sem pem")
+            return None
+        for usuario in ("ubuntu", "root"):
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                try:
+                    client.connect(hostname=ip, username=usuario, key_filename=pem_path, timeout=SSH_CONNECT_TIMEOUT, allow_agent=False, look_for_keys=False)
+                except Exception:
+                    pkey = paramiko.RSAKey.from_private_key_file(pem_path)
+                    client.connect(hostname=ip, username=usuario, pkey=pkey, timeout=SSH_CONNECT_TIMEOUT, allow_agent=False, look_for_keys=False)
+                return client
+            except Exception as e:
+                debug_log("aracloud ssh " + nome_conta + " " + ip + " (" + usuario + "): " + str(e)[:120])
         return None
 
     def _reset_diario_se_necessario(self):
@@ -2027,6 +1927,9 @@ class AracloudManager:
                 break
             cred = dados["cred"]
             pem_path = dados["pem_path"]
+            if not pem_path:
+                dizer("  AVISO: " + nome_conta + " sem k.pem - saltado")
+                continue
             token = self._autenticar(nome_conta, cred)
             if not token:
                 dizer("  AVISO: falha de autenticacao em " + nome_conta)
@@ -2035,10 +1938,9 @@ class AracloudManager:
             if not server_id:
                 dizer("  AVISO: servidor nao encontrado em " + nome_conta)
                 continue
-            conta_estado = GLOBAL["aracloud_contas"].get(nome_conta, {
-                "server_id": server_id, "ips_ativos": [], "total_ips_unicos": 0, "ciclo_atual": 1, "pem_path": pem_path,
-            })
+            conta_estado = GLOBAL["aracloud_contas"].get(nome_conta, {"server_id": server_id, "ips_ativos": [], "total_ips_unicos": 0, "ciclo_atual": 1, "pem_path": pem_path})
             conta_estado["server_id"] = server_id
+            conta_estado["pem_path"] = pem_path
             while len(conta_estado["ips_ativos"]) < MAX_IPS_POR_CONTA:
                 if GLOBAL.get("emergency_stop"):
                     break
@@ -2090,13 +1992,7 @@ class AracloudManager:
                 if c["domain"] == dominio:
                     conta_dkim = c
                     break
-            workers.append({
-                "worker_id": "W" + str(i + 1).zfill(2),
-                "ip": ip,
-                "domain": dominio,
-                "conta_dkim": conta_dkim,
-                "ssh_client": GLOBAL.get("aracloud_clients_ssh", {}).get(ip),
-            })
+            workers.append({"worker_id": "W" + str(i + 1).zfill(2), "ip": ip, "domain": dominio, "conta_dkim": conta_dkim, "ssh_client": GLOBAL.get("aracloud_clients_ssh", {}).get(ip)})
         return workers
 
     def rodar_ip(self, ip):
@@ -2149,9 +2045,6 @@ class AracloudManager:
         return novo_ip
 
 
-# ====================================================================
-# V23.0 - TRANSPORTE EXCLUSIVO VIA TÚNEL SSH ARACLOUD
-# ====================================================================
 def abrir_canal_smtp_aracloud(ssh_client, mx_host, porta=25, timeout=None):
     if ssh_client is None:
         return None
@@ -2349,7 +2242,6 @@ def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
                 wait_calc = int(DESEC_BACKOFF_BASE * (DESEC_BACKOFF_MULTIPLIER ** tentativa))
                 wait = max(wait_hdr, wait_calc)
                 dizer("  Rate limit deSEC (tentativa " + str(tentativa + 1) + "/" + str(max_retries) + "). A esperar " + str(wait) + "s...")
-                debug_log("Rate limit deSEC: " + r.text[:200])
                 time.sleep(wait + 1)
                 continue
             if r.status_code in (500, 502, 503, 504):
@@ -2367,8 +2259,7 @@ def desec_put_com_retry(url, headers, payload, domain, max_retries=5):
             log_desec_request(domain=domain, url=url, method="PUT", status_code=-1, response_body=str(e), headers={}, duration_ms=duracao_ms, attempt=tentativa + 1, payload_preview=payload_preview)
             debug_log("desec_put tentativa " + str(tentativa + 1) + ": " + str(e)[:160])
             if tentativa < max_retries - 1:
-                wait = 3 * (tentativa + 1)
-                time.sleep(wait)
+                time.sleep(3 * (tentativa + 1))
                 continue
             return False, "MAX_RETRIES"
     return False, "MAX_RETRIES"
@@ -2453,20 +2344,12 @@ def atualizar_dominio_completo(domain, contas_dom, spf_record, ip_aracloud=None)
         chunk_num = (i // DESEC_CHUNK) + 1
         total_chunks = (total_rrsets + DESEC_CHUNK - 1) // DESEC_CHUNK
         dizer("    Chunk " + str(chunk_num) + "/" + str(total_chunks) + " (" + str(len(chunk)) + " rrsets)...")
-        try:
-            for rrset in chunk:
-                if rrset.get("type") == "TXT":
-                    debug_log("DESec TXT Sample for " + domain + " (chunk " + str(chunk_num) + "): " + json.dumps(rrset))
-                    break
-        except Exception as e:
-            debug_log("Erro ao logar payload: " + str(e))
         ok, status = desec_put_com_retry(url, headers, chunk, domain)
         if ok:
             ok_count += len(chunk)
             dizer("    Chunk " + str(chunk_num) + " OK (" + str(status) + ")")
         else:
             dizer("    Chunk " + str(chunk_num) + " FALHOU: " + str(status)[:100])
-            debug_log("chunk " + str(chunk_num) + " de " + domain + " falhou: " + str(status))
         time.sleep(1.0)
     return domain, ok_count, total_rrsets
 
@@ -2482,7 +2365,6 @@ def fase3_dns_completo(contas):
     ips_spf = obter_ips_para_spf()
     spf_record = montar_spf_record(ips_spf)
     dizer("  SPF com " + str(len(ips_spf)) + " IPs Aracloud")
-    debug_log("SPF final (com aspas literais): " + spf_record[:500])
     por_dom = defaultdict(list)
     for c in contas:
         por_dom[c["domain"]].append(c)
@@ -2631,7 +2513,6 @@ def aplicar_mutacao_abracadabra(html_base, conta, target_emails, subject=None):
         b = sig + b
     except Exception as e:
         smtp_log("DKIM falhou em " + str(conta.get('identity_id')) + ": " + str(e))
-        debug_log("DKIM: " + traceback.format_exc())
     return b
 
 def recv_smtp(sock, timeout=SMTP_RECV_TIMEOUT):
@@ -2656,8 +2537,8 @@ def recv_smtp(sock, timeout=SMTP_RECV_TIMEOUT):
                 atual = []
         if len(buf) > 8 * 1024 * 1024:
             break
-        if atual:
-            resp.append(" ".join(atual))
+    if atual:
+        resp.append(" ".join(atual))
     return resp
 
 def criar_contexto_tls():
@@ -2785,14 +2666,7 @@ def obter_greylist_prontos(provedor, max_items=200):
 
 def salvar_checkpoint_smtp():
     try:
-        stats = {
-            "smtp_tentativas": GLOBAL["smtp_tentativas"], "smtp_aceites": GLOBAL["smtp_aceites"],
-            "smtp_rejeitados": GLOBAL["smtp_rejeitados"], "smtp_user_unknown": GLOBAL["smtp_user_unknown"],
-            "smtp_erros": GLOBAL["smtp_erros"], "smtp_conexoes": GLOBAL["smtp_conexoes"],
-            "smtp_via_proxy": GLOBAL.get("smtp_via_proxy", 0), "smtp_via_colab": GLOBAL.get("smtp_via_colab", 0),
-            "smtp_4xx": GLOBAL.get("smtp_4xx", 0), "smtp_5xx": GLOBAL.get("smtp_5xx", 0),
-            "smtp_retries": GLOBAL.get("smtp_retries", 0), "smtp_abandonados": GLOBAL.get("smtp_abandonados", 0),
-        }
+        stats = {k: GLOBAL.get(k, 0) for k in ["smtp_tentativas", "smtp_aceites", "smtp_rejeitados", "smtp_user_unknown", "smtp_erros", "smtp_conexoes", "smtp_via_proxy", "smtp_via_colab", "smtp_4xx", "smtp_5xx", "smtp_retries", "smtp_abandonados"]}
         CHECKPOINT.salvar_smtp_stats(stats)
         CHECKPOINT.salvar_por_provedor(GLOBAL.get("por_provedor", {}))
         GLOBAL["smtp_aceites_ultima_checkpoint"] = GLOBAL["smtp_aceites"]
@@ -2805,11 +2679,8 @@ def talvez_salvar_checkpoint():
         salvar_checkpoint_smtp()
 
 def handshake_smtp(sock, conta, mx_host):
-    worker_id = conta.get("_worker_id", "---")
-    ip_w = conta.get("_worker_ip", "---")
     try:
-        ehlo_cmd = "EHLO " + str(conta['identity_id']) + "\r\n"
-        sock.sendall(ehlo_cmd.encode())
+        sock.sendall(("EHLO " + str(conta['identity_id']) + "\r\n").encode())
         smtp_log("  -> EHLO " + str(conta['identity_id']))
         ehlo_resp = recv_smtp(sock)
         ehlo_text = "\n".join(ehlo_resp) if ehlo_resp else ""
@@ -2818,9 +2689,7 @@ def handshake_smtp(sock, conta, mx_host):
             return sock, False
         if "STARTTLS" in ehlo_text.upper() and _canal_suporta_tls(sock):
             sock.sendall(b"STARTTLS\r\n")
-            smtp_log("  -> STARTTLS")
             tls_resp = recv_smtp(sock)
-            smtp_log("   <- STARTTLS: " + str(tls_resp)[:120])
             if tls_resp and tls_resp[0].startswith("220"):
                 try:
                     ctx = criar_contexto_tls()
@@ -2884,7 +2753,6 @@ def enviar_para_provedor(task):
                 total_linhas += 1
     except Exception as e:
         debug_log("Contar linhas " + prov + ": " + str(e))
-        total_linhas = 0
     cp_info = CHECKPOINT.obter_provedor_index(prov)
     offset_inicial = 0
     aceites_iniciais = 0
@@ -2943,12 +2811,10 @@ def enviar_para_provedor(task):
                     if email in GLOBAL["user_unknowns"]:
                         continue
                 janela.append(email)
-            retries_prontos = RETRY_QUEUE.obter_prontos(max_items=200)
-            for retry_email, retry_prov, retry_attempts in retries_prontos:
+            for retry_email, retry_prov, retry_attempts in RETRY_QUEUE.obter_prontos(max_items=200):
                 if retry_prov == prov and retry_email not in janela:
                     janela.append(retry_email)
-            greylist_prontos = obter_greylist_prontos(prov, max_items=200)
-            for g_item in greylist_prontos:
+            for g_item in obter_greylist_prontos(prov, max_items=200):
                 if g_item["email"] not in janela:
                     janela.append(g_item["email"])
             if not janela:
@@ -3051,7 +2917,7 @@ def enviar_para_provedor(task):
                                 except Exception:
                                     pass
                                 smtp_message = " ".join(rr)
-                                registar_resposta_smtp(message_id=None, smtp_code=smtp_code, smtp_message=smtp_message, provider=prov, recipient_domain=em.split("@")[-1] if "@" in em else "", sending_account=conta.get("sender_email", ""), sending_ip=worker_ip, domain=conta.get("domain", ""), subdomain=conta.get("base", ""), attempt_number=1, response_time=response_time)
+                                registar_resposta_smtp(None, smtp_code, smtp_message, prov, em.split("@")[-1] if "@" in em else "", conta.get("sender_email", ""), worker_ip, conta.get("domain", ""), conta.get("base", ""), 1, response_time)
                                 if rr[0].startswith("250") or rr[0].startswith("251"):
                                     aceitos.append(em)
                                     RATE_CTRL.registar_sucesso(conta["identity_id"], prov)
@@ -3074,13 +2940,7 @@ def enviar_para_provedor(task):
                                         too_many_detectado = True
                                         RATE_CTRL.registar_erro_temporario(conta["identity_id"], prov, smtp_code)
                                         RETRY_QUEUE.adicionar(em, prov, attempts=1)
-                                    elif classe == "CONEXAO_FECHADA" or classe == "MAILBOX_BUSY":
-                                        res["smtp_4xx"] += 1
-                                        with GLOBAL["stats_lock"]:
-                                            GLOBAL["smtp_4xx"] += 1
-                                        RATE_CTRL.registar_erro_temporario(conta["identity_id"], prov, smtp_code)
-                                        RETRY_QUEUE.adicionar(em, prov, attempts=1)
-                                    elif classe == "TEMPORARIA" or classe == "THROTTLE":
+                                    elif classe in ("CONEXAO_FECHADA", "MAILBOX_BUSY", "TEMPORARIA", "THROTTLE"):
                                         res["smtp_4xx"] += 1
                                         with GLOBAL["stats_lock"]:
                                             GLOBAL["smtp_4xx"] += 1
@@ -3106,7 +2966,7 @@ def enviar_para_provedor(task):
                                         with GLOBAL["stats_lock"]:
                                             GLOBAL["smtp_rejeitados"] += 1
                                         break
-                                    elif classe == "PERMANENTE" or classe == "REPUTACAO" or classe == "QUOTA_EXCEEDED":
+                                    else:
                                         res["smtp_5xx"] += 1
                                         with GLOBAL["stats_lock"]:
                                             GLOBAL["smtp_5xx"] += 1
@@ -3272,8 +3132,6 @@ def worker_loop(worker_ctx, mxs, contas, html_base):
             orc_ip = GLOBAL["orcamento_por_ip"].get(worker_ip, {})
             if orc_ip.get(prov, 0) >= IP_BUDGET_POR_PROVEDOR:
                 continue
-        with GLOBAL["greylist_lock"]:
-            gl_pendentes = sum(1 for it in GLOBAL.get("greylist_queue", {}).get(prov, []) if it.get("retry_em", 0) > time.time())
         task = (prov, mxs[prov], contas, html_base, worker_ctx)
         try:
             resultado = enviar_para_provedor(task)
@@ -3299,6 +3157,7 @@ def worker_loop(worker_ctx, mxs, contas, html_base):
         GLOBAL["workers_ativos"] = max(0, GLOBAL.get("workers_ativos", 0) - 1)
 
 def fase_envio_massivo(mxs, contas, html_base):
+    global ARACLOUD_MGR_SINGLETON
     definir_fase("FASE 6 - Envio massivo PARALELO HIERÁRQUICO (30 workers Aracloud)")
     faltam = fases_faltantes_para_envio()
     if faltam:
@@ -3309,7 +3168,6 @@ def fase_envio_massivo(mxs, contas, html_base):
         dizer("  FASE 6 BLOQUEADA - sem contas DKIM")
         marcar_fase("FASE6_ENVIO", False, "sem contas")
         return
-    # V23.0 FIX: Usar o manager singleton
     aracloud_mgr = ARACLOUD_MGR_SINGLETON or AracloudManager()
     workers_config = aracloud_mgr.obter_lista_workers()
     if not workers_config:
@@ -3364,8 +3222,8 @@ def fase_envio_massivo(mxs, contas, html_base):
         marcar_fase("FASE6_ENVIO", True, str(GLOBAL['smtp_aceites']) + " aceites / " + str(GLOBAL['smtp_tentativas']) + " tentativas")
 
 def monitor_ips_continuo():
+    global ARACLOUD_MGR_SINGLETON
     dizer("[MONITOR-IP] Thread de monitoramento de IPs Aracloud iniciada")
-    # V23.0 FIX: Usar o manager singleton
     aracloud_mgr = ARACLOUD_MGR_SINGLETON or AracloudManager()
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
         time.sleep(60)
@@ -3375,7 +3233,6 @@ def monitor_ips_continuo():
                 break
             with GLOBAL["orcamento_lock"]:
                 orc_ip = GLOBAL["orcamento_por_ip"].get(ip, {})
-                total_orcamento_usado = sum(orc_ip.values())
                 provedores_esgotados = sum(1 for v in orc_ip.values() if v >= IP_BUDGET_POR_PROVEDOR)
             if provedores_esgotados >= len(PROVEDORES_USAVEIS) // 2:
                 dizer("[MONITOR-IP] IP " + ip + " esgotou orçamento em " + str(provedores_esgotados) + " provedores - a rodar")
@@ -3408,8 +3265,7 @@ def enviar_email_unico(dest, assunto, html, conta):
             sock = None
             try:
                 if worker_ctx:
-                    timeout = 30
-                    sock, banner, status = tentar_conexao_via_aracloud(worker_ctx, mxh, timeout, dominio)
+                    sock, banner, status = tentar_conexao_via_aracloud(worker_ctx, mxh, 30, dominio)
                 else:
                     smtp_log("FINAL: sem worker Aracloud disponível")
                     return False
@@ -3425,7 +3281,6 @@ def enviar_email_unico(dest, assunto, html, conta):
                         sock.close()
                     except Exception:
                         pass
-                    sock = None
                     continue
                 sock.sendall(("RCPT TO:<" + dest + ">\r\n").encode())
                 rr = recv_smtp(sock)
@@ -3434,7 +3289,6 @@ def enviar_email_unico(dest, assunto, html, conta):
                         sock.close()
                     except Exception:
                         pass
-                    sock = None
                     continue
                 sock.sendall(b"DATA\r\n")
                 dr = recv_smtp(sock)
@@ -3443,7 +3297,6 @@ def enviar_email_unico(dest, assunto, html, conta):
                         sock.close()
                     except Exception:
                         pass
-                    sock = None
                     continue
                 corpo = payload
                 if not corpo.endswith(b"\r\n"):
@@ -3475,7 +3328,6 @@ def enviar_email_unico(dest, assunto, html, conta):
         return False
     except Exception as e:
         debug_log("enviar_email_unico: " + traceback.format_exc())
-        smtp_log("enviar_email_unico fatal: " + str(e)[:140])
         return False
 
 def gerar_relatorio(rt):
@@ -3646,23 +3498,20 @@ def main():
                 GLOBAL[k] = v
         GLOBAL["smtp_aceites_ultima_checkpoint"] = GLOBAL["smtp_aceites"]
         GLOBAL["por_provedor"] = CHECKPOINT.obter_por_provedor()
-        por_prov_cp = CHECKPOINT.obter_por_provedor()
-        for prov_nome, prov_info in por_prov_cp.items():
+        for prov_nome, prov_info in GLOBAL["por_provedor"].items():
             if isinstance(prov_info, dict) and prov_info.get("concluido", False):
                 GLOBAL["provedores_concluidos_set"].add(prov_nome)
         GLOBAL["provs_concluidos"] = len(GLOBAL["provedores_concluidos_set"])
         with GLOBAL["stats_lock"]:
             for chave, info in CHECKPOINT.states["fases"].items():
                 GLOBAL["fases"][chave] = info
-        
-        # V23.0 FIX: Recuperar estado Aracloud e REABRIR TÚNEIS SSH
+        # V23.0 FIX - Recuperar estado Aracloud E reabrir túneis SSH
         aracloud_state = CHECKPOINT.obter_aracloud()
         if aracloud_state.get("contas"):
             GLOBAL["aracloud_contas"] = aracloud_state["contas"]
             GLOBAL["aracloud_ips_usados_hoje"] = set(aracloud_state.get("ips_usados_hoje", []))
             GLOBAL["aracloud_data_reset"] = aracloud_state.get("data_ultimo_reset")
             dizer("[RECUPERACAO] Estado Aracloud carregado: " + str(len(GLOBAL["aracloud_ips_usados_hoje"])) + " IPs usados hoje")
-            
             try:
                 _mgr = AracloudManager()
                 _cred = _mgr._carregar_credenciais_hf()
@@ -3686,11 +3535,9 @@ def main():
                                 dizer("  [RECUPERACAO] SSH falhou para " + _ip + " - descartado")
                         _estado["ips_ativos"] = _vivos
                 dizer("[RECUPERACAO] " + str(reconectados) + " IPs reconectados via SSH")
-                GLOBAL["aracloud_manager_singleton"] = _mgr
                 ARACLOUD_MGR_SINGLETON = _mgr
             except Exception as e_rec:
                 dizer("[RECUPERACAO] Erro ao reconectar IPs: " + str(e_rec)[:120])
-
         rate_limits_cp = CHECKPOINT.obter_rate_limits()
         if rate_limits_cp:
             GLOBAL["rate_limits_aprendidos"].update(rate_limits_cp)
@@ -3767,7 +3614,6 @@ def main():
         baixar_unknowns_acumulado()
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
-        
         # FASE 2.5 - Aracloud (substitui proxies)
         definir_fase("FASE 2.5 - Aracloud: autenticacao + IPs flutuantes + SSH")
         aracloud_mgr = AracloudManager()
@@ -3778,7 +3624,6 @@ def main():
             marcar_fase("FASE25_ARACLOUD", False, "0 IPs Aracloud")
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
-        
         fase3_dns_completo(contas)
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
@@ -3819,12 +3664,10 @@ def main():
             dizer("[CHECKPOINT] Estado salvo com sucesso e enviado para HF")
         except Exception as e:
             dizer("ERRO ao salvar checkpoint final: " + str(e))
-            debug_log("checkpoint final: " + traceback.format_exc())
         try:
             gerar_ficheiros_finais()
         except Exception as e:
             dizer("ERRO ao gerar ficheiros finais: " + str(e))
-            debug_log("gerar_ficheiros_finais: " + traceback.format_exc())
         rt = {"aceites": 0, "tentados": 0, "rejeitados": 0, "erros": 0, "via_aracloud": 0, "por_provedor": GLOBAL["por_provedor"]}
         for r in GLOBAL["por_provedor"].values():
             for k in ("aceites", "tentados", "rejeitados", "erros", "via_aracloud"):
@@ -3840,19 +3683,19 @@ def main():
                 ok1 = enviar_email_unico(FINAL_DESTINATARIO, CAMPAIGN["subject"], html_base, cf)
                 dizer("  Email da campanha: " + ("OK" if ok1 else "FALHOU"))
                 time.sleep(5)
-            ar, cr = gerar_relatorio(rt)
-            ok2 = enviar_email_unico(FINAL_DESTINATARIO, ar, cr, cf)
-            dizer("  Relatorio HTML: " + ("OK" if ok2 else "FALHOU"))
-            try:
-                rp = os.path.join(DIR_AUDIT, "relatorio_final.html")
-                with open(rp, "w", encoding="utf-8") as f:
-                    f.write(cr)
-                api = HfApi(token=HF_TOKEN)
-                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_0_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
-                dizer("  Relatorio enviado para HuggingFace")
-            except Exception as e:
-                dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
+                ar, cr = gerar_relatorio(rt)
+                ok2 = enviar_email_unico(FINAL_DESTINATARIO, ar, cr, cf)
+                dizer("  Relatorio HTML: " + ("OK" if ok2 else "FALHOU"))
+                try:
+                    rp = os.path.join(DIR_AUDIT, "relatorio_final.html")
+                    with open(rp, "w", encoding="utf-8") as f:
+                        f.write(cr)
+                    api = HfApi(token=HF_TOKEN)
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_0_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                    dizer("  Relatorio enviado para HuggingFace")
+                except Exception as e:
+                    dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
             else:
                 dizer("  Sem conta/template para enviar o relatorio final")
             try:
@@ -3868,7 +3711,7 @@ def main():
         print("=" * 70, flush=True)
         print("EXECUCAO TERMINADA - " + str(GLOBAL.get('exec_id')), flush=True)
         print("  Aceites (250 OK) : " + "{:,}".format(rt['aceites']), flush=True)
-        print("  Tentativas         : " + "{:,}".format(rt['tentados']), flush=True)
+        print("  Tentativas       : " + "{:,}".format(rt['tentados']), flush=True)
         print("  Taxa             : " + "{:.2f}".format(taxa) + "%", flush=True)
         print("  Via Aracloud     : " + "{:,}".format(rt['via_aracloud']), flush=True)
         print("  IPs Aracloud     : " + str(len(GLOBAL.get('aracloud_ips_ativos', []))) + "/" + str(NUM_WORKERS), flush=True)
