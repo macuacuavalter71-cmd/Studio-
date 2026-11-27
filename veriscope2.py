@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V23.3 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
+VERISCOPE V23.5 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
 PARALELISMO HIERÁRQUICO: 3 IPs/conta (primario + 2 redes Pub_) x WORKERS
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
-V23.3 FIX DEFINITIVO ARACLOUD (sem floating IPs):
-- IP primario = IP publico ja atribuido ao servidor (Nova addresses).
-- IPs extra = anexar redes publicas (Nova os-interface; redes "Pub_*" do portal,
-  ex: Pub_209_127_178_0_23 / Pub_209_127_252_0_23) + config na VM:
-  ip link up + dhclient (passos do portal) + policy routing por IP de origem.
-- Egresso garantido: proxy SMTP na VM (/tmp/vp.py) com socket.bind((IP,0)) ->
-  o MX ve exatamente o IP do worker (SPF alinhado). Verificado com curl --interface.
-- Circuit breaker: max 3 falhas seguidas por conta; nunca loop infinito.
-- Keystone 2 passos, compute_url + network_url do catalogo, SSH ubuntu,
-  3 IPs/conta, 20 unicos/conta/dia, 1000/IP/provedor.
-- deSEC: descoberta de dominios por token (bulk map), PUT bulk 1 pedido/domínio.
-- Checkpoint: offsets anti-reenvio, IPs, orcamento, rate limits, greylist.
+V23.5 FIX:
+- IP primario + attach de redes Pub_ via Nova os-interface
+- Proxy SMTP na VM com socket.bind((IP,0)) -> MX ve sempre o IP correto
+- Verificacao de egresso via curl --interface antes de marcar IP activo
+- Budget por IP aumentado para 2000/provedor
+- Circuit breaker: 3 falhas seguidas por conta (nunca loop infinito)
 """
 
 import os
@@ -51,7 +45,7 @@ for _lg in ["huggingface_hub", "datasets", "fsspec", "httpx", "pyarrow", "urllib
 import warnings
 warnings.filterwarnings("ignore")
 
-import threading, resource, re, gc, csv, json, time, random, socket, ssl, textwrap
+import threading, resource, re, gc, csv, json, time, random, socket, ssl, textwrap, base64
 import concurrent.futures, traceback, glob, shutil, hashlib
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
@@ -139,13 +133,10 @@ DESEC_MIN_DELAY = 5.0
 DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
 
-# ============================================================
-# V23.3 - ARACLOUD (sem floating IPs; redes Pub_ + policy routing)
-# ============================================================
 ARACLOUD_AUTH_URL = "https://vhi.servermania.com:5000/v3"
 MAX_IPS_POR_CONTA = 3
 MAX_IPS_UNICOS_POR_DIA = 20
-IP_BUDGET_POR_PROVEDOR = 1000
+IP_BUDGET_POR_PROVEDOR = 2000
 SSH_CONNECT_TIMEOUT = 20
 SSH_TUNNEL_TIMEOUT = 15
 GREYLIST_DELAY_1 = 120
@@ -157,42 +148,33 @@ TAXA_SUCESSO_AUMENTAR = 0.90
 MAX_FALHAS_SEGUIDAS_CONTA = 3
 ARACLOUD_MGR_SINGLETON = None
 
-# Proxy SMTP com bind ao IP de origem (corre dentro da VM Aracloud)
 VP_SCRIPT = r'''
-import socket, sys, os, threading
-mx, porta, src = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind((src, 0))
-s.settimeout(25)
-s.connect((mx, porta))
-s.settimeout(None)
-si, so = sys.stdin.buffer, sys.stdout.buffer
-def relay_sock_out():
-    try:
-        while True:
-            d = s.recv(65536)
-            if not d:
-                break
-            so.write(d); so.flush()
-    except Exception:
-        pass
-    finally:
-        try: os._exit(0)
-        except Exception: pass
-t = threading.Thread(target=relay_sock_out); t.daemon = True; t.start()
+import socket, sys, os, threading, time
 try:
+    mx, porta, src = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((src, 0))
+    s.settimeout(25)
+    s.connect((mx, porta))
+    s.settimeout(None)
+    si, so = sys.stdin.buffer, sys.stdout.buffer
+    def relay():
+        try:
+            while True:
+                d = s.recv(65536)
+                if not d: break
+                so.write(d); so.flush()
+        except: pass
+        finally: os._exit(0)
+    threading.Thread(target=relay, daemon=True).start()
     while True:
         d = si.read(65536)
-        if not d:
-            break
+        if not d: break
         s.sendall(d)
-except Exception:
-    pass
-finally:
-    try: s.close()
-    except Exception: pass
-    os._exit(0)
+except Exception as e:
+    sys.stderr.write(str(e))
+    os._exit(1)
 '''
 
 RCPT_LIMITS = {
@@ -1018,7 +1000,7 @@ def render_dashboard_text():
         pass
     print(CLEAR_SCREEN, end="", flush=True)
     print("╔" + "═" * 76 + "╗", flush=True)
-    print("║  🚀 VERISCOPE V23.3 | 3 IPs/CONTA | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
+    print("║  🚀 VERISCOPE V23.5 | 3 IPs/CONTA | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
     print("║  STATUS: " + str(GLOBAL.get("status", "UNKNOWN")).ljust(66) + " ║", flush=True)
     print("║  FASE: " + str(GLOBAL.get("fase_atual", "?"))[:40].ljust(66) + " ║", flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
@@ -1721,18 +1703,16 @@ def gerar_ficheiros_finais():
 
 
 # ====================================================================
-# V23.3 - ARACLOUD MANAGER (redes Pub_ + policy routing + proxy bind)
+# V23.5 - ARACLOUD MANAGER (redes Pub_ + proxy bind)
 # ====================================================================
 class AracloudManager:
     """Gerencia contas Aracloud x 3 IPs (1 primario + 2 redes Pub_).
-    NUNCA usa floating IPs (cloud sem router externo -> 404 ExternalGateway...).
-    Fluxo por IP extra:
-      1) POST /servers/{id}/os-interface  (anexa rede Pub_* -> nova port)
-      2) Neutron: fixed_ip + mac + subnet(cidr/gw) da nova port
-      3) VM: ip link up + dhclient (passos do portal) + fallback static
-      4) VM: policy routing (ip rule from IP table N + default via gw dev iface)
-      5) Verificacao de egresso: curl --interface IP -> tem de devolver o proprio IP
-      6) SMTP: proxy /tmp/vp.py com socket.bind((IP,0)) -> MX ve o IP do worker
+    Fluxo:
+      1) IP primario = IP publico ja atribuido ao servidor (Nova addresses)
+      2) IPs extra = anexar redes publicas (Pub_*) via Nova os-interface
+      3) Configurar VM: ip link up + dhclient + policy routing por IP
+      4) Verificar egresso: curl --interface IP devolve o proprio IP
+      5) SMTP: proxy na VM com socket.bind((IP,0)) -> MX ve sempre o IP correcto
     """
 
     def __init__(self):
@@ -1740,7 +1720,6 @@ class AracloudManager:
         self.tokens = {}
         self.compute_urls = {}
         self.network_urls = {}
-        self.provider_net_ids = {}
         self.pub_nets_cache = {}
 
     def _carregar_credenciais_hf(self):
@@ -1914,37 +1893,6 @@ class AracloudManager:
             return ports[0].get("id")
         return None
 
-    def _obter_port(self, nome_conta, port_id):
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url or not port_id:
-            return {}
-        try:
-            r = requests.get(network_url + "/v2.0/ports/" + str(port_id), headers={"X-Auth-Token": token}, timeout=30, verify=False)
-            if r.status_code == 200:
-                return r.json().get("port", {}) or {}
-        except Exception as e:
-            debug_log("aracloud obter_port " + nome_conta + ": " + str(e)[:160])
-        return {}
-
-    def _obter_subnet(self, nome_conta, net_id):
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url or not net_id:
-            return None, None
-        try:
-            r = requests.get(network_url + "/v2.0/subnets", headers={"X-Auth-Token": token}, params={"network_id": net_id}, timeout=30, verify=False)
-            if r.status_code == 200:
-                subs = r.json().get("subnets", [])
-                for s in subs:
-                    if s.get("ip_version") == 4:
-                        return s.get("cidr"), s.get("gateway_ip")
-                if subs:
-                    return subs[0].get("cidr"), subs[0].get("gateway_ip")
-        except Exception as e:
-            debug_log("aracloud subnet " + nome_conta + ": " + str(e)[:160])
-        return None, None
-
     def _ips_publicos_servidor(self, nome_conta, server_id):
         token = self.tokens.get(nome_conta)
         compute_url = self.compute_urls.get(nome_conta)
@@ -1961,7 +1909,7 @@ class AracloudManager:
         return []
 
     def _descobrir_redes_publicas(self, nome_conta, server_id):
-        """Candidatas p/ attach: rede primaria primeiro, depois Pub_* nao anexadas, depois restantes."""
+        """Candidatas p/ attach: rede primaria primeiro, depois Pub_* nao anexadas."""
         if nome_conta in self.pub_nets_cache:
             return self.pub_nets_cache[nome_conta]
         token = self.tokens.get(nome_conta)
@@ -1972,7 +1920,11 @@ class AracloudManager:
                 anexadas = {p.get("network_id") for p in self._obter_ports_servidor(nome_conta, server_id) if p.get("network_id")}
                 r = requests.get(network_url + "/v2.0/networks", headers={"X-Auth-Token": token}, timeout=30, verify=False)
                 if r.status_code == 200:
-                    prim = self.provider_net_ids.get(nome_conta)
+                    prim = None
+                    for p in self._obter_ports_servidor(nome_conta, server_id):
+                        if p.get("network_id"):
+                            prim = p.get("network_id")
+                            break
                     for n in r.json().get("networks", []):
                         nid = n.get("id")
                         nome_rede = n.get("name") or ""
@@ -2018,15 +1970,24 @@ class AracloudManager:
             return r.status_code in (200, 202, 204)
         except Exception as e:
             debug_log("aracloud desanexar_iface " + nome_conta + ": " + str(e)[:160])
-            return False
+        return False
 
     def _esperar_port_com_ip(self, nome_conta, port_id, timeout_seg=60):
         fim = time.time() + timeout_seg
+        token = self.tokens.get(nome_conta)
+        network_url = self.network_urls.get(nome_conta)
+        if not token or not network_url:
+            return None
         while time.time() < fim:
-            port = self._obter_port(nome_conta, port_id)
-            fixed = [fx.get("ip_address") for fx in port.get("fixed_ips", []) if fx.get("ip_address")]
-            if fixed:
-                return fixed[0]
+            try:
+                r = requests.get(network_url + "/v2.0/ports/" + str(port_id), headers={"X-Auth-Token": token}, timeout=30, verify=False)
+                if r.status_code == 200:
+                    port = r.json().get("port", {})
+                    fixed = [fx.get("ip_address") for fx in port.get("fixed_ips", []) if fx.get("ip_address")]
+                    if fixed:
+                        return fixed[0]
+            except Exception as e:
+                debug_log("aracloud esperar_port " + nome_conta + ": " + str(e)[:120])
             time.sleep(5)
         return None
 
@@ -2120,7 +2081,7 @@ class AracloudManager:
                 return None
             chan = transport.open_session()
             chan.settimeout(timeout or SSH_TUNNEL_TIMEOUT)
-            chan.exec_command("python3 /tmp/vp.py " + str(mx_host) + " " + str(porta) + " " + str(src_ip))
+            chan.exec_command("sudo python3 /tmp/vp.py " + str(mx_host) + " " + str(porta) + " " + str(src_ip))
             return chan
         except Exception as e:
             debug_log("proxy_canal_smtp " + str(mx_host) + ": " + str(e)[:160])
@@ -2152,30 +2113,23 @@ class AracloudManager:
         with GLOBAL["orcamento_lock"]:
             GLOBAL["orcamento_por_ip"].setdefault(ip, {})
 
-    def _ativar_ip_extra(self, nome_conta, conta_estado, ssh_prim, net_id, server_id):
-        """Anexa rede, configura VM, verifica egresso. Devolve True se registou IP."""
-        port_novo = self._anexar_interface(nome_conta, server_id, net_id)
-        if not port_novo:
-            return False
-        ip_novo = self._esperar_port_com_ip(nome_conta, port_novo, timeout_seg=60)
-        if not ip_novo or not ip_publico_valido(ip_novo):
-            self._desanexar_interface(nome_conta, server_id, port_novo)
-            return False
-        port = self._obter_port(nome_conta, port_novo)
-        mac = port.get("mac_address", "")
-        cidr, gw = self._obter_subnet(nome_conta, net_id)
-        tbl = 100 + int(conta_estado.get("tbl_counter", 0))
-        conta_estado["tbl_counter"] = int(conta_estado.get("tbl_counter", 0)) + 1
-        ok_cfg = self._configurar_iface_vm(ssh_prim, ip_novo, mac, cidr, gw, tbl)
-        ok_eg = self._verificar_egresso(ssh_prim, ip_novo) if ok_cfg else False
-        if not ok_eg:
-            self._limpar_regras_vm(ssh_prim, ip_novo, tbl)
-            self._desanexar_interface(nome_conta, server_id, port_novo)
-            debug_log("aracloud " + nome_conta + ": egresso falhou para " + ip_novo)
-            return False
-        self._registar_ip(conta_estado, ip_novo, port_novo, "iface", ssh_prim, tbl)
-        dizer("  Aracloud: IP " + ip_novo + " activo em " + nome_conta + " (iface " + str(net_id)[:12] + "... egresso OK)")
-        return True
+    def _obter_subnet(self, nome_conta, net_id):
+        token = self.tokens.get(nome_conta)
+        network_url = self.network_urls.get(nome_conta)
+        if not token or not network_url or not net_id:
+            return None, None
+        try:
+            r = requests.get(network_url + "/v2.0/subnets", headers={"X-Auth-Token": token}, params={"network_id": net_id}, timeout=30, verify=False)
+            if r.status_code == 200:
+                subs = r.json().get("subnets", [])
+                for s in subs:
+                    if s.get("ip_version") == 4:
+                        return s.get("cidr"), s.get("gateway_ip")
+                if subs:
+                    return subs[0].get("cidr"), subs[0].get("gateway_ip")
+        except Exception as e:
+            debug_log("aracloud subnet " + nome_conta + ": " + str(e)[:160])
+        return None, None
 
     def inicializar(self):
         """FASE 2.5: autentica contas; 1 IP primario + ate 2 IPs extra (redes Pub_)."""
@@ -2204,7 +2158,7 @@ class AracloudManager:
             ports = self._obter_ports_servidor(nome_conta, server_id)
             port_id = ports[0].get("id") if ports else None
             if ports and ports[0].get("network_id"):
-                self.provider_net_ids[nome_conta] = ports[0].get("network_id")
+                self.provider_net_id = ports[0].get("network_id")
             contas_funcionais += 1
             conta_estado = GLOBAL["aracloud_contas"].get(nome_conta, {}) or {}
             conta_estado["server_id"] = server_id
@@ -2268,13 +2222,47 @@ class AracloudManager:
                 nid = cand["id"]
                 if nid in nets_anexadas_agora:
                     continue
-                if self._ativar_ip_extra(nome_conta, conta_estado, ssh_prim, nid, server_id):
-                    falhas_seguidas = 0
-                    total_ips += 1
-                    nets_anexadas_agora.add(nid)
-                else:
+                port_novo = self._anexar_interface(nome_conta, server_id, nid)
+                if not port_novo:
                     falhas_seguidas += 1
-                    dizer("  AVISO: falha ao ativar IP extra via rede " + str(cand.get("name", nid)) + " em " + nome_conta)
+                    dizer("  AVISO: falha ao anexar rede " + str(cand.get("name", nid)) + " em " + nome_conta)
+                    continue
+                ip_novo = self._esperar_port_com_ip(nome_conta, port_novo, timeout_seg=60)
+                if not ip_novo or not ip_publico_valido(ip_novo):
+                    self._desanexar_interface(nome_conta, server_id, port_novo)
+                    falhas_seguidas += 1
+                    continue
+                port_info = None
+                try:
+                    r = requests.get(self.network_urls[nome_conta] + "/v2.0/ports/" + str(port_novo),
+                                     headers={"X-Auth-Token": self.tokens[nome_conta]}, timeout=30, verify=False)
+                    if r.status_code == 200:
+                        port_info = r.json().get("port", {})
+                except Exception:
+                    pass
+                if not port_info:
+                    self._desanexar_interface(nome_conta, server_id, port_novo)
+                    falhas_seguidas += 1
+                    continue
+                mac = port_info.get("mac_address", "")
+                cidr, gw = self._obter_subnet(nome_conta, nid)
+                tbl = 100 + int(conta_estado.get("tbl_counter", 0))
+                conta_estado["tbl_counter"] = int(conta_estado.get("tbl_counter", 0)) + 1
+                if not self._configurar_iface_vm(ssh_prim, ip_novo, mac, cidr, gw, tbl):
+                    self._desanexar_interface(nome_conta, server_id, port_novo)
+                    falhas_seguidas += 1
+                    continue
+                if not self._verificar_egresso(ssh_prim, ip_novo):
+                    self._limpar_regras_vm(ssh_prim, ip_novo, tbl)
+                    self._desanexar_interface(nome_conta, server_id, port_novo)
+                    falhas_seguidas += 1
+                    dizer("  AVISO: egresso falhou para " + ip_novo + " - rede " + str(cand.get("name", nid)))
+                    continue
+                falhas_seguidas = 0
+                self._registar_ip(conta_estado, ip_novo, port_novo, "iface", ssh_prim, tbl)
+                total_ips += 1
+                nets_anexadas_agora.add(nid)
+                dizer("  Aracloud: IP " + ip_novo + " activo em " + nome_conta + " (iface " + str(cand.get("name", nid))[:30] + "... egresso OK)")
             GLOBAL["aracloud_contas"][nome_conta] = conta_estado
         CHECKPOINT.salvar_aracloud(GLOBAL["aracloud_contas"], list(GLOBAL["aracloud_ips_usados_hoje"]), GLOBAL.get("aracloud_data_reset"))
         dizer("  Aracloud: " + str(contas_funcionais) + " contas funcionais, " + str(total_ips) + " IPs activos")
@@ -2332,12 +2320,40 @@ class AracloudManager:
             return None
         # substituto: primeira rede candidata livre
         for cand in self._descobrir_redes_publicas(conta_nome, server_id):
-            if self._ativar_ip_extra(conta_nome, estado, ssh_prim, cand["id"], server_id):
-                CHECKPOINT.salvar_aracloud(GLOBAL["aracloud_contas"], list(GLOBAL["aracloud_ips_usados_hoje"]), GLOBAL.get("aracloud_data_reset"))
-                novo = estado["ips_ativos"][-1]["ip"]
-                dizer("  Aracloud: IP " + ip + " substituido por " + novo + " em " + conta_nome)
-                GLOBAL["spf_sujo"] = True
-                return novo
+            port_novo = self._anexar_interface(conta_nome, server_id, cand["id"])
+            if not port_novo:
+                continue
+            ip_novo = self._esperar_port_com_ip(conta_nome, port_novo, 60)
+            if not ip_novo or not ip_publico_valido(ip_novo):
+                self._desanexar_interface(conta_nome, server_id, port_novo)
+                continue
+            port_info = None
+            try:
+                r = requests.get(self.network_urls[conta_nome] + "/v2.0/ports/" + str(port_novo),
+                                 headers={"X-Auth-Token": self.tokens[conta_nome]}, timeout=30, verify=False)
+                if r.status_code == 200:
+                    port_info = r.json().get("port", {})
+            except Exception:
+                pass
+            if not port_info:
+                self._desanexar_interface(conta_nome, server_id, port_novo)
+                continue
+            mac = port_info.get("mac_address", "")
+            cidr, gw = self._obter_subnet(conta_nome, cand["id"])
+            tbl_novo = 100 + int(estado.get("tbl_counter", 0))
+            estado["tbl_counter"] = int(estado.get("tbl_counter", 0)) + 1
+            if not self._configurar_iface_vm(ssh_prim, ip_novo, mac, cidr, gw, tbl_novo):
+                self._desanexar_interface(conta_nome, server_id, port_novo)
+                continue
+            if not self._verificar_egresso(ssh_prim, ip_novo):
+                self._limpar_regras_vm(ssh_prim, ip_novo, tbl_novo)
+                self._desanexar_interface(conta_nome, server_id, port_novo)
+                continue
+            self._registar_ip(estado, ip_novo, port_novo, "iface", ssh_prim, tbl_novo)
+            CHECKPOINT.salvar_aracloud(GLOBAL["aracloud_contas"], list(GLOBAL["aracloud_ips_usados_hoje"]), GLOBAL.get("aracloud_data_reset"))
+            dizer("  Aracloud: IP " + ip + " substituido por " + ip_novo + " em " + conta_nome)
+            GLOBAL["spf_sujo"] = True
+            return ip_novo
         return None
 
 
@@ -3481,7 +3497,7 @@ def monitor_ips_continuo():
                 orc_ip = GLOBAL["orcamento_por_ip"].get(ip, {})
                 restantes = [p for p in PROVEDORES_USAVEIS if orc_ip.get(p, 0) < IP_BUDGET_POR_PROVEDOR]
             if not restantes:
-                dizer("[MONITOR-IP] IP " + ip + " esgotou 1000 envios em TODOS os provedores - a rodar")
+                dizer("[MONITOR-IP] IP " + ip + " esgotou 2000 envios em TODOS os provedores - a rodar")
                 novo_ip = aracloud_mgr.rodar_ip(ip)
                 if novo_ip:
                     GLOBAL["spf_sujo"] = True
@@ -3553,7 +3569,7 @@ def enviar_email_unico(dest, assunto, html, conta):
 
 
 def gerar_relatorio(rt):
-    assunto = "VERISCOPE V23.3 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
+    assunto = "VERISCOPE V23.5 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
     linhas_fases = ""
     try:
         with GLOBAL["stats_lock"]:
@@ -3574,7 +3590,7 @@ body{font-family:Arial;margin:20px;color:#222}h1{color:#2c5f2d}h2{color:#3a7d44}
 table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:7px;font-size:13px}
 th{background:#3a7d44;color:#fff;text-align:left}.ok{color:#2c5f2d;font-weight:bold}ul{line-height:1.7}
 </style></head><body>
-<h1>VERISCOPE V23.3 - 3 IPs/CONTA (redes Pub_ + proxy bind)</h1>
+<h1>VERISCOPE V23.5 - 3 IPs/CONTA (Pub_ + proxy bind)</h1>
 <h2>Resumo</h2><ul>
 <li>IPs Aracloud activos: <b>""" + str(len(GLOBAL.get('aracloud_ips_ativos', []))) + """</b></li>
 <li>IPs únicos usados hoje: <b>""" + str(len(GLOBAL.get('aracloud_ips_usados_hoje', set()))) + """</b></li>
@@ -3622,7 +3638,7 @@ def baixar_ficheiros_campanha():
 
 
 # ====================================================================
-# MAIN V23.3
+# MAIN V23.5
 # ====================================================================
 def main():
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG, ARACLOUD_MGR_SINGLETON
@@ -3754,8 +3770,8 @@ def main():
     threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
     time.sleep(1)
 
-    dizer("VERISCOPE V23.3 HEADLESS [" + execution_id + "]")
-    dizer("ARQUITETURA: 1 primario + 2 Pub_/conta | " + str(MAX_IPS_UNICOS_POR_DIA) + " unicos/conta/dia")
+    dizer("VERISCOPE V23.5 HEADLESS [" + execution_id + "]")
+    dizer("ARQUITETURA: 1 primario + 2 Pub_/conta | " + str(MAX_IPS_UNICOS_POR_DIA) + " unicos/conta/dia | budget 2000/IP")
     dizer("CHECKPOINT: " + ("RECUPERAR" if tem_checkpoint else "NOVO"))
     baixar_ficheiros_campanha()
 
@@ -3881,7 +3897,7 @@ def main():
                     f.write(cr)
                 api = HfApi(token=HF_TOKEN)
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_3_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_5_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
                 dizer("  Relatorio enviado para HuggingFace")
             except Exception as e:
                 dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
