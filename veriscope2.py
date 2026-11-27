@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V23.1 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
-PARALELISMO HIERÁRQUICO: IPs ROTATIVOS (ARACLOUD) x WORKERS INDEPENDENTES
+VERISCOPE V23.3 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
+PARALELISMO HIERÁRQUICO: 3 IPs/conta (primario + 2 redes Pub_) x WORKERS
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
-V23.1 FIX ARACLOUD (rede provider/flat):
-- IP primario = IP publico ja atribuido ao servidor (Nova addresses), SSH direto.
-- IPs extra: tentativa A = floating IP Neutron (1 tentativa/conta, circuit breaker);
-  tentativa B = anexar interface extra (Nova os-interface) na rede provider +
-  configurar VM por SSH (ip link up + dhclient), conforme instrucoes do portal.
-- Circuit breaker: max 3 falhas seguidas por conta (nunca mais loop infinito).
-- Keystone 2 passos (unscoped -> /auth/projects -> scoped), compute_url +
-  network_url do catalogo, 3 IPs/conta, 20 unicos/conta/dia, 1000/IP/provedor.
-- deSEC: descoberta de dominios por token (bulk map), PUT bulk 1 pedido/dominio.
+V23.3 FIX DEFINITIVO ARACLOUD (sem floating IPs):
+- IP primario = IP publico ja atribuido ao servidor (Nova addresses).
+- IPs extra = anexar redes publicas (Nova os-interface; redes "Pub_*" do portal,
+  ex: Pub_209_127_178_0_23 / Pub_209_127_252_0_23) + config na VM:
+  ip link up + dhclient (passos do portal) + policy routing por IP de origem.
+- Egresso garantido: proxy SMTP na VM (/tmp/vp.py) com socket.bind((IP,0)) ->
+  o MX ve exatamente o IP do worker (SPF alinhado). Verificado com curl --interface.
+- Circuit breaker: max 3 falhas seguidas por conta; nunca loop infinito.
+- Keystone 2 passos, compute_url + network_url do catalogo, SSH ubuntu,
+  3 IPs/conta, 20 unicos/conta/dia, 1000/IP/provedor.
+- deSEC: descoberta de dominios por token (bulk map), PUT bulk 1 pedido/domínio.
 - Checkpoint: offsets anti-reenvio, IPs, orcamento, rate limits, greylist.
 """
 
@@ -138,7 +140,7 @@ DESEC_BACKOFF_BASE = 30
 DESEC_BACKOFF_MULTIPLIER = 2.0
 
 # ============================================================
-# V23.1 - ARQUITETURA ARACLOUD (rede provider/flat)
+# V23.3 - ARACLOUD (sem floating IPs; redes Pub_ + policy routing)
 # ============================================================
 ARACLOUD_AUTH_URL = "https://vhi.servermania.com:5000/v3"
 MAX_IPS_POR_CONTA = 3
@@ -154,6 +156,44 @@ RATE_INCREM_SUCESSO = 5
 TAXA_SUCESSO_AUMENTAR = 0.90
 MAX_FALHAS_SEGUIDAS_CONTA = 3
 ARACLOUD_MGR_SINGLETON = None
+
+# Proxy SMTP com bind ao IP de origem (corre dentro da VM Aracloud)
+VP_SCRIPT = r'''
+import socket, sys, os, threading
+mx, porta, src = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((src, 0))
+s.settimeout(25)
+s.connect((mx, porta))
+s.settimeout(None)
+si, so = sys.stdin.buffer, sys.stdout.buffer
+def relay_sock_out():
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            so.write(d); so.flush()
+    except Exception:
+        pass
+    finally:
+        try: os._exit(0)
+        except Exception: pass
+t = threading.Thread(target=relay_sock_out); t.daemon = True; t.start()
+try:
+    while True:
+        d = si.read(65536)
+        if not d:
+            break
+        s.sendall(d)
+except Exception:
+    pass
+finally:
+    try: s.close()
+    except Exception: pass
+    os._exit(0)
+'''
 
 RCPT_LIMITS = {
     "telkomsa.net": 1715, "rock.com": 2126, "walla.com": 1908,
@@ -222,7 +262,7 @@ DESEC_TOKENS_ALL = [
     "sjtyi2PgJEU3ivQeBYeM969WZJ2n", "PJNyPHreKtt6vJCQTnb7nDHFqsjr",
     "CWCuDYbmC39XUoxCYs8jvZk6YVFY", "5AQfA8btDtVHp6Dg3bT5iKjEgtqM",
     "y7oBETbXpYC7arWcXmhsKK8ZQmH6", "PnbiHeNa8jrQagHvih1yJfBcVCUr",
-    "oMKThgLxaoSRF8nGS6iCi1vN9yqo", "4Yamfr48koi4RbzTEJMLKhqWopG".replace("EJML", "4Rbz"),
+    "oMKThgLxaoSRF8nGS6iCi1vN9yqo", "4Yamfr48koi4RbzTEJjMLKhqWopG",
 ]
 
 BASE_LOCAL = "/content/campaign_v23_0"
@@ -978,7 +1018,7 @@ def render_dashboard_text():
         pass
     print(CLEAR_SCREEN, end="", flush=True)
     print("╔" + "═" * 76 + "╗", flush=True)
-    print("║  🚀 VERISCOPE V23.1 | IPs ARACLOUD | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
+    print("║  🚀 VERISCOPE V23.3 | 3 IPs/CONTA | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
     print("║  STATUS: " + str(GLOBAL.get("status", "UNKNOWN")).ljust(66) + " ║", flush=True)
     print("║  FASE: " + str(GLOBAL.get("fase_atual", "?"))[:40].ljust(66) + " ║", flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
@@ -1681,18 +1721,18 @@ def gerar_ficheiros_finais():
 
 
 # ====================================================================
-# V23.1 - ARACLOUD MANAGER (rede provider/flat + circuit breaker)
+# V23.3 - ARACLOUD MANAGER (redes Pub_ + policy routing + proxy bind)
 # ====================================================================
 class AracloudManager:
-    """Gerencia contas Aracloud x N IPs.
-    Estrategia V23.1 (fix associacao em rede provider/flat):
-      1) IP primario = IP publico ja atribuido ao servidor (Nova addresses) - SSH direto.
-      2) IPs extra tentativa A: floating IP Neutron (1 tentativa/conta; se a
-         associacao falhar -> fips_suportados=False e passa a estrategia B).
-      3) IPs extra tentativa B: anexar interface de rede extra (Nova os-interface)
-         na mesma rede provider + configurar a VM por SSH (ip link up + dhclient),
-         exatamente como o portal Aracloud instrui no dialogo 'Attach Networks'.
-      4) Circuit breaker: max 3 falhas seguidas por conta -> nunca mais loop infinito.
+    """Gerencia contas Aracloud x 3 IPs (1 primario + 2 redes Pub_).
+    NUNCA usa floating IPs (cloud sem router externo -> 404 ExternalGateway...).
+    Fluxo por IP extra:
+      1) POST /servers/{id}/os-interface  (anexa rede Pub_* -> nova port)
+      2) Neutron: fixed_ip + mac + subnet(cidr/gw) da nova port
+      3) VM: ip link up + dhclient (passos do portal) + fallback static
+      4) VM: policy routing (ip rule from IP table N + default via gw dev iface)
+      5) Verificacao de egresso: curl --interface IP -> tem de devolver o proprio IP
+      6) SMTP: proxy /tmp/vp.py com socket.bind((IP,0)) -> MX ve o IP do worker
     """
 
     def __init__(self):
@@ -1700,9 +1740,8 @@ class AracloudManager:
         self.tokens = {}
         self.compute_urls = {}
         self.network_urls = {}
-        self.ext_net_ids = {}
-        self.fips_suportados = {}
         self.provider_net_ids = {}
+        self.pub_nets_cache = {}
 
     def _carregar_credenciais_hf(self):
         os.makedirs(DIR_ARACLOUD, exist_ok=True)
@@ -1829,7 +1868,6 @@ class AracloudManager:
                     dizer("  ⚠️ " + nome_conta + ": sem endpoint compute")
                 if nu:
                     self.network_urls[nome_conta] = nu
-                    debug_log("aracloud " + nome_conta + " network_url = " + nu)
                 else:
                     dizer("  ⚠️ " + nome_conta + ": sem endpoint network")
                 return token
@@ -1876,6 +1914,37 @@ class AracloudManager:
             return ports[0].get("id")
         return None
 
+    def _obter_port(self, nome_conta, port_id):
+        token = self.tokens.get(nome_conta)
+        network_url = self.network_urls.get(nome_conta)
+        if not token or not network_url or not port_id:
+            return {}
+        try:
+            r = requests.get(network_url + "/v2.0/ports/" + str(port_id), headers={"X-Auth-Token": token}, timeout=30, verify=False)
+            if r.status_code == 200:
+                return r.json().get("port", {}) or {}
+        except Exception as e:
+            debug_log("aracloud obter_port " + nome_conta + ": " + str(e)[:160])
+        return {}
+
+    def _obter_subnet(self, nome_conta, net_id):
+        token = self.tokens.get(nome_conta)
+        network_url = self.network_urls.get(nome_conta)
+        if not token or not network_url or not net_id:
+            return None, None
+        try:
+            r = requests.get(network_url + "/v2.0/subnets", headers={"X-Auth-Token": token}, params={"network_id": net_id}, timeout=30, verify=False)
+            if r.status_code == 200:
+                subs = r.json().get("subnets", [])
+                for s in subs:
+                    if s.get("ip_version") == 4:
+                        return s.get("cidr"), s.get("gateway_ip")
+                if subs:
+                    return subs[0].get("cidr"), subs[0].get("gateway_ip")
+        except Exception as e:
+            debug_log("aracloud subnet " + nome_conta + ": " + str(e)[:160])
+        return None, None
+
     def _ips_publicos_servidor(self, nome_conta, server_id):
         token = self.tokens.get(nome_conta)
         compute_url = self.compute_urls.get(nome_conta)
@@ -1891,104 +1960,35 @@ class AracloudManager:
             debug_log("aracloud ips_servidor " + nome_conta + ": " + str(e)[:160])
         return []
 
-    def _descobrir_rede_externa(self, nome_conta):
-        if nome_conta in self.ext_net_ids:
-            return self.ext_net_ids[nome_conta]
+    def _descobrir_redes_publicas(self, nome_conta, server_id):
+        """Candidatas p/ attach: rede primaria primeiro, depois Pub_* nao anexadas, depois restantes."""
+        if nome_conta in self.pub_nets_cache:
+            return self.pub_nets_cache[nome_conta]
         token = self.tokens.get(nome_conta)
         network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url:
-            return None
-        try:
-            r = requests.get(network_url + "/v2.0/networks", headers={"X-Auth-Token": token}, timeout=30, verify=False)
-            if r.status_code == 200:
-                networks = r.json().get("networks", [])
-                ext_nets = [n for n in networks if n.get("router:external") is True]
-                if ext_nets:
-                    ext_id = ext_nets[0]["id"]
-                    self.ext_net_ids[nome_conta] = ext_id
-                    return ext_id
-        except Exception as e:
-            debug_log("aracloud redes_externas " + nome_conta + ": " + str(e)[:160])
-        return None
-
-    def _listar_ips_flutuantes(self, nome_conta):
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url:
-            return []
-        try:
-            r = requests.get(network_url + "/v2.0/floatingips", headers={"X-Auth-Token": token}, timeout=30, verify=False)
-            if r.status_code == 200:
-                fips = r.json().get("floatingips", [])
-                return [{"id": fi.get("id"), "ip": fi.get("floating_ip_address"), "port_id": fi.get("port_id")} for fi in fips if fi.get("floating_ip_address")]
-        except Exception as e:
-            debug_log("aracloud listar_ips " + nome_conta + ": " + str(e)[:160])
-        return []
-
-    def _criar_ip_flutuante(self, nome_conta):
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url:
-            return None
-        ext_net_id = self._descobrir_rede_externa(nome_conta)
-        if not ext_net_id:
-            return None
-        try:
-            payload = {"floatingip": {"floating_network_id": ext_net_id}}
-            r = requests.post(network_url + "/v2.0/floatingips", headers={"X-Auth-Token": token, "Content-Type": "application/json"}, json=payload, timeout=30, verify=False)
-            if r.status_code in (200, 201):
-                fip = r.json().get("floatingip", {})
-                return {"ip": fip.get("floating_ip_address"), "id": fip.get("id")}
-            debug_log("aracloud criar_ip " + nome_conta + ": HTTP " + str(r.status_code) + " " + r.text[:200])
-        except Exception as e:
-            debug_log("aracloud criar_ip " + nome_conta + ": " + str(e)[:160])
-        return None
-
-    def _associar_ip(self, nome_conta, fip_id, port_id):
-        """Retorna (ok, detalhe). detalhe contem HTTP + corpo para diagnostico."""
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url or not fip_id or not port_id:
-            return False, "sem token/network/port"
-        try:
-            payload = {"floatingip": {"port_id": port_id}}
-            r = requests.put(network_url + "/v2.0/floatingips/" + str(fip_id), headers={"X-Auth-Token": token, "Content-Type": "application/json"}, json=payload, timeout=30, verify=False)
-            if r.status_code in (200, 202):
-                return True, "ok"
-            detalhe = "HTTP " + str(r.status_code) + ": " + r.text[:150]
-            debug_log("aracloud associar " + nome_conta + " fip=" + str(fip_id) + ": " + detalhe)
-            return False, detalhe
-        except Exception as e:
-            debug_log("aracloud associar " + nome_conta + ": " + str(e)[:160])
-            return False, str(e)[:150]
-
-    def _desassociar_ip(self, nome_conta, fip_id):
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url or not fip_id:
-            return False
-        try:
-            payload = {"floatingip": {"port_id": None}}
-            r = requests.put(network_url + "/v2.0/floatingips/" + str(fip_id), headers={"X-Auth-Token": token, "Content-Type": "application/json"}, json=payload, timeout=30, verify=False)
-            return r.status_code in (200, 202)
-        except Exception as e:
-            debug_log("aracloud desassociar " + nome_conta + ": " + str(e)[:160])
-            return False
-
-    def _remover_ip(self, nome_conta, fip_id):
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url or not fip_id:
-            return False
-        try:
-            r = requests.delete(network_url + "/v2.0/floatingips/" + str(fip_id), headers={"X-Auth-Token": token}, timeout=30, verify=False)
-            return r.status_code in (200, 204)
-        except Exception as e:
-            debug_log("aracloud remover_ip " + nome_conta + ": " + str(e)[:160])
-            return False
+        cands = []
+        if token and network_url:
+            try:
+                anexadas = {p.get("network_id") for p in self._obter_ports_servidor(nome_conta, server_id) if p.get("network_id")}
+                r = requests.get(network_url + "/v2.0/networks", headers={"X-Auth-Token": token}, timeout=30, verify=False)
+                if r.status_code == 200:
+                    prim = self.provider_net_ids.get(nome_conta)
+                    for n in r.json().get("networks", []):
+                        nid = n.get("id")
+                        nome_rede = n.get("name") or ""
+                        if not nid:
+                            continue
+                        pub = nome_rede.startswith("Pub_") or n.get("router:external") is True or n.get("shared") is True
+                        if not pub:
+                            continue
+                        cands.append({"id": nid, "name": nome_rede, "anexada": nid in anexadas})
+                    cands.sort(key=lambda c: (0 if c["id"] == prim else (1 if not c["anexada"] else 2)))
+            except Exception as e:
+                debug_log("aracloud redes_publicas " + nome_conta + ": " + str(e)[:160])
+        self.pub_nets_cache[nome_conta] = cands
+        return cands
 
     def _anexar_interface(self, nome_conta, server_id, net_id):
-        """Anexa interface de rede extra (Nova os-interface). Retorna port_id ou None."""
         token = self.tokens.get(nome_conta)
         compute_url = self.compute_urls.get(nome_conta)
         if not token or not compute_url or not net_id:
@@ -2000,9 +2000,8 @@ class AracloudManager:
                               json=payload, timeout=45, verify=False)
             if r.status_code in (200, 202):
                 att = r.json().get("interfaceAttachment", {}) or {}
-                pid = att.get("port_id")
-                if pid:
-                    return pid
+                if att.get("port_id"):
+                    return att["port_id"]
             debug_log("aracloud anexar_iface " + nome_conta + ": HTTP " + str(r.status_code) + " " + r.text[:200])
         except Exception as e:
             debug_log("aracloud anexar_iface " + nome_conta + ": " + str(e)[:160])
@@ -2023,42 +2022,17 @@ class AracloudManager:
 
     def _esperar_port_com_ip(self, nome_conta, port_id, timeout_seg=60):
         fim = time.time() + timeout_seg
-        token = self.tokens.get(nome_conta)
-        network_url = self.network_urls.get(nome_conta)
-        if not token or not network_url:
-            return None
         while time.time() < fim:
-            try:
-                r = requests.get(network_url + "/v2.0/ports/" + str(port_id), headers={"X-Auth-Token": token}, timeout=30, verify=False)
-                if r.status_code == 200:
-                    port = r.json().get("port", {})
-                    fixed = [fx.get("ip_address") for fx in port.get("fixed_ips", []) if fx.get("ip_address")]
-                    if fixed:
-                        return fixed[0]
-            except Exception as e:
-                debug_log("aracloud esperar_port " + nome_conta + ": " + str(e)[:120])
+            port = self._obter_port(nome_conta, port_id)
+            fixed = [fx.get("ip_address") for fx in port.get("fixed_ips", []) if fx.get("ip_address")]
+            if fixed:
+                return fixed[0]
             time.sleep(5)
         return None
 
-    def _configurar_redes_vm(self, ssh_client):
-        """Sobe interfaces novas + dhclient (passos do portal) e devolve IPs publicos da VM."""
-        if ssh_client is None:
-            return []
-        cmd = ("ip a | awk '/^[0-9]+:/ {print $2}' | sed 's/://' | grep -v lo | xargs -r -I {} sudo ip link set {} up; "
-               "ip a | awk '/^[0-9]+:/ && !/inet / {print $2}' | sed 's/://' | grep -v lo | xargs -r -I {} sudo dhclient -nw {} >/dev/null 2>&1; "
-               "sleep 2; ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1")
-        try:
-            _i, o, _e = ssh_client.exec_command(cmd, timeout=90)
-            out = o.read().decode(errors="ignore")
-            ips = [l.strip() for l in out.splitlines() if l.strip()]
-            return [i for i in ips if ip_publico_valido(i)]
-        except Exception as e:
-            debug_log("configurar_redes_vm: " + str(e)[:160])
-            return []
-
     def _abrir_ssh(self, nome_conta, ip, pem_path):
         if paramiko is None:
-            debug_log("paramiko indisponivel - sem tunel SSH")
+            debug_log("paramiko indisponivel - sem SSH")
             return None
         if not pem_path or not os.path.exists(pem_path):
             return None
@@ -2076,6 +2050,82 @@ class AracloudManager:
                 debug_log("aracloud ssh " + nome_conta + " " + ip + " (" + usuario + "): " + str(e)[:120])
         return None
 
+    def _garantir_proxy_vm(self, ssh_client):
+        try:
+            _i, o, _e = ssh_client.exec_command("test -f /tmp/vp.py && echo OK", timeout=10)
+            if o.read().decode(errors="ignore").strip() == "OK":
+                return True
+            cmd = "cat > /tmp/vp.py <<'VPEOF'\n" + VP_SCRIPT.strip() + "\nVPEOF\nchmod 755 /tmp/vp.py; echo DONE"
+            _i, o, _e = ssh_client.exec_command(cmd, timeout=25)
+            return "DONE" in o.read().decode(errors="ignore")
+        except Exception as e:
+            debug_log("garantir_proxy_vm: " + str(e)[:160])
+            return False
+
+    def _configurar_iface_vm(self, ssh_client, ip_novo, mac_novo, cidr, gw, tbl):
+        """Passos do portal + policy routing por IP de origem."""
+        if ssh_client is None:
+            return False
+        prefixo = "24"
+        try:
+            if cidr and "/" in cidr:
+                prefixo = cidr.split("/")[1]
+        except Exception:
+            pass
+        cmd = (
+            "IFACE=$(ip -o link | grep -i '" + str(mac_novo) + "' | head -n1 | awk -F': ' '{print $2}'); "
+            "if [ -z \"$IFACE\" ]; then echo SEMIFACE; exit 0; fi; "
+            "sudo ip link set \"$IFACE\" up; "
+            "sudo dhclient -nw \"$IFACE\" >/dev/null 2>&1 || true; "
+            "ip -4 -o addr show dev \"$IFACE\" scope global | grep -q '" + str(ip_novo) + "/' || sudo ip addr add " + str(ip_novo) + "/" + str(prefixo) + " dev \"$IFACE\" 2>/dev/null || true; "
+            + ("sudo ip route replace default via " + str(gw) + " dev \"$IFACE\" table " + str(tbl) + " 2>/dev/null || true; " if gw else "")
+            + "sudo ip rule add from " + str(ip_novo) + " table " + str(tbl) + " priority " + str(1000 + tbl) + " 2>/dev/null || true; "
+            "ip -4 -o addr show dev \"$IFACE\" scope global | awk '{print $4}' | cut -d/ -f1"
+        )
+        try:
+            _i, o, _e = ssh_client.exec_command(cmd, timeout=90)
+            out = o.read().decode(errors="ignore")
+            return str(ip_novo) in out
+        except Exception as e:
+            debug_log("configurar_iface_vm: " + str(e)[:160])
+            return False
+
+    def _limpar_regras_vm(self, ssh_client, ip_antigo, tbl):
+        if ssh_client is None or not tbl:
+            return
+        try:
+            ssh_client.exec_command("sudo ip rule del from " + str(ip_antigo) + " table " + str(tbl) + " 2>/dev/null; sudo ip route flush table " + str(tbl) + " 2>/dev/null; true", timeout=20)
+        except Exception:
+            pass
+
+    def _verificar_egresso(self, ssh_client, ip_novo):
+        if ssh_client is None:
+            return False
+        cmd = ("curl -s --max-time 12 --interface " + str(ip_novo) + " https://api.ipify.org || "
+               "curl -s --max-time 12 --interface " + str(ip_novo) + " https://ifconfig.me/ip")
+        try:
+            _i, o, _e = ssh_client.exec_command(cmd, timeout=40)
+            out = o.read().decode(errors="ignore").strip()
+            return out == str(ip_novo)
+        except Exception as e:
+            debug_log("verificar_egresso " + str(ip_novo) + ": " + str(e)[:160])
+            return False
+
+    def _proxy_canal_smtp(self, ssh_client, mx_host, porta, src_ip, timeout=None):
+        if ssh_client is None or not self._garantir_proxy_vm(ssh_client):
+            return None
+        try:
+            transport = ssh_client.get_transport()
+            if transport is None or not transport.is_active():
+                return None
+            chan = transport.open_session()
+            chan.settimeout(timeout or SSH_TUNNEL_TIMEOUT)
+            chan.exec_command("python3 /tmp/vp.py " + str(mx_host) + " " + str(porta) + " " + str(src_ip))
+            return chan
+        except Exception as e:
+            debug_log("proxy_canal_smtp " + str(mx_host) + ": " + str(e)[:160])
+            return None
+
     def _localizar_ip(self, ip):
         for nome, estado in GLOBAL.get("aracloud_contas", {}).items():
             for item in estado.get("ips_ativos", []):
@@ -2090,8 +2140,8 @@ class AracloudManager:
             GLOBAL["aracloud_ips_usados_hoje"] = set()
             GLOBAL["aracloud_data_reset"] = hoje
 
-    def _registar_ip_activo(self, nome_conta, conta_estado, ip, item_id, tipo, ssh_client, total_ref):
-        conta_estado["ips_ativos"].append({"ip": ip, "id": item_id, "tipo": tipo})
+    def _registar_ip(self, conta_estado, ip, item_id, tipo, ssh_client, tbl=None):
+        conta_estado["ips_ativos"].append({"ip": ip, "id": item_id, "tipo": tipo, "tbl": tbl})
         if tipo != "primario":
             conta_estado["total_ips_unicos"] = conta_estado.get("total_ips_unicos", 0) + 1
             GLOBAL["aracloud_ips_usados_hoje"].add(ip)
@@ -2101,10 +2151,34 @@ class AracloudManager:
             GLOBAL["aracloud_clients_ssh"][ip] = ssh_client
         with GLOBAL["orcamento_lock"]:
             GLOBAL["orcamento_por_ip"].setdefault(ip, {})
-        return total_ref + 1
+
+    def _ativar_ip_extra(self, nome_conta, conta_estado, ssh_prim, net_id, server_id):
+        """Anexa rede, configura VM, verifica egresso. Devolve True se registou IP."""
+        port_novo = self._anexar_interface(nome_conta, server_id, net_id)
+        if not port_novo:
+            return False
+        ip_novo = self._esperar_port_com_ip(nome_conta, port_novo, timeout_seg=60)
+        if not ip_novo or not ip_publico_valido(ip_novo):
+            self._desanexar_interface(nome_conta, server_id, port_novo)
+            return False
+        port = self._obter_port(nome_conta, port_novo)
+        mac = port.get("mac_address", "")
+        cidr, gw = self._obter_subnet(nome_conta, net_id)
+        tbl = 100 + int(conta_estado.get("tbl_counter", 0))
+        conta_estado["tbl_counter"] = int(conta_estado.get("tbl_counter", 0)) + 1
+        ok_cfg = self._configurar_iface_vm(ssh_prim, ip_novo, mac, cidr, gw, tbl)
+        ok_eg = self._verificar_egresso(ssh_prim, ip_novo) if ok_cfg else False
+        if not ok_eg:
+            self._limpar_regras_vm(ssh_prim, ip_novo, tbl)
+            self._desanexar_interface(nome_conta, server_id, port_novo)
+            debug_log("aracloud " + nome_conta + ": egresso falhou para " + ip_novo)
+            return False
+        self._registar_ip(conta_estado, ip_novo, port_novo, "iface", ssh_prim, tbl)
+        dizer("  Aracloud: IP " + ip_novo + " activo em " + nome_conta + " (iface " + str(net_id)[:12] + "... egresso OK)")
+        return True
 
     def inicializar(self):
-        """FASE 2.5: autentica contas, IP primario + IPs extra (fip ou interface)."""
+        """FASE 2.5: autentica contas; 1 IP primario + ate 2 IPs extra (redes Pub_)."""
         self._reset_diario_se_necessario()
         credenciais = self._carregar_credenciais_hf()
         dizer("  Aracloud: " + str(len(credenciais)) + " contas com credenciais")
@@ -2127,7 +2201,10 @@ class AracloudManager:
             if not server_id:
                 dizer("  AVISO: servidor nao encontrado em " + nome_conta)
                 continue
-            port_id = self._obter_port_id_servidor(nome_conta, server_id)
+            ports = self._obter_ports_servidor(nome_conta, server_id)
+            port_id = ports[0].get("id") if ports else None
+            if ports and ports[0].get("network_id"):
+                self.provider_net_ids[nome_conta] = ports[0].get("network_id")
             contas_funcionais += 1
             conta_estado = GLOBAL["aracloud_contas"].get(nome_conta, {}) or {}
             conta_estado["server_id"] = server_id
@@ -2136,13 +2213,9 @@ class AracloudManager:
             if conta_estado.get("data") != hoje:
                 conta_estado["total_ips_unicos"] = 0
                 conta_estado["data"] = hoje
+                conta_estado["tbl_counter"] = 0
             conta_estado["ips_ativos"] = []
-            # rede provider da port primaria (usada para anexar interfaces extra)
-            for p in self._obter_ports_servidor(nome_conta, server_id):
-                if p.get("id") == port_id:
-                    self.provider_net_ids[nome_conta] = p.get("network_id")
-                    break
-            # ---- 1) IP PRIMARIO: IP publico ja atribuido ao servidor ----
+            # ---- 1) IP PRIMARIO ----
             ips_base = self._ips_publicos_servidor(nome_conta, server_id)
             primary_ip = None
             ssh_prim = None
@@ -2156,114 +2229,56 @@ class AracloudManager:
                 dizer("  AVISO: " + nome_conta + " sem IP publico acessivel por SSH - saltado")
                 GLOBAL["aracloud_contas"][nome_conta] = conta_estado
                 continue
-            total_ips = self._registar_ip_activo(nome_conta, conta_estado, primary_ip, None, "primario", ssh_prim, total_ips)
+            self._registar_ip(conta_estado, primary_ip, None, "primario", ssh_prim)
+            total_ips += 1
             dizer("  Aracloud: IP primario " + primary_ip + " activo em " + nome_conta)
-            # ---- 2) Reaproveitar floating IPs ja associados a esta port ----
-            for fip_info in self._listar_ips_flutuantes(nome_conta):
+            # ---- 2) Reaproveitar interfaces extra ja anexadas ----
+            for p in ports[1:]:
                 if len(conta_estado["ips_ativos"]) >= MAX_IPS_POR_CONTA:
                     break
-                if fip_info.get("port_id") != port_id:
-                    continue
-                ip_addr = fip_info.get("ip")
-                fip_id = fip_info.get("id")
-                if not ip_addr or not fip_id or not ip_publico_valido(ip_addr):
-                    continue
-                cli = self._abrir_ssh(nome_conta, ip_addr, pem_path)
-                if cli is None:
-                    self._desassociar_ip(nome_conta, fip_id)
-                    self._remover_ip(nome_conta, fip_id)
-                    continue
-                total_ips = self._registar_ip_activo(nome_conta, conta_estado, ip_addr, fip_id, "fip", cli, total_ips)
-                dizer("  Aracloud: IP existente " + ip_addr + " reaproveitado em " + nome_conta)
-            # ---- 3) Reaproveitar interfaces extra ja anexadas ----
-            for p in self._obter_ports_servidor(nome_conta, server_id):
-                if len(conta_estado["ips_ativos"]) >= MAX_IPS_POR_CONTA:
-                    break
-                if p.get("id") == port_id:
-                    continue
                 fixed = [fx.get("ip_address") for fx in p.get("fixed_ips", []) if fx.get("ip_address")]
                 if not fixed:
                     continue
                 ip_addr = fixed[0]
                 if not ip_publico_valido(ip_addr):
                     continue
-                cli = self._abrir_ssh(nome_conta, ip_addr, pem_path)
-                if cli is None:
-                    self._configurar_redes_vm(ssh_prim)
-                    cli = self._abrir_ssh(nome_conta, ip_addr, pem_path)
-                if cli is None:
-                    continue
-                total_ips = self._registar_ip_activo(nome_conta, conta_estado, ip_addr, p.get("id"), "iface", cli, total_ips)
-                dizer("  Aracloud: interface existente " + ip_addr + " reaproveitada em " + nome_conta)
-            # ---- 4) Criar IPs extra com circuit breaker ----
+                tbl = 100 + int(conta_estado.get("tbl_counter", 0))
+                conta_estado["tbl_counter"] = int(conta_estado.get("tbl_counter", 0)) + 1
+                cidr, gw = self._obter_subnet(nome_conta, p.get("network_id"))
+                self._configurar_iface_vm(ssh_prim, ip_addr, p.get("mac_address", ""), cidr, gw, tbl)
+                if self._verificar_egresso(ssh_prim, ip_addr):
+                    self._registar_ip(conta_estado, ip_addr, p.get("id"), "iface", ssh_prim, tbl)
+                    total_ips += 1
+                    dizer("  Aracloud: interface existente " + ip_addr + " reaproveitada em " + nome_conta)
+                else:
+                    self._limpar_regras_vm(ssh_prim, ip_addr, tbl)
+            # ---- 3) Anexar redes Pub_ ate MAX_IPS_POR_CONTA ----
             falhas_seguidas = 0
-            tentativas = 0
-            while (len(conta_estado["ips_ativos"]) < MAX_IPS_POR_CONTA
-                   and falhas_seguidas < MAX_FALHAS_SEGUIDAS_CONTA
-                   and tentativas < MAX_IPS_POR_CONTA * 4
-                   and conta_estado.get("total_ips_unicos", 0) < MAX_IPS_UNICOS_POR_DIA
-                   and not GLOBAL.get("emergency_stop")):
-                tentativas += 1
-                novo_ip = None
-                novo_id = None
-                novo_tipo = None
-                novo_cli = None
-                # 4a) floating IP - UMA tentativa por conta
-                if self.fips_suportados.get(nome_conta, True):
-                    fip = self._criar_ip_flutuante(nome_conta)
-                    if fip and fip.get("ip") and fip.get("id"):
-                        ok_assoc, detalhe = self._associar_ip(nome_conta, fip["id"], port_id)
-                        if ok_assoc:
-                            cli = self._abrir_ssh(nome_conta, fip["ip"], pem_path)
-                            if cli is not None:
-                                novo_ip, novo_id, novo_tipo, novo_cli = fip["ip"], fip["id"], "fip", cli
-                            else:
-                                self._desassociar_ip(nome_conta, fip["id"])
-                                self._remover_ip(nome_conta, fip["id"])
-                                falhas_seguidas += 1
-                        else:
-                            dizer("  AVISO: " + nome_conta + " floating IP nao associavel (" + detalhe[:90] + ") - a usar interfaces extra")
-                            self._remover_ip(nome_conta, fip["id"])
-                            self.fips_suportados[nome_conta] = False
-                            falhas_seguidas += 1
-                    else:
-                        self.fips_suportados[nome_conta] = False
-                        falhas_seguidas += 1
-                # 4b) interface extra na rede provider + config VM por SSH
-                if novo_ip is None:
-                    net_id = self.provider_net_ids.get(nome_conta)
-                    port_novo = self._anexar_interface(nome_conta, server_id, net_id) if net_id else None
-                    if port_novo:
-                        ip_novo = self._esperar_port_com_ip(nome_conta, port_novo, timeout_seg=60)
-                        if ip_novo and ip_publico_valido(ip_novo):
-                            ips_vm = self._configurar_redes_vm(ssh_prim)
-                            cli = None
-                            if ip_novo in ips_vm:
-                                cli = self._abrir_ssh(nome_conta, ip_novo, pem_path)
-                            if cli is None:
-                                cli = self._abrir_ssh(nome_conta, ip_novo, pem_path)
-                            if cli is not None:
-                                novo_ip, novo_id, novo_tipo, novo_cli = ip_novo, port_novo, "iface", cli
-                            else:
-                                self._desanexar_interface(nome_conta, server_id, port_novo)
-                                falhas_seguidas += 1
-                        else:
-                            self._desanexar_interface(nome_conta, server_id, port_novo)
-                            falhas_seguidas += 1
-                    else:
-                        dizer("  AVISO: " + nome_conta + " nao consegue anexar mais interfaces (quota/rede)")
-                        break
-                if novo_ip:
+            candidatos = self._descobrir_redes_publicas(nome_conta, server_id)
+            nets_anexadas_agora = set()
+            for cand in candidatos:
+                if len(conta_estado["ips_ativos"]) >= MAX_IPS_POR_CONTA:
+                    break
+                if falhas_seguidas >= MAX_FALHAS_SEGUIDAS_CONTA:
+                    break
+                if conta_estado.get("total_ips_unicos", 0) >= MAX_IPS_UNICOS_POR_DIA:
+                    break
+                if GLOBAL.get("emergency_stop"):
+                    break
+                nid = cand["id"]
+                if nid in nets_anexadas_agora:
+                    continue
+                if self._ativar_ip_extra(nome_conta, conta_estado, ssh_prim, nid, server_id):
                     falhas_seguidas = 0
-                    total_ips = self._registar_ip_activo(nome_conta, conta_estado, novo_ip, novo_id, novo_tipo, novo_cli, total_ips)
-                    dizer("  Aracloud: IP " + novo_ip + " activo em " + nome_conta + " (" + novo_tipo + ")")
+                    total_ips += 1
+                    nets_anexadas_agora.add(nid)
                 else:
                     falhas_seguidas += 1
-                    time.sleep(2)
+                    dizer("  AVISO: falha ao ativar IP extra via rede " + str(cand.get("name", nid)) + " em " + nome_conta)
             GLOBAL["aracloud_contas"][nome_conta] = conta_estado
         CHECKPOINT.salvar_aracloud(GLOBAL["aracloud_contas"], list(GLOBAL["aracloud_ips_usados_hoje"]), GLOBAL.get("aracloud_data_reset"))
         dizer("  Aracloud: " + str(contas_funcionais) + " contas funcionais, " + str(total_ips) + " IPs activos")
-        dizer("  Arquitectura real: " + str(total_ips) + " workers (primarios + extra)")
+        dizer("  Arquitectura real: " + str(total_ips) + " workers (primario + Pub_ por conta)")
         marcar_fase("FASE25_ARACLOUD", total_ips > 0, str(total_ips) + " IPs activos (" + str(contas_funcionais) + " contas)")
         return total_ips
 
@@ -2271,94 +2286,59 @@ class AracloudManager:
         workers = []
         contas_dkim = GLOBAL.get("contas", [])
         dominios_dkim = list({c["domain"] for c in contas_dkim}) if contas_dkim else []
-        for i, ip in enumerate(GLOBAL.get("aracloud_ips_ativos", [])):
-            dominio = dominios_dkim[i % len(dominios_dkim)] if dominios_dkim else "fallback.local"
-            conta_dkim = next((c for c in contas_dkim if c["domain"] == dominio), None)
-            workers.append({
-                "worker_id": "W" + str(i + 1).zfill(2),
-                "ip": ip, "domain": dominio, "conta_dkim": conta_dkim,
-                "ssh_client": GLOBAL.get("aracloud_clients_ssh", {}).get(ip),
-            })
+        i = 0
+        for nome, estado in GLOBAL.get("aracloud_contas", {}).items():
+            prim = next((x["ip"] for x in estado.get("ips_ativos", []) if x.get("tipo") == "primario"), None)
+            ssh_prim = GLOBAL.get("aracloud_clients_ssh", {}).get(prim) if prim else None
+            if not ssh_prim:
+                continue
+            for item in estado.get("ips_ativos", []):
+                ip = item.get("ip")
+                if not ip:
+                    continue
+                dominio = dominios_dkim[i % len(dominios_dkim)] if dominios_dkim else "fallback.local"
+                conta_dkim = next((c for c in contas_dkim if c["domain"] == dominio), None)
+                workers.append({
+                    "worker_id": "W" + str(i + 1).zfill(2),
+                    "ip": ip, "domain": dominio, "conta_dkim": conta_dkim,
+                    "ssh_client": ssh_prim, "ip_primario": prim, "conta_nome": nome,
+                })
+                i += 1
         return workers
 
     def rodar_ip(self, ip):
         conta_nome, estado, item = self._localizar_ip(ip)
         if not conta_nome or not item:
             return None
-        tipo = item.get("tipo", "fip")
-        item_id = item.get("id")
+        tipo = item.get("tipo", "iface")
         if tipo == "primario":
             debug_log("rodar_ip: " + ip + " e IP primario (fixo) - nao rotativo")
             return None
         server_id = estado.get("server_id")
-        port_id = estado.get("port_id")
-        pem = estado.get("pem_path", "")
+        item_id = item.get("id")
+        tbl = item.get("tbl")
+        prim = next((x["ip"] for x in estado.get("ips_ativos", []) if x.get("tipo") == "primario"), None)
+        ssh_prim = GLOBAL.get("aracloud_clients_ssh", {}).get(prim) if prim else None
         # remover antigo
-        ssh_old = GLOBAL.get("aracloud_clients_ssh", {}).pop(ip, None)
-        if ssh_old:
-            try:
-                ssh_old.close()
-            except Exception:
-                pass
         if ip in GLOBAL["aracloud_ips_ativos"]:
             GLOBAL["aracloud_ips_ativos"].remove(ip)
+        GLOBAL["aracloud_clients_ssh"].pop(ip, None)
         estado["ips_ativos"] = [x for x in estado.get("ips_ativos", []) if x.get("ip") != ip]
-        if tipo == "fip" and item_id:
-            self._desassociar_ip(conta_nome, item_id)
-            self._remover_ip(conta_nome, item_id)
-        elif tipo == "iface" and item_id:
+        self._limpar_regras_vm(ssh_prim, ip, tbl)
+        if item_id:
             self._desanexar_interface(conta_nome, server_id, item_id)
         if estado.get("total_ips_unicos", 0) >= MAX_IPS_UNICOS_POR_DIA:
             dizer("  " + conta_nome + ": nao e possivel rodar IP (limite diario 20)")
             return None
-        # substituto: fip se suportado, senao interface
-        novo_ip = None
-        novo_id = None
-        novo_tipo = None
-        if self.fips_suportados.get(conta_nome, True):
-            fip = self._criar_ip_flutuante(conta_nome)
-            if fip:
-                ok, det = self._associar_ip(conta_nome, fip["id"], port_id)
-                if ok:
-                    cli = self._abrir_ssh(conta_nome, fip["ip"], pem)
-                    if cli is not None:
-                        GLOBAL["aracloud_clients_ssh"][fip["ip"]] = cli
-                        novo_ip, novo_id, novo_tipo = fip["ip"], fip["id"], "fip"
-                    else:
-                        self._desassociar_ip(conta_nome, fip["id"])
-                        self._remover_ip(conta_nome, fip["id"])
-                        self.fips_suportados[conta_nome] = False
-                else:
-                    self._remover_ip(conta_nome, fip["id"])
-                    self.fips_suportados[conta_nome] = False
-        if novo_ip is None:
-            net_id = self.provider_net_ids.get(conta_nome)
-            port_novo = self._anexar_interface(conta_nome, server_id, net_id) if net_id else None
-            if port_novo:
-                ip_n = self._esperar_port_com_ip(conta_nome, port_novo, 60)
-                if ip_n and ip_publico_valido(ip_n):
-                    prim = next((x["ip"] for x in estado["ips_ativos"] if x.get("tipo") == "primario"), None)
-                    ssh_prim = GLOBAL["aracloud_clients_ssh"].get(prim) if prim else None
-                    if ssh_prim:
-                        self._configurar_redes_vm(ssh_prim)
-                    cli = self._abrir_ssh(conta_nome, ip_n, pem)
-                    if cli is not None:
-                        GLOBAL["aracloud_clients_ssh"][ip_n] = cli
-                        novo_ip, novo_id, novo_tipo = ip_n, port_novo, "iface"
-                    else:
-                        self._desanexar_interface(conta_nome, server_id, port_novo)
-        if novo_ip is None:
-            return None
-        estado["ips_ativos"].append({"ip": novo_ip, "id": novo_id, "tipo": novo_tipo})
-        estado["total_ips_unicos"] = estado.get("total_ips_unicos", 0) + 1
-        GLOBAL["aracloud_ips_usados_hoje"].add(novo_ip)
-        GLOBAL["aracloud_ips_ativos"].append(novo_ip)
-        with GLOBAL["orcamento_lock"]:
-            GLOBAL["orcamento_por_ip"].setdefault(novo_ip, {})
-        CHECKPOINT.salvar_aracloud(GLOBAL["aracloud_contas"], list(GLOBAL["aracloud_ips_usados_hoje"]), GLOBAL.get("aracloud_data_reset"))
-        dizer("  Aracloud: IP " + ip + " substituido por " + novo_ip + " em " + conta_nome)
-        GLOBAL["spf_sujo"] = True
-        return novo_ip
+        # substituto: primeira rede candidata livre
+        for cand in self._descobrir_redes_publicas(conta_nome, server_id):
+            if self._ativar_ip_extra(conta_nome, estado, ssh_prim, cand["id"], server_id):
+                CHECKPOINT.salvar_aracloud(GLOBAL["aracloud_contas"], list(GLOBAL["aracloud_ips_usados_hoje"]), GLOBAL.get("aracloud_data_reset"))
+                novo = estado["ips_ativos"][-1]["ip"]
+                dizer("  Aracloud: IP " + ip + " substituido por " + novo + " em " + conta_nome)
+                GLOBAL["spf_sujo"] = True
+                return novo
+        return None
 
 
 def abrir_canal_smtp_aracloud(ssh_client, mx_host, porta=25, timeout=None):
@@ -2395,14 +2375,19 @@ def _canal_suporta_tls(sock):
 def tentar_conexao_via_aracloud(worker_ctx, mx_host, timeout, provedor):
     ip = worker_ctx.get("ip") if worker_ctx else None
     ssh_client = worker_ctx.get("ssh_client") if worker_ctx else None
+    ip_prim = worker_ctx.get("ip_primario") or ip
     worker_id = worker_ctx.get("worker_id") if worker_ctx else "---"
     if not ssh_client:
         smtp_log_raw(worker_id, ip, provedor, "🛑 sem ssh_client - nao e possivel ligar")
         return None, None, "sem_ssh"
     canal = None
     try:
-        smtp_log_raw(worker_id, ip, provedor, "    ARACLOUD " + str(ip) + " -> " + mx_host + ":25")
-        canal = abrir_canal_smtp_aracloud(ssh_client, mx_host, 25, timeout)
+        smtp_log_raw(worker_id, ip, provedor, "    ARACLOUD " + str(ip) + " -> " + mx_host + ":25 (proxy bind)")
+        mgr = ARACLOUD_MGR_SINGLETON
+        canal = mgr._proxy_canal_smtp(ssh_client, mx_host, 25, ip, timeout) if mgr else None
+        if canal is None and ip == ip_prim:
+            smtp_log_raw(worker_id, ip, provedor, "    proxy indisponivel - fallback direct-tcpip (IP primario)")
+            canal = abrir_canal_smtp_aracloud(ssh_client, mx_host, 25, timeout)
         if canal is None:
             return None, None, "canal_falhou"
         banner = canal.recv(4096).decode(errors="ignore").strip()
@@ -3568,7 +3553,7 @@ def enviar_email_unico(dest, assunto, html, conta):
 
 
 def gerar_relatorio(rt):
-    assunto = "VERISCOPE V23.1 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
+    assunto = "VERISCOPE V23.3 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
     linhas_fases = ""
     try:
         with GLOBAL["stats_lock"]:
@@ -3589,7 +3574,7 @@ body{font-family:Arial;margin:20px;color:#222}h1{color:#2c5f2d}h2{color:#3a7d44}
 table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:7px;font-size:13px}
 th{background:#3a7d44;color:#fff;text-align:left}.ok{color:#2c5f2d;font-weight:bold}ul{line-height:1.7}
 </style></head><body>
-<h1>VERISCOPE V23.1 - IPs ARACLOUD (rede provider/flat)</h1>
+<h1>VERISCOPE V23.3 - 3 IPs/CONTA (redes Pub_ + proxy bind)</h1>
 <h2>Resumo</h2><ul>
 <li>IPs Aracloud activos: <b>""" + str(len(GLOBAL.get('aracloud_ips_ativos', []))) + """</b></li>
 <li>IPs únicos usados hoje: <b>""" + str(len(GLOBAL.get('aracloud_ips_usados_hoje', set()))) + """</b></li>
@@ -3637,7 +3622,7 @@ def baixar_ficheiros_campanha():
 
 
 # ====================================================================
-# MAIN V23.1
+# MAIN V23.3
 # ====================================================================
 def main():
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG, ARACLOUD_MGR_SINGLETON
@@ -3698,27 +3683,38 @@ def main():
                 _norm = []
                 for _it in _estado.get("ips_ativos", []):
                     if isinstance(_it, str):
-                        _norm.append({"ip": _it, "id": None, "tipo": "primario"})
+                        _norm.append({"ip": _it, "id": None, "tipo": "primario", "tbl": None})
                     elif isinstance(_it, dict):
-                        _it.setdefault("tipo", "fip" if _it.get("id") else "primario")
+                        _it.setdefault("tipo", "iface" if _it.get("id") else "primario")
+                        _it.setdefault("tbl", None)
                         _norm.append(_it)
                 _estado["ips_ativos"] = _norm
                 if _mgr._autenticar(_nome, _cd.get("cred", {})):
+                    _prim = next((x["ip"] for x in _norm if x.get("tipo") == "primario"), None)
+                    _ssh_prim = _mgr._abrir_ssh(_nome, _prim, _pem) if _prim else None
                     _vivos = []
                     for ip_info in list(_estado.get("ips_ativos", [])):
                         _ip = ip_info.get("ip")
-                        _cli = _mgr._abrir_ssh(_nome, _ip, _pem)
-                        if _cli is not None:
-                            _vivos.append(ip_info)
-                            if _ip not in GLOBAL["aracloud_ips_ativos"]:
-                                GLOBAL["aracloud_ips_ativos"].append(_ip)
-                            GLOBAL["aracloud_clients_ssh"][_ip] = _cli
-                            GLOBAL.setdefault("orcamento_por_ip", {}).setdefault(_ip, {})
-                            reconectados += 1
-                        else:
-                            dizer("  [RECUPERACAO] SSH falhou para " + str(_ip) + " - descartado")
+                        if ip_info.get("tipo") == "primario":
+                            if _ssh_prim is not None:
+                                _vivos.append(ip_info)
+                                if _ip not in GLOBAL["aracloud_ips_ativos"]:
+                                    GLOBAL["aracloud_ips_ativos"].append(_ip)
+                                GLOBAL["aracloud_clients_ssh"][_ip] = _ssh_prim
+                                GLOBAL.setdefault("orcamento_por_ip", {}).setdefault(_ip, {})
+                                reconectados += 1
+                            continue
+                        if _ssh_prim is not None and ip_info.get("tbl"):
+                            _mgr._verificar_egresso(_ssh_prim, _ip)
+                        _vivos.append(ip_info)
+                        if _ip not in GLOBAL["aracloud_ips_ativos"]:
+                            GLOBAL["aracloud_ips_ativos"].append(_ip)
+                        if _ssh_prim is not None:
+                            GLOBAL["aracloud_clients_ssh"][_ip] = _ssh_prim
+                        GLOBAL.setdefault("orcamento_por_ip", {}).setdefault(_ip, {})
+                        reconectados += 1
                     _estado["ips_ativos"] = _vivos
-            dizer("[RECUPERACAO] " + str(reconectados) + " IPs reconectados via SSH")
+            dizer("[RECUPERACAO] " + str(reconectados) + " IPs reconectados")
             ARACLOUD_MGR_SINGLETON = _mgr
         except Exception as e_rec:
             dizer("[RECUPERACAO] Erro ao reconectar IPs: " + str(e_rec)[:120])
@@ -3758,8 +3754,8 @@ def main():
     threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
     time.sleep(1)
 
-    dizer("VERISCOPE V23.1 HEADLESS [" + execution_id + "]")
-    dizer("ARQUITETURA: IP primario + extra (fip/iface) | " + str(MAX_IPS_UNICOS_POR_DIA) + " unicos/conta/dia")
+    dizer("VERISCOPE V23.3 HEADLESS [" + execution_id + "]")
+    dizer("ARQUITETURA: 1 primario + 2 Pub_/conta | " + str(MAX_IPS_UNICOS_POR_DIA) + " unicos/conta/dia")
     dizer("CHECKPOINT: " + ("RECUPERAR" if tem_checkpoint else "NOVO"))
     baixar_ficheiros_campanha()
 
@@ -3800,7 +3796,7 @@ def main():
         if GLOBAL.get("emergency_stop"):
             raise KeyboardInterrupt()
 
-        definir_fase("FASE 2.5 - Aracloud: autenticacao + IPs (primario/iface/fip) + SSH")
+        definir_fase("FASE 2.5 - Aracloud: auth + IP primario + redes Pub_ + proxy bind")
         aracloud_mgr = AracloudManager()
         ARACLOUD_MGR_SINGLETON = aracloud_mgr
         total_ips = aracloud_mgr.inicializar()
@@ -3885,7 +3881,7 @@ def main():
                     f.write(cr)
                 api = HfApi(token=HF_TOKEN)
                 ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_1_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_3_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
                 dizer("  Relatorio enviado para HuggingFace")
             except Exception as e:
                 dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
