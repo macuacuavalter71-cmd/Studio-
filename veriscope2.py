@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-VERISCOPE V23.6 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
+VERISCOPE V23.6.1 - ARQUITETURA HEADLESS (COLAB CLI + GITHUB ACTIONS)
 PARALELISMO HIERÁRQUICO: 3 IPs/conta (primario + 2 redes Pub_) x WORKERS
 SMART SHUTDOWN (5h40m) + AUTO-RESTART + CHECKPOINT HF + RASTREIO EXATO
+
+V23.6.1 - MODIFICACAO UNICA:
+  [NOVO] Upload do smtp_raw.txt para HuggingFace a cada 5 minutos
+  [NOVO] Dashboard mostra as ultimas respostas dos provedores em tempo real
 
 V23.6 - CORRECCAO DA CAUSA RAIZ (0 tentativas / 100% handshake falhado):
   [BUG-1 CRITICO] VP_SCRIPT usava sys.stdin.buffer.read(65536).
@@ -12,28 +16,19 @@ V23.6 - CORRECCAO DA CAUSA RAIZ (0 tentativas / 100% handshake falhado):
   [BUG-2 CRITICO] _garantir_proxy_vm() fazia short-circuit com "test -f /tmp/vp.py".
                   As VMs ja tinham o script velho gravado e nunca era reescrito.
                   -> versionamento via /tmp/vp.ver + reescrita forcada.
-  [BUG-3] Fallback direct-tcpip so disparava para o IP primario E so se o proxy
-          devolvesse None. Como o proxy devolve banner, nunca caia no fallback.
+  [BUG-3] Fallback direct-tcpip so disparava para o IP primario.
           -> fallback para TODOS os IPs + log explicito.
-  [BUG-4] Os 15 workers percorriam PROVEDORES_USAVEIS na mesma ordem: todos em
-          cima do bebo.com, todos do offset 0, emails duplicados, race conditions.
+  [BUG-4] Os 15 workers percorriam PROVEDORES_USAVEIS na mesma ordem.
           -> filas rotacionadas por worker + lock de reclamacao de provedor.
   [BUG-5] GLOBAL["por_provedor"][prov] = res sobrescrito pelo ultimo worker.
           -> agregacao com lock (merge de contadores).
-  [BUG-6] stderr do canal SSH nunca era lido -> erros do vp.py invisiveis.
+  [BUG-6] stderr do canal SSH nunca era lido.
           -> captura e log de stderr.
   [BUG-7] Cegueira: logs SMTP iam para ficheiro, dashboard so mostrava dizer().
           -> taxonomy de falhas de handshake + superficie no dashboard.
   [BUG-8] "530 Must issue a STARTTLS command first" nao era detetado.
           -> classe TLS_OBRIGATORIO + contador proprio.
-  [NOVO]  FASE 5.5 SMOKE TEST: 1 handshake completo por IP contra um MX real,
-          com transcript integral, ANTES de iniciar o envio massivo.
-V23.5:
-- IP primario + attach de redes Pub_ via Nova os-interface
-- Proxy SMTP na VM com socket.bind((IP,0)) -> MX ve sempre o IP correto
-- Verificacao de egresso via curl --interface antes de marcar IP activo
-- Budget por IP aumentado para 2000/provedor
-- Circuit breaker: 3 falhas seguidas por conta (nunca loop infinito)
+  [NOVO]  FASE 5.5 SMOKE TEST: 1 handshake completo por IP contra um MX real.
 """
 import os
 import sys
@@ -118,8 +113,6 @@ APAGAR_PARQUETS_APOS_USO = True
 USAR_SNAPSHOT_PRIMEIRO = True
 SMTP_TIMEOUT = 15
 SMTP_TIMEOUT_ASIATICO = 30
-# [BUG-1] mantem 30s: com o proxy corrigido o EHLO responde em <3s.
-# 30s so serve de rede de seguranca contra tarpitting real.
 SMTP_RECV_TIMEOUT = 30
 DESEC_TTL = 900
 DESEC_CHUNK = 150
@@ -153,21 +146,8 @@ RATE_INCREM_SUCESSO = 5
 TAXA_SUCESSO_AUMENTAR = 0.90
 MAX_FALHAS_SEGUIDAS_CONTA = 3
 ARACLOUD_MGR_SINGLETON = None
-# =====================================================================
-# [BUG-1 CRITICO] - PROXY SMTP DA VM - VERSAO 2
-# ---------------------------------------------------------------------
-# A versao anterior fazia:  si = sys.stdin.buffer ; d = si.read(65536)
-# BufferedReader.read(N) SO devolve quando acumula N bytes OU chega EOF.
-# Um "EHLO x\r\n" tem ~30 bytes -> ficava bloqueado PARA SEMPRE e o
-# comando nunca chegava ao MX. Resultado: banner 220 OK (a direcao
-# socket->stdout usava write+flush e funcionava), mas 0 tentativas.
-#
-# CORRECCAO: os.read(0, N) devolve assim que ha >=1 byte disponivel.
-#            os.write(1, d) em vez de sys.stdout.buffer.write (sem buffering).
-#            TCP_NODELAY para nao atrasar pacotes pequenos.
-#            Banner de pronto "VP2 READY" nunca e escrito para stdout
-#            (so stderr) para nao poluir o fluxo SMTP.
-# =====================================================================
+# [V23.6.1] Intervalo de upload do smtp_raw.txt (5 minutos = 300 segundos)
+SMTP_RAW_UPLOAD_INTERVAL = 300
 VP_VERSION = "vp2-osread-20261128"
 VP_SCRIPT = r'''
 import socket, sys, os, threading, time
@@ -204,7 +184,6 @@ except Exception as e:
     log("FALHA connect/bind: " + repr(e)); bye(3)
 stop = threading.Event()
 def rx():
-    """socket -> stdout (para o Colab)."""
     try:
         while not stop.is_set():
             d = s.recv(65536)
@@ -219,10 +198,9 @@ def rx():
         except Exception: pass
         bye(0)
 def tx():
-    """stdin (do Colab) -> socket.  OS.READ = devolve ao 1o byte."""
     try:
         while not stop.is_set():
-            d = os.read(FD_IN, 65536)          # <<< A CORRECCAO CRITICA
+            d = os.read(FD_IN, 65536)
             if not d:
                 log("stdin EOF"); break
             s.sendall(d)
@@ -282,7 +260,6 @@ PROVEDORES_ASIATICOS = {
     "qq.com", "foxmail.com", "vip.qq.com", "yeah.net",
     "21cn.com", "eyou.com", "docomo.ne.jp", "yahoo.co.jp", "pchome.com.tw",
 }
-# MX publico e sempre responsivo, usado no SMOKE TEST da FASE 5.5
 SMOKE_TEST_MX = "gmail-smtp-in.l.google.com"
 CAMPAIGN_MAP = {
     1: {"subject": "Can I show you something tomorrow?", "template": "veriscope_email_01.html"},
@@ -531,10 +508,8 @@ GLOBAL = {}
 LOG_FILE = None
 SMTP_LOG = None
 DEBUG_LOG = None
-# [BUG-4] Lock global de reclamacao: impede 2 workers no mesmo provedor
 PROVEDOR_EM_USO = set()
 PROVEDOR_EM_USO_LOCK = threading.Lock()
-# [BUG-3] Semaforo por transport SSH: paramiko tem max ~10 canais simultaneos
 SSH_TRANSPORT_SEMAPHORES = {}
 SSH_TRANSPORT_SEM_LOCK = threading.Lock()
 def obter_semaforo_transport(chave, limite=4):
@@ -543,7 +518,6 @@ def obter_semaforo_transport(chave, limite=4):
             SSH_TRANSPORT_SEMAPHORES[chave] = threading.Semaphore(limite)
         return SSH_TRANSPORT_SEMAPHORES[chave]
 def reclamar_provedor(prov):
-    """[BUG-4] Retorna True se este worker pode trabalhar neste provedor AGORA."""
     with PROVEDOR_EM_USO_LOCK:
         if prov in PROVEDOR_EM_USO:
             return False
@@ -566,10 +540,11 @@ def reset_global_state():
         "smtp_tentativas": 0, "smtp_aceites": 0, "smtp_rejeitados": 0, "smtp_user_unknown": 0,
         "smtp_erros": 0, "smtp_conexoes": 0, "smtp_via_proxy": 0, "smtp_via_colab": 0,
         "smtp_4xx": 0, "smtp_5xx": 0, "smtp_retries": 0, "smtp_abandonados": 0,
-        # [BUG-7] Taxonomia de falhas de handshake -> visivel no dashboard
         "hs_ok": 0, "hs_fail_timeout": 0, "hs_fail_reject": 0, "hs_fail_conn": 0,
         "hs_fail_tls_required": 0, "hs_fail_channel": 0, "hs_fallback_direct": 0,
         "smtp_tail": deque(maxlen=8),
+        # [V23.6.1] Novas deques para mostrar respostas dos provedores no dashboard
+        "smtp_respostas_provedores": deque(maxlen=15),
         "smtp_aceites_ultima_checkpoint": 0, "provs_concluidos": 0, "prov_total_envio": 0,
         "rcpt_aprendido": {}, "rcpt_lock": threading.Lock(), "por_provedor": {},
         "por_provedor_lock": threading.Lock(),
@@ -594,6 +569,8 @@ def reset_global_state():
         "orcamento_por_ip": {}, "orcamento_lock": threading.Lock(),
         "offsets_por_provedor": {}, "offsets_lock": threading.Lock(),
         "smoke_results": [],
+        # [V23.6.1] Contador de uploads do smtp_raw
+        "smtp_raw_uploads": 0,
     })
     return execution_id
 class RateController:
@@ -760,9 +737,14 @@ def smtp_log_raw(worker_id, ip, provedor, msg):
         with GLOBAL_FILEWRITE_SEMAPHORE:
             with open(SMTP_RAW_LOG, "a", encoding="utf-8") as f:
                 f.write(linha + "\n")
-        # [BUG-7] Superficie as ultimas linhas SMTP no dashboard
         if GLOBAL and "smtp_tail" in GLOBAL:
             GLOBAL["smtp_tail"].append("[" + str(worker_id or "---") + "/" + str(ip or "---") + "] " + str(msg)[:60])
+        # [V23.6.1] Registar respostas dos provedores para o dashboard
+        if GLOBAL and "smtp_respostas_provedores" in GLOBAL:
+            msg_str = str(msg)
+            # Capturar respostas SMTP (linhas que começam com código ou contêm respostas)
+            if any(kw in msg_str for kw in ["<-", "Banner:", "EHLO", "MAIL FROM", "RCPT", "DATA", "FINAL", "250", "354", "450", "451", "452", "550", "554", "421", "530", "REJEITADO", "TIMEOUT", "FALHOU", "erro"]):
+                GLOBAL["smtp_respostas_provedores"].append("[" + str(provedor or "---") + "/" + str(worker_id or "---") + "] " + msg_str[:80])
     except Exception as e:
         debug_log("smtp_log_raw: " + str(e))
 def debug_log(msg):
@@ -990,7 +972,7 @@ def render_dashboard_text():
         pass
     print(CLEAR_SCREEN, end="", flush=True)
     print("╔" + "═" * 76 + "╗", flush=True)
-    print("║  🚀 VERISCOPE V23.6 | 3 IPs/CONTA | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
+    print("║  🚀 VERISCOPE V23.6.1 | 3 IPs/CONTA | " + modo + "  ⏱️ {:02d}:{:02d}:{:02d}  💾 {:<6} ║".format(h, m, s, disco_str), flush=True)
     print("║  STATUS: " + str(GLOBAL.get("status", "UNKNOWN")).ljust(66) + " ║", flush=True)
     print("║  FASE: " + str(GLOBAL.get("fase_atual", "?"))[:40].ljust(66) + " ║", flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
@@ -1001,7 +983,6 @@ def render_dashboard_text():
     print("║  ☁️ IPs Aracloud: {:<8} 👷 Workers: {:<8} 🔵 Greylist: {:<16} ║".format(len(GLOBAL.get("aracloud_ips_ativos", [])), GLOBAL.get("workers_ativos", 0), greylist_pend), flush=True)
     print("║  📤 Tentativas: {:<12,} ⚡ {:.1f}/s     🔌 Con: {:<15,} ║".format(GLOBAL['smtp_tentativas'], rate, GLOBAL['smtp_conexoes']), flush=True)
     print("║  SMTP: ✅{:<8,} ❌{:<8,} ⚠️{:<8,} 👻{:<8,}              ║".format(GLOBAL['smtp_aceites'], GLOBAL['smtp_rejeitados'], GLOBAL['smtp_erros'], GLOBAL['smtp_user_unknown']), flush=True)
-    # [BUG-7] LINHA NOVA - taxonomia de handshakes, visivel em tempo real
     print("║  🤝 HS ok:{:<6,} TO:{:<6,} rej:{:<5,} conn:{:<5,} TLS!:{:<4,} chan:{:<4,} ║".format(
         GLOBAL.get('hs_ok', 0), GLOBAL.get('hs_fail_timeout', 0), GLOBAL.get('hs_fail_reject', 0),
         GLOBAL.get('hs_fail_conn', 0), GLOBAL.get('hs_fail_tls_required', 0), GLOBAL.get('hs_fail_channel', 0)), flush=True)
@@ -1009,20 +990,26 @@ def render_dashboard_text():
         GLOBAL.get('smtp_via_aracloud', 0), GLOBAL.get('hs_fallback_direct', 0), "{:,}".format(len(GLOBAL['user_unknowns']))), flush=True)
     print("║  🏆 Concluídos: {:<14}  4xx:{:<7,}  5xx:{:<7,}  Retry:{:<7,}  ║".format(str(GLOBAL['provs_concluidos']) + "/" + str(GLOBAL['prov_total_envio']), GLOBAL.get('smtp_4xx', 0), GLOBAL.get('smtp_5xx', 0), GLOBAL.get('smtp_retries', 0)), flush=True)
     print("║  📥 Aceites registados: {:<10,}  DESec: {}/{} OK/{} fail        ║".format(len(GLOBAL.get('aceites_emails', set())), GLOBAL.get('desec_requests', 0), GLOBAL.get('desec_success', 0), GLOBAL.get('desec_failures', 0)), flush=True)
+    # [V23.6.1] Mostrar contador de uploads do smtp_raw
+    print("║  📤 Uploads smtp_raw: {:<8,} (a cada 5 min)               ║".format(GLOBAL.get('smtp_raw_uploads', 0)), flush=True)
     print("╠" + "═" * 76 + "╣", flush=True)
-    logs = list(GLOBAL["log_buffer"])[-4:]
+    logs = list(GLOBAL["log_buffer"])[-3:]
     for log in logs:
         l = log[:74] if len(log) <= 74 else log[:72] + ".."
         print("║  " + l.ljust(74) + " ║", flush=True)
-    for _ in range(4 - len(logs)):
+    for _ in range(3 - len(logs)):
         print("║  " + " " * 74 + " ║", flush=True)
     print("╟" + "─" * 76 + "╢", flush=True)
-    # [BUG-7] ULTIMAS LINHAS DO SMTP RAW - diagnostico ao vivo
-    tails = list(GLOBAL.get("smtp_tail", []))[-2:]
-    for t in tails:
-        tt = t[:74] if len(t) <= 74 else t[:72] + ".."
-        print("║  " + tt.ljust(74) + " ║", flush=True)
-    for _ in range(2 - len(tails)):
+    # [V23.6.1] RESPOSTAS DOS PROVEDORES EM TEMPO REAL
+    respostas = list(GLOBAL.get("smtp_respostas_provedores", []))[-4:]
+    if respostas:
+        print("║  📬 ÚLTIMAS RESPOSTAS DOS PROVEDORES:", flush=True)
+        for resp in respostas:
+            r = resp[:74] if len(resp) <= 74 else resp[:72] + ".."
+            print("║  " + r.ljust(74) + " ║", flush=True)
+    else:
+        print("║  📬 Sem respostas ainda..." + " " * 48 + " ║", flush=True)
+    for _ in range(4 - len(respostas)):
         print("║  " + " " * 74 + " ║", flush=True)
     print("╚" + "═" * 76 + "╝", flush=True)
 def monitor_live():
@@ -1075,8 +1062,37 @@ def periodic_checkpoint_thread():
             GLOBAL["ultimo_checkpoint_tempo"] = time.time()
         except Exception as e:
             debug_log("Erro checkpoint 1h: " + str(e))
+# ====================================================================
+# [V23.6.1] NOVA THREAD: Upload do smtp_raw.txt a cada 5 minutos
+# ====================================================================
+def upload_smtp_raw_periodico():
+    """Thread que envia o smtp_raw.txt para o HuggingFace a cada 5 minutos."""
+    dizer("[SMTP RAW UPLOAD] Thread iniciada - upload a cada " + str(SMTP_RAW_UPLOAD_INTERVAL // 60) + " minutos")
+    while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
+        time.sleep(SMTP_RAW_UPLOAD_INTERVAL)
+        if GLOBAL.get("emergency_stop"):
+            break
+        try:
+            if os.path.exists(SMTP_RAW_LOG) and os.path.getsize(SMTP_RAW_LOG) > 0:
+                api = HfApi(token=HF_TOKEN)
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                path_in_repo = "live_smtp_raw/smtp_raw_" + ts + ".txt"
+                api.upload_file(
+                    path_or_fileobj=SMTP_RAW_LOG,
+                    path_in_repo=path_in_repo,
+                    repo_id=HF_LOGS_REPO,
+                    repo_type="dataset",
+                    token=HF_TOKEN
+                )
+                with GLOBAL["stats_lock"]:
+                    GLOBAL["smtp_raw_uploads"] = GLOBAL.get("smtp_raw_uploads", 0) + 1
+                dizer("📤 [SMTP RAW] Upload #" + str(GLOBAL["smtp_raw_uploads"]) + " -> " + path_in_repo)
+            else:
+                debug_log("smtp_raw vazio ou inexistente - a saltar upload")
+        except Exception as e:
+            debug_log("upload_smtp_raw_periodico: " + str(e)[:200])
+            dizer("⚠️ [SMTP RAW] Upload falhou: " + str(e)[:80])
 def watchdog_handshake():
-    """[BUG-7] Se apos N conexoes continuarmos com 0 tentativas, grita no log."""
     avisado = False
     while GLOBAL.get("monitor_running") and not GLOBAL.get("emergency_stop"):
         time.sleep(120)
@@ -1662,11 +1678,7 @@ def gerar_ficheiros_finais():
                     debug_log("upload " + nome + ": " + str(e)[:120])
     except Exception as e:
         dizer("  ERRO geral no upload: " + str(e))
-# ====================================================================
-# V23.6 - ARACLOUD MANAGER (redes Pub_ + proxy bind CORRIGIDO)
-# ====================================================================
 class AracloudManager:
-    """Gerencia contas Aracloud x 3 IPs (1 primario + 2 redes Pub_)."""
     def __init__(self):
         self.auth_url = ARACLOUD_AUTH_URL
         self.tokens = {}
@@ -1951,8 +1963,6 @@ class AracloudManager:
                 debug_log("aracloud ssh " + nome_conta + " " + ip + " (" + usuario + "): " + str(e)[:120])
         return None
     def _garantir_proxy_vm(self, ssh_client, forcar=False):
-        """[BUG-2] Versao anterior: 'test -f /tmp/vp.py && echo OK' -> nunca reescrevia.
-        Agora comparamos /tmp/vp.ver com VP_VERSION e reescrevemos se diferente."""
         if ssh_client is None:
             return False
         try:
@@ -2026,7 +2036,6 @@ class AracloudManager:
             debug_log("verificar_egresso " + str(ip_novo) + ": " + str(e)[:160])
             return False
     def _proxy_canal_smtp(self, ssh_client, mx_host, porta, src_ip, timeout=None):
-        """Abre canal SSH e executa o proxy vp2 com bind ao src_ip."""
         if ssh_client is None:
             return None
         if not self._garantir_proxy_vm(ssh_client):
@@ -2046,7 +2055,6 @@ class AracloudManager:
             chan = transport.open_session()
             chan.settimeout(timeout or SSH_TUNNEL_TIMEOUT)
             chan.exec_command("sudo -n python3 /tmp/vp.py " + str(mx_host) + " " + str(porta) + " " + str(src_ip) + " 2>/tmp/vp.err")
-            # [BUG-6] dar tempo ao script para ligar; ler stderr se morreu ja
             deadline = time.time() + 6.0
             while time.time() < deadline:
                 if chan.exit_status_ready():
@@ -2066,7 +2074,6 @@ class AracloudManager:
                     sem.release()
                     return None
                 time.sleep(0.2)
-            # anexar o semaforo ao canal para libertar no close
             chan._vp_sem = sem
             return chan
         except Exception as e:
@@ -2166,7 +2173,6 @@ class AracloudManager:
                 dizer("  AVISO: " + nome_conta + " sem IP publico acessivel por SSH - saltado")
                 GLOBAL["aracloud_contas"][nome_conta] = conta_estado
                 continue
-            # [BUG-2] Forcar a reescrita do proxy na 1a ligacao a esta VM
             if self._garantir_proxy_vm(ssh_prim, forcar=True):
                 dizer("  ✅ Proxy " + VP_VERSION + " instalado em " + nome_conta + " (" + primary_ip + ")")
             else:
@@ -2256,7 +2262,6 @@ class AracloudManager:
         marcar_fase("FASE25_ARACLOUD", total_ips > 0, str(total_ips) + " IPs activos (" + str(contas_funcionais) + " contas)")
         return total_ips
     def obter_lista_workers(self):
-        """[BUG-4] Dedup por IP para nao termos mais workers do que IPs."""
         workers = []
         vistos = set()
         contas_dkim = GLOBAL.get("contas", [])
@@ -2342,8 +2347,6 @@ class AracloudManager:
             return ip_novo
         return None
 def abrir_canal_smtp_aracloud(ssh_client, mx_host, porta=25, timeout=None):
-    """Fallback direct-tcpip. ATENCAO: o egresso sera o IP da rota default da VM
-    (normalmente o primario), NAO o IP do worker. Usa-se so em ultimo recurso."""
     if ssh_client is None:
         return None
     if timeout is None:
@@ -2370,7 +2373,6 @@ def abrir_canal_smtp_aracloud(ssh_client, mx_host, porta=25, timeout=None):
         sem.release()
         return None
 def fechar_canal(canal):
-    """Fecha canal e liberta o semaforo de transport associado."""
     if canal is None:
         return
     sem = getattr(canal, "_vp_sem", None)
@@ -2400,8 +2402,6 @@ def _canal_suporta_tls(sock):
     except Exception:
         return False
 def _ler_banner_com_deadline(canal, timeout_total=20):
-    """[BUG-6] Le o banner em loop ate ver 220 ou esgotar o tempo.
-    Um unico recv() podia apanhar so metade de um banner multi-linha."""
     buf = b""
     fim = time.time() + timeout_total
     while time.time() < fim:
@@ -2431,7 +2431,6 @@ def tentar_conexao_via_aracloud(worker_ctx, mx_host, timeout, provedor):
         with GLOBAL["stats_lock"]:
             GLOBAL["hs_fail_conn"] = GLOBAL.get("hs_fail_conn", 0) + 1
         return None, None, "sem_ssh"
-    # ---- tentativa 1: proxy vp2 com bind ao IP do worker ----
     canal = None
     try:
         smtp_log_raw(worker_id, ip, provedor, "    ARACLOUD " + str(ip) + " -> " + mx_host + ":25 (proxy vp2 bind)")
@@ -2450,7 +2449,6 @@ def tentar_conexao_via_aracloud(worker_ctx, mx_host, timeout, provedor):
         smtp_log_raw(worker_id, ip, provedor, "    ERRO proxy " + str(ip) + ": " + str(e)[:110])
         fechar_canal(canal)
         canal = None
-    # ---- [BUG-3] tentativa 2: fallback direct-tcpip para TODOS os IPs ----
     try:
         smtp_log_raw(worker_id, ip, provedor, "    ↪ FALLBACK direct-tcpip (egresso=" + str(ip_prim) + ")")
         canal = abrir_canal_smtp_aracloud(ssh_client, mx_host, 25, timeout)
@@ -2849,7 +2847,6 @@ def get_timeout(provedor):
         return SMTP_TIMEOUT_ASIATICO
     return SMTP_TIMEOUT
 def ehlo_host_valido(conta, mx_host):
-    """Garante um FQDN sintacticamente valido para o EHLO."""
     for cand in (conta.get("identity_id"), conta.get("base"), conta.get("domain"), mx_host):
         if cand and str(cand).strip() and str(cand).strip().lower() != "none":
             v = str(cand).strip()
@@ -2876,7 +2873,6 @@ def classificar_resposta_smtp(smtp_code, smtp_message, provedor):
         if any(kw in msg_low for kw in throttle_keywords):
             return "THROTTLE", "Throttling detected"
         return "TEMPORARIA", "Falha temporaria"
-    # [BUG-8] STARTTLS obrigatorio
     if code == 530 and "starttls" in msg_low:
         return "TLS_OBRIGATORIO", "530 STARTTLS obrigatorio"
     if code == 550:
@@ -2964,7 +2960,6 @@ def talvez_salvar_checkpoint():
     if diff >= CHECKPOINT_SAVE_INTERVAL:
         salvar_checkpoint_smtp()
 def handshake_smtp(sock, conta, mx_host, worker_id="---", worker_ip="---", provedor="---"):
-    """Devolve (sock, ok). Regista a RAZAO exacta da falha nos contadores."""
     ehlo = ehlo_host_valido(conta, mx_host)
     t0 = time.time()
     try:
@@ -2976,7 +2971,6 @@ def handshake_smtp(sock, conta, mx_host, worker_id="---", worker_ip="---", prove
         ehlo_text = "\n".join(ehlo_resp) if ehlo_resp else ""
         smtp_log_raw(worker_id, worker_ip, provedor, "  <- EHLO (" + "{:.1f}".format(dt) + "s): " + ehlo_text[:150])
         if not ehlo_resp:
-            # vazio = timeout (30s) ou socket fechado pelo servidor
             if dt >= (SMTP_RECV_TIMEOUT - 2):
                 with GLOBAL["stats_lock"]:
                     GLOBAL["hs_fail_timeout"] = GLOBAL.get("hs_fail_timeout", 0) + 1
@@ -3021,14 +3015,6 @@ def handshake_smtp(sock, conta, mx_host, worker_id="---", worker_ip="---", prove
         with GLOBAL["stats_lock"]:
             GLOBAL["hs_fail_conn"] = GLOBAL.get("hs_fail_conn", 0) + 1
         return sock, False
-# ====================================================================
-# [NOVO] FASE 5.5 - SMOKE TEST
-# --------------------------------------------------------------------
-# Faz UM handshake SMTP completo por IP contra um MX publico conhecido
-# (gmail-smtp-in.l.google.com) e imprime o transcript integral.
-# Sem isto ficavamos 40 minutos as cegas a tentar perceber porque
-# smtp_tentativas ficava a 0. Agora sabemos em ~2 minutos.
-# ====================================================================
 def smoke_test_um_ip(worker_ctx):
     wid = worker_ctx.get("worker_id", "---")
     ip = worker_ctx.get("ip", "---")
@@ -3074,7 +3060,6 @@ def fase55_smoke_test(workers):
         return True
     dizer("  Alvo: " + SMOKE_TEST_MX + ":25 (1 EHLO por IP)")
     resultados = []
-    # sequencial e limitado para nao esgotar canais SSH
     for wc in workers[:12]:
         if GLOBAL.get("emergency_stop"):
             break
@@ -3117,7 +3102,6 @@ def aguardar_ips_aracloud(minimo, timeout_seg=300):
     dizer("  AVISO: timeout a aguardar IPs Aracloud (tem " + str(n) + ").")
     return n > 0
 def agregar_por_provedor(prov, res):
-    """[BUG-5] Agregacao atomica em vez de sobrescrita."""
     campos = ("aceites", "tentados", "rejeitados", "erros", "user_unknown",
               "via_aracloud", "smtp_4xx", "smtp_5xx", "smtp_retries")
     with GLOBAL["por_provedor_lock"]:
@@ -3185,7 +3169,6 @@ def enviar_para_provedor(task):
     except Exception as e:
         debug_log("saltar offset " + prov + ": " + str(e))
     conta_idx = random.randint(0, max(0, len(contas_pool) - 1))
-    # limite local desta janela para nao repetir o trabalho de outro worker
     meta_janela = max(50, META_ACEITES_POR_PROVEDOR // max(1, len(GLOBAL.get("workers", [1]))))
     try:
         while res["aceites"] < meta_janela and not GLOBAL.get("emergency_stop"):
@@ -3234,8 +3217,6 @@ def enviar_para_provedor(task):
                     continue
                 with GLOBAL["stats_lock"]:
                     GLOBAL["smtp_conexoes"] += 1
-                    if via == "aracloud_direct":
-                        GLOBAL["smtp_via_proxy"] = GLOBAL.get("smtp_via_proxy", 0)
                 conta = contas_pool[conta_idx % len(contas_pool)]
                 conta_idx += 1
                 pode, espera = RATE_CTRL.pode_enviar(conta["identity_id"], prov)
@@ -3269,7 +3250,6 @@ def enviar_para_provedor(task):
                         mr = recv_smtp(sock)
                         smtp_log_raw(worker_id, worker_ip, prov, "  <- MAIL FROM: " + str(mr)[:140])
                         if not mr or not mr[0].startswith("250"):
-                            # [BUG-8] detetar STARTTLS obrigatorio
                             if mr:
                                 try:
                                     codigo = int(mr[0][:3])
@@ -3491,8 +3471,6 @@ def enviar_para_provedor(task):
     smtp_log_raw(worker_id, worker_ip, prov, "=== FIM " + prov + ": +" + str(res['aceites']) + " aceites / " + str(res['tentados']) + " tentados (total prov: " + str(agregado.get('aceites', 0)) + ") ===")
     return res
 def worker_loop(worker_ctx, mxs, contas, html_base):
-    """[BUG-4] Cada worker comeca num provedor DIFERENTE (fila rotacionada)
-    e so trabalha um provedor de cada vez (lock de reclamacao global)."""
     worker_id = worker_ctx.get("worker_id", "---")
     worker_ip = worker_ctx.get("ip", "---")
     idx = worker_ctx.get("idx", 0)
@@ -3516,7 +3494,6 @@ def worker_loop(worker_ctx, mxs, contas, html_base):
         cp_info = CHECKPOINT.obter_provedor_index(prov)
         if cp_info and cp_info.get("concluido", False):
             continue
-        # [BUG-4] reclamacao exclusiva
         if not reclamar_provedor(prov):
             providers_queue.append(prov)
             time.sleep(random.uniform(2.0, 6.0))
@@ -3693,7 +3670,7 @@ def enviar_email_unico(dest, assunto, html, conta):
     finally:
         fechar_canal(sock)
 def gerar_relatorio(rt):
-    assunto = "VERISCOPE V23.6 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
+    assunto = "VERISCOPE V23.6.1 - " + datetime.now().strftime('%Y-%m-%d %H:%M')
     linhas_fases = ""
     try:
         with GLOBAL["stats_lock"]:
@@ -3719,15 +3696,16 @@ body{font-family:Arial;margin:20px;color:#222}h1{color:#2c5f2d}h2{color:#3a7d44}
 table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:7px;font-size:13px}
 th{background:#3a7d44;color:#fff;text-align:left}.ok{color:#2c5f2d;font-weight:bold}ul{line-height:1.7}
 </style></head><body>
-<h1>VERISCOPE V23.6 - proxy vp2 corrigido (os.read)</h1>
+<h1>VERISCOPE V23.6.1 - proxy vp2 corrigido + upload smtp_raw a cada 5min</h1>
 <h2>Resumo</h2><ul>
 <li>IPs Aracloud activos: <b>""" + str(len(GLOBAL.get('aracloud_ips_ativos', []))) + """</b></li>
 <li>IPs únicos usados hoje: <b>""" + str(len(GLOBAL.get('aracloud_ips_usados_hoje', set()))) + """</b></li>
 <li>Emails base local: <b>""" + "{:,}".format(GLOBAL.get('emails_read', 0)) + """</b> | Parquets: """ + str(GLOBAL.get('pq_downloaded')) + "/" + str(GLOBAL.get('pq_total')) + """</li>
-<li>DNS bases: <b>""" + str(GLOBAL.get('dns_updated')) + "/" + str(GLOBAL.get('dns_total')) + """</b> | DESec: """ + str(GLOBAL.get('desec_requests', 0)) + " req / " + str(GLOBAL.get('desec_success', 0)) + " OK / " + str(GLOBAL.get('desec_failures', 0)) + """ fail</li></ul>
+<li>DNS bases: <b>""" + str(GLOBAL.get('dns_updated')) + "/" + str(GLOBAL.get('dns_total')) + """</b> | DESec: """ + str(GLOBAL.get('desec_requests', 0)) + " req / " + str(GLOBAL.get('desec_success', 0)) + " OK / " + str(GLOBAL.get('desec_failures', 0)) + """ fail</li>
+<li>Uploads smtp_raw.txt: <b>""" + str(GLOBAL.get('smtp_raw_uploads', 0)) + """</b></li></ul>
 <h2>Handshake SMTP (diagnostico)</h2><ul>
 <li>EHLO 250 OK: <b>""" + "{:,}".format(GLOBAL.get('hs_ok', 0)) + """</b></li>
-<li>Timeout EHLO: <b>""" + "{:,}".format(GLOBAL.get('hs_fail_timeout', 0)) + """</b> (proxy nao encaminha / tarpit)</li>
+<li>Timeout EHLO: <b>""" + "{:,}".format(GLOBAL.get('hs_fail_timeout', 0)) + """</b></li>
 <li>Rejeitado EHLO: <b>""" + "{:,}".format(GLOBAL.get('hs_fail_reject', 0)) + """</b></li>
 <li>Falha conexao: <b>""" + "{:,}".format(GLOBAL.get('hs_fail_conn', 0)) + """</b></li>
 <li>STARTTLS obrigatorio: <b>""" + "{:,}".format(GLOBAL.get('hs_fail_tls_required', 0)) + """</b></li>
@@ -3767,9 +3745,6 @@ def baixar_ficheiros_campanha():
         dizer("  mail_from_variations descarregado")
     except Exception as e:
         dizer("  AVISO: Falha ao baixar mail_from_variations: " + str(e)[:100])
-# ====================================================================
-# MAIN V23.6
-# ====================================================================
 def main():
     global DESEC_TOKENS_VALIDOS, LOG_FILE, SMTP_LOG, DEBUG_LOG, ARACLOUD_MGR_SINGLETON
     diagnostico_ambiente_hf()
@@ -3836,7 +3811,6 @@ def main():
                         _prim = next((x["ip"] for x in _norm if x.get("tipo") == "primario"), None)
                         _ssh_prim = _mgr._abrir_ssh(_nome, _prim, _pem) if _prim else None
                         if _ssh_prim is not None:
-                            # [BUG-2] repor o proxy corrigido tambem em modo recuperacao
                             if _mgr._garantir_proxy_vm(_ssh_prim, forcar=True):
                                 dizer("  ✅ Proxy " + VP_VERSION + " (re)instalado em " + _nome)
                         _vivos = []
@@ -3897,10 +3871,13 @@ def main():
     threading.Thread(target=time_limit_watcher, daemon=True).start()
     threading.Thread(target=periodic_checkpoint_thread, daemon=True).start()
     threading.Thread(target=watchdog_handshake, daemon=True).start()
+    # [V23.6.1] NOVA THREAD: Upload do smtp_raw.txt a cada 5 minutos
+    threading.Thread(target=upload_smtp_raw_periodico, daemon=True).start()
     time.sleep(1)
-    dizer("VERISCOPE V23.6 HEADLESS [" + execution_id + "]")
+    dizer("VERISCOPE V23.6.1 HEADLESS [" + execution_id + "]")
     dizer("ARQUITETURA: 1 primario + 2 Pub_/conta | " + str(MAX_IPS_UNICOS_POR_DIA) + " unicos/conta/dia | budget 2000/IP")
     dizer("PROXY VM: " + VP_VERSION + " (os.read - corrige o bloqueio do EHLO)")
+    dizer("[V23.6.1] Upload smtp_raw.txt para HF a cada " + str(SMTP_RAW_UPLOAD_INTERVAL // 60) + " minutos")
     dizer("CHECKPOINT: " + ("RECUPERAR" if tem_checkpoint else "NOVO"))
     baixar_ficheiros_campanha()
     contas = []
@@ -3956,7 +3933,6 @@ def main():
             aguardar_ips_aracloud(4, timeout_seg=ESPERA_POOL_ANTES_ENVIO)
             if GLOBAL.get("emergency_stop"):
                 raise KeyboardInterrupt()
-            # [NOVO] validar o pipeline SMTP ANTES de queimar horas
             workers_para_smoke = aracloud_mgr.obter_lista_workers()
             fase55_smoke_test(workers_para_smoke)
         if GLOBAL.get("emergency_stop"):
@@ -4017,7 +3993,7 @@ def main():
                         f.write(cr)
                     api = HfApi(token=HF_TOKEN)
                     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_6_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
+                    api.upload_file(path_or_fileobj=rp, path_in_repo="reports/v23_6_1_" + ts + ".html", repo_id=HF_LOGS_REPO, repo_type="dataset", token=HF_TOKEN)
                     dizer("  Relatorio enviado para HuggingFace")
                 except Exception as e:
                     dizer("  AVISO: upload do relatorio falhou (" + str(e)[:110] + ")")
@@ -4052,6 +4028,7 @@ def main():
         print("  USER_UNKNOWN     : " + "{:,}".format(len(GLOBAL['user_unknowns'])), flush=True)
         print("  4xx / 5xx        : " + "{:,}".format(GLOBAL.get('smtp_4xx', 0)) + " / " + "{:,}".format(GLOBAL.get('smtp_5xx', 0)), flush=True)
         print("  Retries / Aband. : " + "{:,}".format(GLOBAL.get('smtp_retries', 0)) + " / " + "{:,}".format(GLOBAL.get('smtp_abandonados', 0)), flush=True)
+        print("  Uploads smtp_raw : " + str(GLOBAL.get('smtp_raw_uploads', 0)), flush=True)
         print("  STATUS FINAL     : " + str(GLOBAL.get("status", "UNKNOWN")), flush=True)
         print("=" * 70, flush=True)
 if __name__ == "__main__":
